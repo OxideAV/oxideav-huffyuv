@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-huffyuv/releases/tag/v0.0.1) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- bootstrap clean-room HuffYUV / FFVHuff decoder
+- Initial commit
+
 ### Added
 
 - Initial scaffold and `huffyuv` v2 / v3 decoder.
