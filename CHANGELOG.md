@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.1](https://github.com/OxideAV/oxideav-huffyuv/releases/tag/v0.0.1) - 2026-05-03
-
-### Other
-
-- replace never-match regex with semver_check = false
-- bootstrap clean-room HuffYUV / FFVHuff decoder
-- Initial commit
-
 ### Added
 
 - **Encoder** — bit-exact `huffyuv` / `ffvhuff` frame encoder.
@@ -82,12 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | Interlaced bootstrap                   | not yet       |
 | `hymt` slice variant                   | not in scope  |
 
-### Initial scaffold (also in [Unreleased])
+## [0.0.1](https://github.com/OxideAV/oxideav-huffyuv/releases/tag/v0.0.1) - 2026-05-03
 
-- Initial `huffyuv` v2 / v3 decoder.
-- Extradata parser (RLE-coded canonical-Huffman length tables).
-- Predictors: LEFT, GRADIENT (PLANE), MEDIAN.
-- Pixel formats: yuv422p (v2), yuv420p (v2), yuv444p (v3), gray8 (v3),
-  rgb24 (v2 + decorrelate), bgra (v2 + decorrelate).
-- Per-frame Huffman tables (`-context 1`, ffvhuff) decode path.
-- 32-bit byte-swap unwrap before bit-reading per the on-disk word order.
+### Other
+
+- replace never-match regex with semver_check = false
+- bootstrap clean-room HuffYUV / FFVHuff decoder
+- Initial commit
