@@ -26,7 +26,9 @@ use oxideav_core::{
 use crate::bitreader::{unswap_payload, BitReader};
 use crate::extradata::{Extradata, FormatVersion, Predictor, V2Colorspace, V3Format};
 use crate::huffman::HuffTable;
-use crate::predictor::{pred_gradient_inplace, pred_left_inplace, pred_median_inplace};
+use crate::predictor::{
+    pred_gradient_inplace, pred_gradient_inplace_full, pred_left_inplace, pred_median_inplace_full,
+};
 use crate::rle;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -120,31 +122,49 @@ fn derive_pixel_format(extra: &Extradata) -> Result<PixelFormat> {
 }
 
 fn derive_v3_pixel_format(v: &V3Format) -> Result<PixelFormat> {
-    if v.bps != 8 {
-        return Err(Error::unsupported(format!(
-            "huffyuv v3: bit-depth {} not yet supported (8-bit only for now)",
-            v.bps
-        )));
-    }
-    match (v.yuv, v.chroma, v.alpha, v.chroma_h_shift, v.chroma_v_shift) {
-        (false, false, false, _, _) => Ok(PixelFormat::Gray8),
-        (true, true, false, 0, 0) => Ok(PixelFormat::Yuv444P),
-        (true, true, false, 1, 0) => Ok(PixelFormat::Yuv422P),
-        (true, true, false, 1, 1) => Ok(PixelFormat::Yuv420P),
-        (true, true, false, 2, 0) => Err(Error::unsupported(
+    match (v.bps, v.yuv, v.chroma, v.alpha, v.chroma_h_shift, v.chroma_v_shift) {
+        (8, false, false, false, _, _) => Ok(PixelFormat::Gray8),
+        (8, true, true, false, 0, 0) => Ok(PixelFormat::Yuv444P),
+        (8, true, true, false, 1, 0) => Ok(PixelFormat::Yuv422P),
+        (8, true, true, false, 1, 1) => Ok(PixelFormat::Yuv420P),
+        (8, true, true, false, 2, 0) => Err(Error::unsupported(
             "huffyuv v3: yuv411p decode not yet wired",
         )),
-        (false, true, false, _, _) => Err(Error::unsupported(
+        // High-bit-depth planar layouts (10/12/16-bit). 9 / 14-bit are
+        // valid in the spec but core lacks dedicated PixelFormat
+        // variants for them; we promote them up to the next supported
+        // depth (so a 9-bit stream is delivered as 10-bit-LE etc.).
+        (10, true, true, false, 0, 0) => Ok(PixelFormat::Yuv444P10Le),
+        (10, true, true, false, 1, 0) => Ok(PixelFormat::Yuv422P10Le),
+        (10, true, true, false, 1, 1) => Ok(PixelFormat::Yuv420P10Le),
+        (12, true, true, false, 0, 0) => Ok(PixelFormat::Yuv444P12Le),
+        (12, true, true, false, 1, 0) => Ok(PixelFormat::Yuv422P12Le),
+        (12, true, true, false, 1, 1) => Ok(PixelFormat::Yuv420P12Le),
+        (10, false, false, false, _, _) => Ok(PixelFormat::Gray10Le),
+        (12, false, false, false, _, _) => Ok(PixelFormat::Gray12Le),
+        (16, false, false, false, _, _) => Ok(PixelFormat::Gray16Le),
+        (_, false, true, false, _, _) => Err(Error::unsupported(
             "huffyuv v3: gbrp pixel format mapping not yet wired",
         )),
-        (false, true, true, _, _) => Err(Error::unsupported(
+        (_, false, true, true, _, _) => Err(Error::unsupported(
             "huffyuv v3: gbrap pixel format mapping not yet wired",
         )),
+        (bps, _, _, _, _, _) if !(8..=16).contains(&bps) => Err(Error::unsupported(format!(
+            "huffyuv v3: bit-depth {bps} out of range"
+        ))),
         _ => Err(Error::unsupported(format!(
-            "huffyuv v3: unrecognised channel descriptor (yuv={}, chroma={}, alpha={}, h={}, v={})",
-            v.yuv, v.chroma, v.alpha, v.chroma_h_shift, v.chroma_v_shift
+            "huffyuv v3: unrecognised channel descriptor (bps={}, yuv={}, chroma={}, alpha={}, h={}, v={})",
+            v.bps, v.yuv, v.chroma, v.alpha, v.chroma_h_shift, v.chroma_v_shift
         ))),
     }
+}
+
+/// Public re-export for the encoder so it can apply the same
+/// width-multiple checks the decoder does. (Same function — both paths
+/// must agree on the constraint, otherwise an encoded frame would fail
+/// to decode.)
+pub fn validate_shape_pub(extra: &Extradata, width: usize) -> Result<()> {
+    validate_shape(extra, width)
 }
 
 fn validate_shape(extra: &Extradata, width: usize) -> Result<()> {
@@ -242,6 +262,29 @@ fn decode_packet(
             pixel_format,
             pkt.pts,
         ),
+        (FormatVersion::V3(v3), PixelFormat::Gray10Le)
+        | (FormatVersion::V3(v3), PixelFormat::Gray12Le)
+        | (FormatVersion::V3(v3), PixelFormat::Gray16Le) => {
+            decode_v3_gray_hbd(extra, tables, bitstream, width, height, v3.bps, pkt.pts)
+        }
+        (
+            FormatVersion::V3(v3),
+            PixelFormat::Yuv420P10Le
+            | PixelFormat::Yuv422P10Le
+            | PixelFormat::Yuv444P10Le
+            | PixelFormat::Yuv420P12Le
+            | PixelFormat::Yuv422P12Le
+            | PixelFormat::Yuv444P12Le,
+        ) => decode_v3_yuv_planar_hbd(
+            extra,
+            tables,
+            bitstream,
+            width,
+            height,
+            pixel_format,
+            v3.bps,
+            pkt.pts,
+        ),
         _ => Err(Error::unsupported(format!(
             "huffyuv decode: unhandled (format, pixel_format) combo: {:?} / {:?}",
             extra.format, pixel_format
@@ -326,6 +369,13 @@ fn decode_v2_yuv422(
     y_plane[..width].copy_from_slice(&row_y);
     u_plane[..chroma_w].copy_from_slice(&row_u);
     v_plane[..chroma_w].copy_from_slice(&row_v);
+    // GRADIENT carries `top_left` across rows in addition to `left`.
+    // For row 0 there's no "top" so the start-of-row top_left is 0;
+    // entering row 1 it becomes the *last* `top` value seen during
+    // row 1's processing (equivalently the last sample of row 0).
+    let mut top_left_y: u8 = 0;
+    let mut top_left_u: u8 = 0;
+    let mut top_left_v: u8 = 0;
 
     // Predictor row 1+ scaffolding for MEDIAN bootstrap (trace doc §4.3).
     // For non-MEDIAN predictors the row residual is just decoded into
@@ -351,9 +401,15 @@ fn decode_v2_yuv422(
                 let top_y = &y_plane[prev_y_off..prev_y_off + width];
                 let top_u = &u_plane[prev_u_off..prev_u_off + chroma_w];
                 let top_v = &v_plane[prev_v_off..prev_v_off + chroma_w];
-                left_y = pred_gradient_inplace(&mut row_y, top_y, left_y);
-                left_u = pred_gradient_inplace(&mut row_u, top_u, left_u);
-                left_v = pred_gradient_inplace(&mut row_v, top_v, left_v);
+                let (ny, ntl) = pred_gradient_inplace_full(&mut row_y, top_y, left_y, top_left_y);
+                left_y = ny;
+                top_left_y = ntl;
+                let (nu, ntu) = pred_gradient_inplace_full(&mut row_u, top_u, left_u, top_left_u);
+                left_u = nu;
+                top_left_u = ntu;
+                let (nv, ntv) = pred_gradient_inplace_full(&mut row_v, top_v, left_v, top_left_v);
+                left_v = nv;
+                top_left_v = ntv;
             }
             Predictor::Median => {
                 // Row 1 bootstrap: first 4 luma + 2 chroma pairs are
@@ -369,30 +425,50 @@ fn decode_v2_yuv422(
                         let (head, tail) = row_y.split_at_mut(bs_y);
                         left_y = pred_left_inplace(head, left_y);
                         if !tail.is_empty() {
-                            let top_left_y = top_y[bs_y - 1];
-                            left_y = pred_median_inplace(tail, &top_y[bs_y..], left_y, top_left_y);
+                            let init_tl = top_y[bs_y - 1];
+                            let (nl, ntl) =
+                                pred_median_inplace_full(tail, &top_y[bs_y..], left_y, init_tl);
+                            left_y = nl;
+                            top_left_y = ntl;
                         }
                     }
                     {
                         let (head, tail) = row_u.split_at_mut(bs_c);
                         left_u = pred_left_inplace(head, left_u);
                         if !tail.is_empty() {
-                            let top_left_u = top_u[bs_c - 1];
-                            left_u = pred_median_inplace(tail, &top_u[bs_c..], left_u, top_left_u);
+                            let init_tl = top_u[bs_c - 1];
+                            let (nl, ntl) =
+                                pred_median_inplace_full(tail, &top_u[bs_c..], left_u, init_tl);
+                            left_u = nl;
+                            top_left_u = ntl;
                         }
                     }
                     {
                         let (head, tail) = row_v.split_at_mut(bs_c);
                         left_v = pred_left_inplace(head, left_v);
                         if !tail.is_empty() {
-                            let top_left_v = top_v[bs_c - 1];
-                            left_v = pred_median_inplace(tail, &top_v[bs_c..], left_v, top_left_v);
+                            let init_tl = top_v[bs_c - 1];
+                            let (nl, ntl) =
+                                pred_median_inplace_full(tail, &top_v[bs_c..], left_v, init_tl);
+                            left_v = nl;
+                            top_left_v = ntl;
                         }
                     }
                 } else {
-                    left_y = pred_median_inplace(&mut row_y, top_y, left_y, top_y[0]);
-                    left_u = pred_median_inplace(&mut row_u, top_u, left_u, top_u[0]);
-                    left_v = pred_median_inplace(&mut row_v, top_v, left_v, top_v[0]);
+                    // Trace doc §4.3 + empirical cross-check against
+                    // ffmpeg's `huffyuv -pred median`: the `top_left`
+                    // register threads across rows (= the trailing
+                    // `top_left` of the previous row's MEDIAN call =
+                    // the previous row's last `top` sample).
+                    let (nl, ntl) = pred_median_inplace_full(&mut row_y, top_y, left_y, top_left_y);
+                    left_y = nl;
+                    top_left_y = ntl;
+                    let (nl, ntl) = pred_median_inplace_full(&mut row_u, top_u, left_u, top_left_u);
+                    left_u = nl;
+                    top_left_u = ntl;
+                    let (nl, ntl) = pred_median_inplace_full(&mut row_v, top_v, left_v, top_left_v);
+                    left_v = nl;
+                    top_left_v = ntl;
                 }
             }
         }
@@ -468,7 +544,9 @@ fn decode_v2_yuv420(
     let mut left_v = v0;
 
     // Row 0 — finish the rest of the row using the same Y/U/Y/V
-    // interleave starting from chroma column 1.
+    // interleave starting from chroma column 1. (Restored to the
+    // pre-experiment behaviour while we figure out the v2 yuv420p
+    // layout properly.)
     for cx in 1..chroma_w {
         row_y[2 * cx] = read_sym8(&mut r, table_y)?;
         row_u[cx] = read_sym8(&mut r, table_u)?;
@@ -485,10 +563,16 @@ fn decode_v2_yuv420(
     u_plane[..chroma_w].copy_from_slice(&row_u);
     v_plane[..chroma_w].copy_from_slice(&row_v);
 
-    // Track the row index in chroma space.
+    // GRADIENT cross-row top_left registers (see decode_v2_yuv422).
+    let mut top_left_y: u8 = 0;
+    let mut top_left_u: u8 = 0;
+    let mut top_left_v: u8 = 0;
+
     let mut cy: usize = 1;
     for y in 1..height {
-        let do_chroma = (y % 2) == 0; // row 0 already handled above
+        let do_chroma = (y % 2) == 0; // chroma on even luma rows
+        let chroma_first = 0; // unused now; kept to minimise diff
+        let _ = chroma_first;
 
         if do_chroma {
             for cx in 0..chroma_w {
@@ -515,13 +599,21 @@ fn decode_v2_yuv420(
             }
             Predictor::Gradient => {
                 let top_y = &y_plane[prev_y_off..prev_y_off + width];
-                left_y = pred_gradient_inplace(&mut row_y, top_y, left_y);
+                let (ny, ntl) = pred_gradient_inplace_full(&mut row_y, top_y, left_y, top_left_y);
+                left_y = ny;
+                top_left_y = ntl;
                 if do_chroma {
                     let prev_c_off = (cy - 1) * chroma_w;
                     let top_u = &u_plane[prev_c_off..prev_c_off + chroma_w];
                     let top_v = &v_plane[prev_c_off..prev_c_off + chroma_w];
-                    left_u = pred_gradient_inplace(&mut row_u, top_u, left_u);
-                    left_v = pred_gradient_inplace(&mut row_v, top_v, left_v);
+                    let (nu, ntu) =
+                        pred_gradient_inplace_full(&mut row_u, top_u, left_u, top_left_u);
+                    left_u = nu;
+                    top_left_u = ntu;
+                    let (nv, ntv) =
+                        pred_gradient_inplace_full(&mut row_v, top_v, left_v, top_left_v);
+                    left_v = nv;
+                    top_left_v = ntv;
                 }
             }
             Predictor::Median => {
@@ -531,11 +623,16 @@ fn decode_v2_yuv420(
                     let (head, tail) = row_y.split_at_mut(bs_y);
                     left_y = pred_left_inplace(head, left_y);
                     if !tail.is_empty() {
-                        let tl = top_y[bs_y - 1];
-                        left_y = pred_median_inplace(tail, &top_y[bs_y..], left_y, tl);
+                        let init_tl = top_y[bs_y - 1];
+                        let (nl, ntl) =
+                            pred_median_inplace_full(tail, &top_y[bs_y..], left_y, init_tl);
+                        left_y = nl;
+                        top_left_y = ntl;
                     }
                 } else {
-                    left_y = pred_median_inplace(&mut row_y, top_y, left_y, top_y[0]);
+                    let (nl, ntl) = pred_median_inplace_full(&mut row_y, top_y, left_y, top_left_y);
+                    left_y = nl;
+                    top_left_y = ntl;
                 }
                 if do_chroma {
                     let prev_c_off = (cy - 1) * chroma_w;
@@ -546,18 +643,30 @@ fn decode_v2_yuv420(
                         let (uh, ut) = row_u.split_at_mut(bs_c);
                         left_u = pred_left_inplace(uh, left_u);
                         if !ut.is_empty() {
-                            let tlu = top_u[bs_c - 1];
-                            left_u = pred_median_inplace(ut, &top_u[bs_c..], left_u, tlu);
+                            let init_tl = top_u[bs_c - 1];
+                            let (nl, ntl) =
+                                pred_median_inplace_full(ut, &top_u[bs_c..], left_u, init_tl);
+                            left_u = nl;
+                            top_left_u = ntl;
                         }
                         let (vh, vt) = row_v.split_at_mut(bs_c);
                         left_v = pred_left_inplace(vh, left_v);
                         if !vt.is_empty() {
-                            let tlv = top_v[bs_c - 1];
-                            left_v = pred_median_inplace(vt, &top_v[bs_c..], left_v, tlv);
+                            let init_tl = top_v[bs_c - 1];
+                            let (nl, ntl) =
+                                pred_median_inplace_full(vt, &top_v[bs_c..], left_v, init_tl);
+                            left_v = nl;
+                            top_left_v = ntl;
                         }
                     } else {
-                        left_u = pred_median_inplace(&mut row_u, top_u, left_u, top_u[0]);
-                        left_v = pred_median_inplace(&mut row_v, top_v, left_v, top_v[0]);
+                        let (nl, ntl) =
+                            pred_median_inplace_full(&mut row_u, top_u, left_u, top_left_u);
+                        left_u = nl;
+                        top_left_u = ntl;
+                        let (nl, ntl) =
+                            pred_median_inplace_full(&mut row_v, top_v, left_v, top_left_v);
+                        left_v = nl;
+                        top_left_v = ntl;
                     }
                 }
             }
@@ -927,6 +1036,7 @@ fn decode_one_plane(
     }
     let mut left = pred_left_inplace(&mut row, 0);
     plane[..width].copy_from_slice(&row);
+    let mut top_left: u8 = 0;
 
     for y in 1..height {
         for x in 0..width {
@@ -939,21 +1049,239 @@ fn decode_one_plane(
             }
             Predictor::Gradient => {
                 let top = &plane[prev_off..prev_off + width];
-                left = pred_gradient_inplace(&mut row, top, left);
+                let (nl, ntl) = pred_gradient_inplace_full(&mut row, top, left, top_left);
+                left = nl;
+                top_left = ntl;
             }
             Predictor::Median => {
                 let top = &plane[prev_off..prev_off + width];
-                // For v3 planar streams, row 1 is fully median-predicted
-                // against row 0 (no LEFT bootstrap — trace doc §4.3
-                // explicitly contrasts this with the v2 4:2:2 case).
-                // top_left for the very first sample is taken as 0.
-                left = pred_median_inplace(&mut row, top, left, 0);
+                // v3 planar median: top_left threads across rows.
+                // For row 1 (first MEDIAN row), the initial top_left
+                // is 0 (canonical Paeth out-of-bounds).
+                let (nl, ntl) = pred_median_inplace_full(&mut row, top, left, top_left);
+                left = nl;
+                top_left = ntl;
             }
         }
         let off = y * width;
         plane[off..off + width].copy_from_slice(&row);
     }
     Ok(())
+}
+
+// ──────────────── v3 high-bit-depth (9..16 bps) ────────────────
+
+fn decode_v3_gray_hbd(
+    extra: &Extradata,
+    tables: &[HuffTable],
+    bitstream: &[u8],
+    width: usize,
+    height: usize,
+    bps: u8,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    let table = &tables[0];
+    let mut samples = vec![0u16; width * height];
+    let mut r = BitReader::new(bitstream);
+    decode_one_plane_u16(extra, table, &mut r, &mut samples, width, height, bps)?;
+    let plane_bytes = u16_plane_to_le_bytes(&samples);
+    Ok(VideoFrame {
+        pts,
+        planes: vec![VideoPlane {
+            stride: width * 2,
+            data: plane_bytes,
+        }],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_v3_yuv_planar_hbd(
+    extra: &Extradata,
+    tables: &[HuffTable],
+    bitstream: &[u8],
+    width: usize,
+    height: usize,
+    pixel_format: PixelFormat,
+    bps: u8,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    let (h_shift, v_shift) = match pixel_format {
+        PixelFormat::Yuv444P10Le | PixelFormat::Yuv444P12Le => (0, 0),
+        PixelFormat::Yuv422P10Le | PixelFormat::Yuv422P12Le => (1, 0),
+        PixelFormat::Yuv420P10Le | PixelFormat::Yuv420P12Le => (1, 1),
+        _ => unreachable!(),
+    };
+    let chroma_w = width >> h_shift;
+    let chroma_h = height >> v_shift;
+    let mut y = vec![0u16; width * height];
+    let mut u = vec![0u16; chroma_w * chroma_h];
+    let mut v = vec![0u16; chroma_w * chroma_h];
+    let mut r = BitReader::new(bitstream);
+    decode_one_plane_u16(extra, &tables[0], &mut r, &mut y, width, height, bps)?;
+    decode_one_plane_u16(extra, &tables[1], &mut r, &mut u, chroma_w, chroma_h, bps)?;
+    decode_one_plane_u16(extra, &tables[2], &mut r, &mut v, chroma_w, chroma_h, bps)?;
+    Ok(VideoFrame {
+        pts,
+        planes: vec![
+            VideoPlane {
+                stride: width * 2,
+                data: u16_plane_to_le_bytes(&y),
+            },
+            VideoPlane {
+                stride: chroma_w * 2,
+                data: u16_plane_to_le_bytes(&u),
+            },
+            VideoPlane {
+                stride: chroma_w * 2,
+                data: u16_plane_to_le_bytes(&v),
+            },
+        ],
+    })
+}
+
+fn decode_one_plane_u16(
+    extra: &Extradata,
+    table: &HuffTable,
+    r: &mut BitReader<'_>,
+    plane: &mut [u16],
+    width: usize,
+    height: usize,
+    bps: u8,
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let mask: u32 = if bps >= 16 { 0xFFFF } else { (1u32 << bps) - 1 };
+    let mut row = vec![0u16; width];
+    // Row 0.
+    for x in 0..width {
+        row[x] = read_sym_hbd(r, table, bps)? as u16;
+    }
+    let mut left = pred_left_inplace_u16(&mut row, 0, mask);
+    plane[..width].copy_from_slice(&row);
+    let mut top_left: u16 = 0;
+
+    for y in 1..height {
+        for x in 0..width {
+            row[x] = read_sym_hbd(r, table, bps)? as u16;
+        }
+        let prev_off = (y - 1) * width;
+        match extra.predictor {
+            Predictor::Left => {
+                left = pred_left_inplace_u16(&mut row, left, mask);
+            }
+            Predictor::Gradient => {
+                let top = &plane[prev_off..prev_off + width];
+                let (nl, ntl) = pred_gradient_inplace_full_u16(&mut row, top, left, top_left, mask);
+                left = nl;
+                top_left = ntl;
+            }
+            Predictor::Median => {
+                let top = &plane[prev_off..prev_off + width];
+                let (nl, ntl) = pred_median_inplace_full_u16(&mut row, top, left, top_left, mask);
+                left = nl;
+                top_left = ntl;
+            }
+        }
+        let off = y * width;
+        plane[off..off + width].copy_from_slice(&row);
+    }
+    Ok(())
+}
+
+/// Read one HBD symbol — Huffman-coded for ≤14 bps; for 15/16 bps the
+/// codec switches to "Huffman the high (bps-2) bits, splice the low 2
+/// bits raw" (trace doc §5.5 / §9.7).
+fn read_sym_hbd(r: &mut BitReader<'_>, t: &HuffTable, bps: u8) -> Result<u32> {
+    if bps <= 14 {
+        let s = t.read_symbol(r)?;
+        let cap = if bps >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << bps) - 1
+        };
+        if s > cap {
+            return Err(Error::invalid(format!(
+                "huffyuv: bps={bps} table emitted symbol {s} > {cap}"
+            )));
+        }
+        Ok(s)
+    } else {
+        // bps ∈ {15, 16}: Huffman code carries (sample >> 2), then 2
+        // raw bits carry (sample & 3).
+        let hi = t.read_symbol(r)?;
+        let lo = r.read_bits(2)?;
+        Ok((hi << 2) | lo)
+    }
+}
+
+/// In-place LEFT prefix-sum over a u16 row (modular within `mask + 1`).
+fn pred_left_inplace_u16(row: &mut [u16], mut left: u16, mask: u32) -> u16 {
+    for v in row.iter_mut() {
+        let next = ((left as u32).wrapping_add(*v as u32)) & mask;
+        *v = next as u16;
+        left = next as u16;
+    }
+    left
+}
+
+fn pred_gradient_inplace_full_u16(
+    row: &mut [u16],
+    top: &[u16],
+    mut left: u16,
+    mut top_left: u16,
+    mask: u32,
+) -> (u16, u16) {
+    debug_assert_eq!(row.len(), top.len());
+    // Canonical PLANE: pred[x] = left + top[x] - top_left, threaded
+    // per-sample. See `pred_gradient_inplace_full` in predictor.rs.
+    for x in 0..row.len() {
+        let pred = ((left as u32)
+            .wrapping_add(top[x] as u32)
+            .wrapping_sub(top_left as u32))
+            & mask;
+        let s = pred.wrapping_add(row[x] as u32) & mask;
+        row[x] = s as u16;
+        top_left = top[x];
+        left = s as u16;
+    }
+    (left, top_left)
+}
+
+fn pred_median_inplace_full_u16(
+    row: &mut [u16],
+    top: &[u16],
+    mut left: u16,
+    mut top_left: u16,
+    mask: u32,
+) -> (u16, u16) {
+    debug_assert_eq!(row.len(), top.len());
+    // Modular u16 (or n-bit, see `mask`) median — same shape as the
+    // 8-bit `paeth_median_u8` in predictor.rs. The `L+T-TL` term wraps
+    // mod 2^bps before the order-statistic median picks the middle.
+    for x in 0..row.len() {
+        let l = left as u32;
+        let t = top[x] as u32;
+        let tl = top_left as u32;
+        let c = (l.wrapping_add(t).wrapping_sub(tl)) & mask;
+        let lo = l.min(t);
+        let hi = l.max(t);
+        let pred = hi.min(c.max(lo));
+        let s = pred.wrapping_add(row[x] as u32) & mask;
+        row[x] = s as u16;
+        top_left = top[x];
+        left = s as u16;
+    }
+    (left, top_left)
+}
+
+fn u16_plane_to_le_bytes(samples: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for &s in samples.iter() {
+        out.push((s & 0xFF) as u8);
+        out.push((s >> 8) as u8);
+    }
+    out
 }
 
 // ─────────────────────────── helpers ────────────────────────────

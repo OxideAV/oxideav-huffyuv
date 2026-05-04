@@ -170,7 +170,13 @@ impl Extradata {
                 let chroma_h_shift = e1 & 0x03;
                 let chroma_v_shift = (e1 >> 2) & 0x03;
                 let yuv = (e2 & 0x01) != 0;
-                let chroma = (e2 & 0x02) != 0;
+                // Trace doc §2.2.2: the "chroma" property reported in
+                // the per-pixel-format table is `yuv || (e2 & 0x02)` —
+                // the explicit chroma bit only fires for non-yuv
+                // multi-plane layouts (gbrp/gbrap). yuv layouts (444p,
+                // 422p, 420p, 411p, …) flag `yuv=1` and leave bit 1
+                // clear; the decoder still walks 3 planes for them.
+                let chroma = yuv || (e2 & 0x02) != 0;
                 let alpha = (e2 & 0x04) != 0;
                 FormatVersion::V3(V3Format {
                     bps,

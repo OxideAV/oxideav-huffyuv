@@ -33,11 +33,15 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod bitreader;
+pub mod bitwriter;
 pub mod decoder;
+pub mod encoder;
 pub mod extradata;
 pub mod huffman;
+pub mod length_builder;
 pub mod predictor;
 pub mod rle;
+pub mod rle_encode;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 use oxideav_core::{CodecInfo, CodecRegistry};
@@ -58,12 +62,14 @@ pub fn register(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_HUFFYUV))
             .capabilities(caps.clone())
             .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
             .tag(CodecTag::fourcc(b"HFYU")),
     );
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_FFVHUFF))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
             .tag(CodecTag::fourcc(b"FFVH")),
     );
 }

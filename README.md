@@ -13,8 +13,6 @@ same reverse-engineered behaviour-trace spec described in
 
 ## Status
 
-This is the initial bootstrap drop. Decode coverage:
-
 | Feature                                | Status        |
 | -------------------------------------- | ------------- |
 | AVI extradata parser (v2 + v3)         | implemented   |
@@ -22,23 +20,29 @@ This is the initial bootstrap drop. Decode coverage:
 | Predictor: LEFT                        | implemented   |
 | Predictor: GRADIENT (PLANE)            | implemented   |
 | Predictor: MEDIAN                      | implemented   |
-| YUV 4:2:2 planar (v2 `bsbpp=16`)       | implemented   |
-| YUV 4:2:0 planar (v2 `bsbpp=12`)       | implemented   |
-| YUV 4:4:4 planar (v3, 8-bit)           | implemented   |
-| YUV 4:1:1 planar (v3, 8-bit)           | implemented   |
-| Gray 8 (v3)                            | implemented   |
-| RGB 24 packed + decorrelate (v2)       | implemented   |
-| BGRA 32 packed + decorrelate (v2)      | implemented   |
-| Per-frame Huffman tables (FFVHuff `-context 1`) | implemented |
-| GBRP / GBRAP planar (v3)               | implemented   |
-| ≥9-bit depths (v3)                     | not yet       |
-| 15/16-bit Huffman + 2 raw bits split   | not yet       |
-| Encoder                                | not yet       |
+| YUV 4:2:2 planar (v2 `bsbpp=16`)       | decode + encode |
+| YUV 4:2:0 planar (v2 `bsbpp=12`)       | decode + encode |
+| YUV 4:4:4 planar (v3, 8-bit)           | decode + encode |
+| YUV 4:1:1 planar (v3, 8-bit)           | not yet       |
+| Gray 8 (v3)                            | decode + encode |
+| RGB 24 packed + decorrelate (v2)       | decode + encode |
+| BGRA 32 packed + decorrelate (v2)      | decode + encode |
+| Per-frame Huffman tables (FFVHuff)     | decode + encode |
+| GBRP / GBRAP planar (v3)               | not yet       |
+| 10 / 12-bit YUV 4:2:0/4:2:2/4:4:4 (v3) | decode + encode |
+| 10 / 12 / 16-bit Gray (v3)             | decode + encode |
+| 15 / 16-bit "huff hi-bits + 2 raw" splice (§5.5) | implemented |
 | Interlaced bootstrap                   | not yet       |
 | `hymt` slice variant                   | not in scope  |
 
-The crate is **decode-only** today and exposes itself through
-`oxideav-core`'s `CodecRegistry`. Encoding is a future work item.
+The crate exposes itself through `oxideav-core`'s `CodecRegistry`
+under both the `huffyuv` and `ffvhuff` codec ids; the `huffyuv` id
+emits v2 extradata where representable (yuv422p, yuv420p, rgb24,
+bgra), the `ffvhuff` id emits v3 extradata for everything v2 cannot
+describe (yuv444p, gray, ≥9-bit depths). Cross-decode round-trips
+through `ffmpeg -c:v {huffyuv,ffvhuff}` are exercised in
+`tests/ffmpeg_interop.rs` for every (predictor × pixel-format)
+combination listed above.
 
 ## Bitstream notes
 
@@ -86,12 +90,17 @@ Reproduced from the trace doc; see that document for full justification:
 ## Round-trip tests
 
 - `tests/synth_left.rs` — hand-built 4×4 yuv422p stream (LEFT predictor)
-  reproduces a known sample matrix bit-exactly.
-- `tests/ffmpeg_interop.rs` — invokes `ffmpeg -c:v huffyuv -pix_fmt
-  yuv422p -f avi …` on a tiny generated PNG, then decodes the AVI through
-  this crate and asserts every plane sample matches what `ffmpeg
-  -i … -c:v rawvideo` produces. The test is `#[ignore]`d when no
-  `ffmpeg` binary is on `$PATH`, so it is opt-in for CI.
+  reproduces a known sample matrix bit-exactly with no external tools.
+- `tests/ffmpeg_interop.rs` — runtime-skipped when `ffmpeg` isn't on
+  `$PATH`. When it is, the suite cross-decodes ffmpeg-encoded
+  HuffYUV / FFVHuff bitstreams through this crate (yuv422p LEFT /
+  PLANE / MEDIAN, yuv420p LEFT, yuv444p PLANE / MEDIAN, gray8 LEFT /
+  PLANE, gray16le LEFT, yuv422p10le LEFT, yuv444p12le LEFT) AND runs
+  the reverse direction (our encoder → minimal AVI → ffmpeg's
+  decoder → byte-identical rawvideo) for yuv422p LEFT / PLANE,
+  yuv420p LEFT and gray8 PLANE. None of the tests are `#[ignore]`d;
+  they print `ffmpeg not on PATH; skipping` and return cleanly when
+  the binary is missing.
 
 ## License
 

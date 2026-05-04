@@ -119,6 +119,48 @@ impl HuffTable {
         Ok(Self { entries, min_code })
     }
 
+    /// Encoder-side mirror of [`Self::from_lengths`]: derive the per-symbol
+    /// canonical code (and its length) from a length-array. Returns a
+    /// vector indexed by symbol value; entries with length 0 are
+    /// `(code=0, length=0)` and must not be emitted.
+    pub fn build_codes(lengths: &[u8]) -> Result<Vec<(u32, u8)>> {
+        // Bound + by-length bucketing identical to `from_lengths`.
+        for (sym, &len) in lengths.iter().enumerate() {
+            if len > MAX_CODE_LEN {
+                return Err(Error::invalid(format!(
+                    "huffyuv huffman: code length {len} for symbol {sym} exceeds {MAX_CODE_LEN}"
+                )));
+            }
+        }
+        let mut by_len: Vec<Vec<u32>> = vec![Vec::new(); MAX_CODE_LEN as usize + 1];
+        for (sym, &len) in lengths.iter().enumerate() {
+            if len > 0 {
+                by_len[len as usize].push(sym as u32);
+            }
+        }
+        let mut max_used: usize = 0;
+        for len in 1..=MAX_CODE_LEN as usize {
+            if !by_len[len].is_empty() {
+                max_used = len;
+            }
+        }
+        let mut codes = vec![(0u32, 0u8); lengths.len()];
+        if max_used == 0 {
+            return Ok(codes);
+        }
+        let mut next: u64 = 0;
+        for len in (1..=max_used).rev() {
+            let step: u64 = 1 << (max_used - len);
+            for &sym in by_len[len].iter() {
+                let code_at_max = next;
+                let code_l = (code_at_max >> (max_used - len)) as u32;
+                codes[sym as usize] = (code_l, len as u8);
+                next += step;
+            }
+        }
+        Ok(codes)
+    }
+
     /// Decode the next symbol from `r`. Returns `Error::Eof` if the
     /// reader runs out of bits mid-code.
     pub fn read_symbol(&self, r: &mut BitReader<'_>) -> Result<u32> {
@@ -172,6 +214,21 @@ mod tests {
         let err = HuffTable::from_lengths(&lens).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("Kraft"), "got: {msg}");
+    }
+
+    /// Decoder + encoder agree on the canonical assignment for a
+    /// representative length array (cross-verified against the round-trip
+    /// test below).
+    #[test]
+    fn build_codes_matches_decoder() {
+        let lens = [1u8, 2, 3, 3];
+        let codes = HuffTable::build_codes(&lens).unwrap();
+        // From the trace doc + `mixed_lengths` test: sym 0 → `1`, sym 1 → `01`,
+        // sym 2 → `000`, sym 3 → `001`.
+        assert_eq!(codes[0], (0b1, 1));
+        assert_eq!(codes[1], (0b01, 2));
+        assert_eq!(codes[2], (0b000, 3));
+        assert_eq!(codes[3], (0b001, 3));
     }
 
     /// Mixed lengths with the classic "1, 2, 3, 3" shape. Under the
