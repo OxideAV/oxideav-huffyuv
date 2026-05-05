@@ -8,26 +8,26 @@
 //! derives every Huffman code from the canonical convention applied to
 //! the lengths shipped on the wire (RLE-coded, see `extradata`).
 //!
-//! **Supported pixel formats** (v2 → 8-bit, v3 → 8-bit only for now):
+//! **Supported pixel formats**:
 //!
 //! - YUV 4:2:0 / 4:2:2 (v2 packed-identifier extradata)
-//! - YUV 4:4:4 / 4:1:1 (v3 planar extradata)
-//! - Gray 8 (v3)
-//! - GBRP / GBRAP planar (v3, no decorrelate)
+//! - YUV 4:4:4 / 4:2:2 / 4:2:0 / 4:1:1 (v3 planar extradata, 8-bit)
+//! - YUV 4:4:4 / 4:2:2 / 4:2:0 planar at 10 / 12-bit (v3)
+//! - Gray 8 / 10 / 12 / 16-bit (v3, incl. §5.5 2-raw-bit splice)
+//! - GBRP / GBRAP planar at 8 / 10 / 12-bit (v3)
 //! - RGB24 / BGRA packed (v2, with `decorrelate` flag)
 //!
 //! **Supported predictors**: LEFT, GRADIENT (called PLANE in the
 //! original codec), MEDIAN. RGB v2 streams accept LEFT and PLANE only.
 //!
 //! **Supported variants**: v2 + v3 extradata, FFVHuff per-frame tables
-//! (`-context 1`, signaled by `extra[2] & 0x40`).
+//! (`-context 1`, signaled by `extra[2] & 0x40`), interlaced bootstrap
+//! (row-1 fresh-field-start when `InterlaceMode::Interlaced` or
+//! `AutoByHeight` with height > 288).
 //!
 //! **Not yet supported**:
 //!
-//! - Bit depths above 8 (the v3 high-bit-depth tables and the
-//!   15/16-bit Huffman + 2 raw bits split).
-//! - Interlaced streams (the row-1 bootstrap differs).
-//! - Encoder.
+//! - Interlaced encoder path (decoder only).
 //! - The `hymt` slice variant.
 
 #![allow(clippy::needless_range_loop)]
