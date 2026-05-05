@@ -219,8 +219,7 @@ fn assert_planes_match(
                 let ref_plane = &raw[p * n..(p + 1) * n];
                 for y in 0..height {
                     for x in 0..width {
-                        let decoded_lo =
-                            video.planes[p].data[y * video.planes[p].stride + x * 2];
+                        let decoded_lo = video.planes[p].data[y * video.planes[p].stride + x * 2];
                         let decoded_hi =
                             video.planes[p].data[y * video.planes[p].stride + x * 2 + 1];
                         let ref_val = ref_plane[y * width + x];
@@ -244,8 +243,7 @@ fn assert_planes_match(
                 let ref_plane = &raw[p * n..(p + 1) * n];
                 for y in 0..height {
                     for x in 0..width {
-                        let decoded_lo =
-                            video.planes[p].data[y * video.planes[p].stride + x * 2];
+                        let decoded_lo = video.planes[p].data[y * video.planes[p].stride + x * 2];
                         let decoded_hi =
                             video.planes[p].data[y * video.planes[p].stride + x * 2 + 1];
                         let ref_val = ref_plane[y * width + x];

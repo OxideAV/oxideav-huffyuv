@@ -24,7 +24,9 @@ use oxideav_core::{
 };
 
 use crate::bitreader::{unswap_payload, BitReader};
-use crate::extradata::{Extradata, FormatVersion, InterlaceMode, Predictor, V2Colorspace, V3Format};
+use crate::extradata::{
+    Extradata, FormatVersion, InterlaceMode, Predictor, V2Colorspace, V3Format,
+};
 use crate::huffman::HuffTable;
 use crate::predictor::{
     pred_gradient_inplace, pred_gradient_inplace_full, pred_left_inplace, pred_median_inplace_full,
@@ -252,10 +254,9 @@ fn decode_packet(
         (FormatVersion::V3(_), PixelFormat::Gray8) => {
             decode_v3_gray8(extra, tables, bitstream, width, height, pkt.pts)
         }
-        (
-            FormatVersion::V3(_),
-            PixelFormat::Yuv411P,
-        ) => decode_v3_yuv411p(extra, tables, bitstream, width, height, pkt.pts),
+        (FormatVersion::V3(_), PixelFormat::Yuv411P) => {
+            decode_v3_yuv411p(extra, tables, bitstream, width, height, pkt.pts)
+        }
         (
             FormatVersion::V3(_),
             PixelFormat::Yuv420P | PixelFormat::Yuv422P | PixelFormat::Yuv444P,
@@ -298,7 +299,16 @@ fn decode_packet(
             | PixelFormat::Gbrap10Le
             | PixelFormat::Gbrp12Le
             | PixelFormat::Gbrap12Le,
-        ) => decode_v3_gbrp(extra, tables, bitstream, width, height, pixel_format, v3.bps, pkt.pts),
+        ) => decode_v3_gbrp(
+            extra,
+            tables,
+            bitstream,
+            width,
+            height,
+            pixel_format,
+            v3.bps,
+            pkt.pts,
+        ),
         _ => Err(Error::unsupported(format!(
             "huffyuv decode: unhandled (format, pixel_format) combo: {:?} / {:?}",
             extra.format, pixel_format
@@ -1258,12 +1268,18 @@ fn decode_v3_gbrp(
             tables.len()
         )));
     }
-    let mut planes: Vec<Vec<u16>> = (0..n_planes)
-        .map(|_| vec![0u16; width * height])
-        .collect();
+    let mut planes: Vec<Vec<u16>> = (0..n_planes).map(|_| vec![0u16; width * height]).collect();
     let mut r = BitReader::new(bitstream);
     for p in 0..n_planes {
-        decode_one_plane_u16(extra, &tables[p], &mut r, &mut planes[p], width, height, bps)?;
+        decode_one_plane_u16(
+            extra,
+            &tables[p],
+            &mut r,
+            &mut planes[p],
+            width,
+            height,
+            bps,
+        )?;
     }
     let stride = width * 2;
     Ok(VideoFrame {
