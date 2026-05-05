@@ -173,7 +173,7 @@ fn cross_decode_huffyuv(
     params.height = Some(height);
     params.pixel_format = Some(pf);
     params.extradata = extradata;
-    let mut decoder = reg.make_decoder(&params).expect("make_decoder");
+    let mut decoder = reg.first_decoder(&params).expect("make_decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), packet).with_keyframe(true);
     decoder.send_packet(&pkt).expect("send_packet");
     let frame = decoder.receive_frame().expect("receive_frame");
@@ -398,7 +398,7 @@ fn ffmpeg_ffvhuff_round_trip_yuv444p12le_left() {
     params.height = Some(H);
     params.pixel_format = Some(PixelFormat::Yuv444P12Le);
     params.extradata = extradata;
-    let mut decoder = reg.make_decoder(&params).expect("make_decoder");
+    let mut decoder = reg.first_decoder(&params).expect("make_decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), packet).with_keyframe(true);
     decoder.send_packet(&pkt).expect("send_packet");
     let frame = decoder.receive_frame().expect("receive_frame");
@@ -465,7 +465,7 @@ fn ffmpeg_ffvhuff_round_trip_gray16le_left() {
     params.height = Some(H);
     params.pixel_format = Some(PixelFormat::Gray16Le);
     params.extradata = extradata;
-    let mut decoder = reg.make_decoder(&params).expect("make_decoder");
+    let mut decoder = reg.first_decoder(&params).expect("make_decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), packet).with_keyframe(true);
     decoder.send_packet(&pkt).expect("send_packet");
     let video = match decoder.receive_frame().expect("receive_frame") {
@@ -529,7 +529,7 @@ fn ffmpeg_ffvhuff_round_trip_yuv422p10le_left() {
     params.height = Some(H);
     params.pixel_format = Some(PixelFormat::Yuv422P10Le);
     params.extradata = extradata;
-    let mut decoder = reg.make_decoder(&params).expect("make_decoder");
+    let mut decoder = reg.first_decoder(&params).expect("make_decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), packet).with_keyframe(true);
     decoder.send_packet(&pkt).expect("send_packet");
     let frame = decoder.receive_frame().expect("receive_frame");
@@ -654,7 +654,7 @@ fn ffmpeg_huffyuv_round_trip_yuv422p_interlaced_left() {
     params.height = Some(H);
     params.pixel_format = Some(PixelFormat::Yuv422P);
     params.extradata = extradata;
-    let mut decoder = reg.make_decoder(&params).expect("make_decoder");
+    let mut decoder = reg.first_decoder(&params).expect("make_decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), packet).with_keyframe(true);
     decoder.send_packet(&pkt).expect("send_packet");
     let frame = decoder.receive_frame().expect("receive_frame");
@@ -716,7 +716,7 @@ fn self_roundtrip_gbrp8_left() {
     enc_params.width = Some(width as u32);
     enc_params.height = Some(height as u32);
     enc_params.pixel_format = Some(PixelFormat::Gbrp10Le);
-    let mut enc = reg.make_encoder(&enc_params).expect("encoder");
+    let mut enc = reg.first_encoder(&enc_params).expect("encoder");
     enc.send_frame(&Frame::Video(frame)).unwrap();
     let pkt = enc.receive_packet().unwrap();
     let dec_extra = enc.output_params().extradata.clone();
@@ -726,7 +726,7 @@ fn self_roundtrip_gbrp8_left() {
     dec_params.height = Some(height as u32);
     dec_params.pixel_format = Some(PixelFormat::Gbrp10Le);
     dec_params.extradata = dec_extra;
-    let mut dec = reg.make_decoder(&dec_params).expect("decoder");
+    let mut dec = reg.first_decoder(&dec_params).expect("decoder");
     dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), pkt.data).with_keyframe(true))
         .unwrap();
     let decoded = match dec.receive_frame().unwrap() {
@@ -778,7 +778,7 @@ fn self_roundtrip_yuv411p_left() {
     enc_params.width = Some(width as u32);
     enc_params.height = Some(height as u32);
     enc_params.pixel_format = Some(PixelFormat::Yuv411P);
-    let mut enc = reg.make_encoder(&enc_params).expect("encoder");
+    let mut enc = reg.first_encoder(&enc_params).expect("encoder");
     enc.send_frame(&Frame::Video(frame)).unwrap();
     let pkt = enc.receive_packet().unwrap();
     let dec_extra = enc.output_params().extradata.clone();
@@ -788,7 +788,7 @@ fn self_roundtrip_yuv411p_left() {
     dec_params.height = Some(height as u32);
     dec_params.pixel_format = Some(PixelFormat::Yuv411P);
     dec_params.extradata = dec_extra;
-    let mut dec = reg.make_decoder(&dec_params).expect("decoder");
+    let mut dec = reg.first_decoder(&dec_params).expect("decoder");
     dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), pkt.data).with_keyframe(true))
         .unwrap();
     let decoded = match dec.receive_frame().unwrap() {
@@ -915,7 +915,7 @@ fn cross_encode_then_ffmpeg_decode_inner(
     enc_params.height = Some(height);
     enc_params.pixel_format = Some(pf);
     enc_params.options.insert("predictor", pred);
-    let mut enc = reg.make_encoder(&enc_params).expect("our encoder");
+    let mut enc = reg.first_encoder(&enc_params).expect("our encoder");
     enc.send_frame(&oxideav_core::Frame::Video(frame.clone()))
         .expect("send_frame");
     let pkt = enc.receive_packet().expect("receive_packet");

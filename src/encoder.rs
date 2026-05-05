@@ -1382,7 +1382,7 @@ mod tests {
         params.width = Some(8);
         params.height = Some(4);
         params.pixel_format = Some(PixelFormat::Yuv422P);
-        let mut enc = reg.make_encoder(&params).expect("encoder");
+        let mut enc = reg.first_encoder(&params).expect("encoder");
         let original = frame_yuv422(8, 4, 0xDEAD);
         enc.send_frame(&Frame::Video(original.clone())).unwrap();
         let pkt = enc.receive_packet().unwrap();
@@ -1393,7 +1393,7 @@ mod tests {
         dec_params.height = Some(4);
         dec_params.pixel_format = Some(PixelFormat::Yuv422P);
         dec_params.extradata = dec_extra;
-        let mut dec = reg.make_decoder(&dec_params).expect("decoder");
+        let mut dec = reg.first_decoder(&dec_params).expect("decoder");
         let pkt2 = Packet::new(0, TimeBase::new(1, 25), pkt.data.clone()).with_keyframe(true);
         dec.send_packet(&pkt2).unwrap();
         let frame = dec.receive_frame().unwrap();
@@ -1433,7 +1433,7 @@ mod tests {
         params.height = Some(4);
         params.pixel_format = Some(PixelFormat::Yuv422P);
         params.options.insert("predictor", "gradient");
-        let mut enc = reg.make_encoder(&params).expect("encoder");
+        let mut enc = reg.first_encoder(&params).expect("encoder");
         let original = frame_yuv422(8, 4, 0xBEEF);
         enc.send_frame(&Frame::Video(original.clone())).unwrap();
         let pkt = enc.receive_packet().unwrap();
@@ -1444,7 +1444,7 @@ mod tests {
         dec_params.height = Some(4);
         dec_params.pixel_format = Some(PixelFormat::Yuv422P);
         dec_params.extradata = dec_extra;
-        let mut dec = reg.make_decoder(&dec_params).expect("decoder");
+        let mut dec = reg.first_decoder(&dec_params).expect("decoder");
         dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), pkt.data).with_keyframe(true))
             .unwrap();
         let frame = dec.receive_frame().unwrap();
@@ -1468,7 +1468,7 @@ mod tests {
         params.width = Some(16);
         params.height = Some(8);
         params.pixel_format = Some(PixelFormat::Gray8);
-        let mut enc = reg.make_encoder(&params).expect("encoder");
+        let mut enc = reg.first_encoder(&params).expect("encoder");
         let mut data = vec![0u8; 16 * 8];
         for (i, b) in data.iter_mut().enumerate() {
             *b = ((i * 7) & 0xFF) as u8;
@@ -1487,7 +1487,7 @@ mod tests {
         dec_params.height = Some(8);
         dec_params.pixel_format = Some(PixelFormat::Gray8);
         dec_params.extradata = enc.output_params().extradata.clone();
-        let mut dec = reg.make_decoder(&dec_params).unwrap();
+        let mut dec = reg.first_decoder(&dec_params).unwrap();
         dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), pkt.data).with_keyframe(true))
             .unwrap();
         let v = match dec.receive_frame().unwrap() {

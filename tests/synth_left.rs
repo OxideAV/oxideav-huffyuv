@@ -140,7 +140,7 @@ fn decode_v2_yuv422_left_round_trip() {
     params.pixel_format = Some(PixelFormat::Yuv422P);
     params.extradata = extradata;
 
-    let mut decoder = reg.make_decoder(&params).expect("decoder factory");
+    let mut decoder = reg.first_decoder(&params).expect("decoder factory");
     let pkt = Packet::new(0, TimeBase::new(1, 25), payload).with_keyframe(true);
     decoder.send_packet(&pkt).expect("send_packet");
     let frame = decoder.receive_frame().expect("receive_frame");
