@@ -17,15 +17,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **GBRP / GBRAP planar decode + encode** — v3 planar G→B→R[→A] layouts at
+  8 / 10 / 12-bit depths (stored in `Gbrp10Le` / `Gbrap10Le` / `Gbrp12Le` /
+  `Gbrap12Le` PixelFormat containers). All three predictors supported.
+  Cross-decoded against ffmpeg's `gbrp` / `gbrap` / `gbrp10le` formats;
+  self-roundtrip verified.
+- **YUV 4:1:1 planar decode + encode** — v3 `chroma_h_shift=2` layout
+  (`Yuv411P`). Plane-sequential bitstream; all three predictors.
+  Cross-decoded against `ffmpeg -c:v ffvhuff -pix_fmt yuv411p`.
+- **Interlaced bootstrap for decode** — when `InterlaceMode::Interlaced`
+  (or `AutoByHeight` with height > 288), row 1 is fully LEFT-predicted
+  as a fresh bottom-field start; for MEDIAN the row-1 partial-left
+  bootstrap shifts to row 2. Applies to both v2 (YUV 4:2:2) and v3
+  planar paths. Cross-decoded against
+  `ffmpeg -flags +ilme+ildct -top 1 -c:v huffyuv`.
 - **Encoder** — bit-exact `huffyuv` / `ffvhuff` frame encoder.
   Supports v2 yuv422p / yuv420p / rgb24 / bgra and v3 yuv444p / yuv422p /
-  yuv420p / yuv444p10le / yuv422p10le / yuv420p10le / yuv444p12le /
-  yuv422p12le / yuv420p12le / gray8 / gray10le / gray12le / gray16le.
+  yuv420p / yuv411p / yuv444p10le / yuv422p10le / yuv420p10le /
+  yuv444p12le / yuv422p12le / yuv420p12le / gray8 / gray10le / gray12le /
+  gray16le / gbrp10le / gbrap10le / gbrp12le / gbrap12le.
   Per-frame histogram-driven canonical Huffman tables (`-context 1`
   style); LEFT / GRADIENT / MEDIAN predictors; auto v2 vs v3 extradata
   selection via the `huffyuv` vs `ffvhuff` codec id. Cross-decode
   round-trips through ffmpeg are verified for yuv422p (LEFT, PLANE),
-  yuv420p (LEFT) and gray8 (PLANE).
+  yuv420p (LEFT), gray8 (PLANE), yuv411p (LEFT), gbrp10le (LEFT).
 - **High-bit-depth decode** — v3 planar 10 / 12 / 16-bit support via
   `yuv{420,422,444}p{10,12}le` / `gray{10,12,16}le` PixelFormats.
   Includes the trace-doc §5.5 / §9.7 "(sample >> 2) Huffman + 2 raw
@@ -70,16 +85,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | YUV 4:2:2 planar (v2 `bsbpp=16`)       | implemented   |
 | YUV 4:2:0 planar (v2 `bsbpp=12`)       | implemented   |
 | YUV 4:4:4 planar (v3, 8-bit)           | implemented   |
-| YUV 4:1:1 planar (v3, 8-bit)           | not yet       |
+| YUV 4:1:1 planar (v3, 8-bit)           | implemented (decode + encode) |
 | Gray 8 (v3)                            | implemented   |
 | RGB 24 packed + decorrelate (v2)       | implemented   |
 | BGRA 32 packed + decorrelate (v2)      | implemented   |
 | Per-frame Huffman tables (FFVHuff)     | implemented   |
-| GBRP / GBRAP planar (v3)               | not yet       |
+| GBRP 8/10/12-bit planar (v3)           | implemented (decode + encode) |
+| GBRAP 8/10/12-bit planar+alpha (v3)    | implemented (decode + encode) |
 | 10/12-bit YUV 4:2:0/4:2:2/4:4:4        | implemented   |
 | 10/12/16-bit Gray (incl. 2-raw splice) | implemented   |
 | **Encoder** (LEFT / GRADIENT / MEDIAN) | implemented   |
-| Interlaced bootstrap                   | not yet       |
+| Interlaced bootstrap                   | implemented (decode)          |
 | `hymt` slice variant                   | not in scope  |
 
 ## [0.0.1](https://github.com/OxideAV/oxideav-huffyuv/releases/tag/v0.0.1) - 2026-05-03

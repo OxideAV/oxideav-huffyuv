@@ -24,7 +24,7 @@ use oxideav_core::{
 };
 
 use crate::bitreader::{unswap_payload, BitReader};
-use crate::extradata::{Extradata, FormatVersion, Predictor, V2Colorspace, V3Format};
+use crate::extradata::{Extradata, FormatVersion, InterlaceMode, Predictor, V2Colorspace, V3Format};
 use crate::huffman::HuffTable;
 use crate::predictor::{
     pred_gradient_inplace, pred_gradient_inplace_full, pred_left_inplace, pred_median_inplace_full,
@@ -127,9 +127,7 @@ fn derive_v3_pixel_format(v: &V3Format) -> Result<PixelFormat> {
         (8, true, true, false, 0, 0) => Ok(PixelFormat::Yuv444P),
         (8, true, true, false, 1, 0) => Ok(PixelFormat::Yuv422P),
         (8, true, true, false, 1, 1) => Ok(PixelFormat::Yuv420P),
-        (8, true, true, false, 2, 0) => Err(Error::unsupported(
-            "huffyuv v3: yuv411p decode not yet wired",
-        )),
+        (8, true, true, false, 2, 0) => Ok(PixelFormat::Yuv411P),
         // High-bit-depth planar layouts (10/12/16-bit). 9 / 14-bit are
         // valid in the spec but core lacks dedicated PixelFormat
         // variants for them; we promote them up to the next supported
@@ -143,12 +141,16 @@ fn derive_v3_pixel_format(v: &V3Format) -> Result<PixelFormat> {
         (10, false, false, false, _, _) => Ok(PixelFormat::Gray10Le),
         (12, false, false, false, _, _) => Ok(PixelFormat::Gray12Le),
         (16, false, false, false, _, _) => Ok(PixelFormat::Gray16Le),
-        (_, false, true, false, _, _) => Err(Error::unsupported(
-            "huffyuv v3: gbrp pixel format mapping not yet wired",
-        )),
-        (_, false, true, true, _, _) => Err(Error::unsupported(
-            "huffyuv v3: gbrap pixel format mapping not yet wired",
-        )),
+        // GBRP planar (8-bit stored as 16-bit LE words via Gbrp10Le, low 8 bits used).
+        // No native Gbrp8 PixelFormat exists; we promote to the 10-bit container.
+        (8, false, true, false, 0, 0) => Ok(PixelFormat::Gbrp10Le),
+        // GBRAP planar (8-bit + alpha, same promotion strategy).
+        (8, false, true, true, 0, 0) => Ok(PixelFormat::Gbrap10Le),
+        // HBD gbrp/gbrap (10/12 bit).
+        (10, false, true, false, 0, 0) => Ok(PixelFormat::Gbrp10Le),
+        (10, false, true, true, 0, 0) => Ok(PixelFormat::Gbrap10Le),
+        (12, false, true, false, 0, 0) => Ok(PixelFormat::Gbrp12Le),
+        (12, false, true, true, 0, 0) => Ok(PixelFormat::Gbrap12Le),
         (bps, _, _, _, _, _) if !(8..=16).contains(&bps) => Err(Error::unsupported(format!(
             "huffyuv v3: bit-depth {bps} out of range"
         ))),
@@ -252,6 +254,10 @@ fn decode_packet(
         }
         (
             FormatVersion::V3(_),
+            PixelFormat::Yuv411P,
+        ) => decode_v3_yuv411p(extra, tables, bitstream, width, height, pkt.pts),
+        (
+            FormatVersion::V3(_),
             PixelFormat::Yuv420P | PixelFormat::Yuv422P | PixelFormat::Yuv444P,
         ) => decode_v3_yuv_planar(
             extra,
@@ -285,6 +291,14 @@ fn decode_packet(
             v3.bps,
             pkt.pts,
         ),
+        // GBRP / GBRAP planar (8-bit promoted to Gbrp10Le storage, HBD native).
+        (
+            FormatVersion::V3(v3),
+            PixelFormat::Gbrp10Le
+            | PixelFormat::Gbrap10Le
+            | PixelFormat::Gbrp12Le
+            | PixelFormat::Gbrap12Le,
+        ) => decode_v3_gbrp(extra, tables, bitstream, width, height, pixel_format, v3.bps, pkt.pts),
         _ => Err(Error::unsupported(format!(
             "huffyuv decode: unhandled (format, pixel_format) combo: {:?} / {:?}",
             extra.format, pixel_format
@@ -376,6 +390,8 @@ fn decode_v2_yuv422(
     let mut top_left_y: u8 = 0;
     let mut top_left_u: u8 = 0;
     let mut top_left_v: u8 = 0;
+    let interlaced = matches!(extra.interlace, InterlaceMode::Interlaced)
+        || (extra.interlace == InterlaceMode::AutoByHeight && height > 288);
 
     // Predictor row 1+ scaffolding for MEDIAN bootstrap (trace doc §4.3).
     // For non-MEDIAN predictors the row residual is just decoded into
@@ -391,6 +407,23 @@ fn decode_v2_yuv422(
         let prev_y_off = (y - 1) * width;
         let prev_u_off = (y - 1) * chroma_w;
         let prev_v_off = (y - 1) * chroma_w;
+
+        // Interlaced: row 1 is the bottom-field start; LEFT-predict with
+        // the threading left register (not reset to 0 — the left register
+        // is a 1-D prefix sum that continues from row 0).
+        if interlaced && y == 1 {
+            left_y = pred_left_inplace(&mut row_y, left_y);
+            left_u = pred_left_inplace(&mut row_u, left_u);
+            left_v = pred_left_inplace(&mut row_v, left_v);
+            top_left_y = 0;
+            top_left_u = 0;
+            top_left_v = 0;
+            y_plane[prev_y_off + width..prev_y_off + 2 * width].copy_from_slice(&row_y);
+            u_plane[prev_u_off + chroma_w..prev_u_off + 2 * chroma_w].copy_from_slice(&row_u);
+            v_plane[prev_v_off + chroma_w..prev_v_off + 2 * chroma_w].copy_from_slice(&row_v);
+            continue;
+        }
+
         match extra.predictor {
             Predictor::Left => {
                 left_y = pred_left_inplace(&mut row_y, left_y);
@@ -415,10 +448,12 @@ fn decode_v2_yuv422(
                 // Row 1 bootstrap: first 4 luma + 2 chroma pairs are
                 // LEFT-predicted; the rest of row 1 is MEDIAN against
                 // row 0. From row 2 onward, fully MEDIAN.
+                // Interlaced: bootstrap applies at row 2 (row 1 handled above).
                 let top_y = &y_plane[prev_y_off..prev_y_off + width];
                 let top_u = &u_plane[prev_u_off..prev_u_off + chroma_w];
                 let top_v = &v_plane[prev_v_off..prev_v_off + chroma_w];
-                if y == 1 {
+                let is_bootstrap_row = if interlaced { y == 2 } else { y == 1 };
+                if is_bootstrap_row {
                     let bs_y = 4.min(width);
                     let bs_c = 2.min(chroma_w);
                     {
@@ -1014,10 +1049,55 @@ fn decode_v3_yuv_planar(
     })
 }
 
+// ────────────────────── v3 YUV 4:1:1 ──────────────────────
+
+fn decode_v3_yuv411p(
+    extra: &Extradata,
+    tables: &[HuffTable],
+    bitstream: &[u8],
+    width: usize,
+    height: usize,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    // 4:1:1: chroma_h_shift=2, chroma_v_shift=0.
+    let chroma_w = width >> 2;
+    let chroma_h = height;
+    let mut y_plane = vec![0u8; width * height];
+    let mut u_plane = vec![0u8; chroma_w * chroma_h];
+    let mut v_plane = vec![0u8; chroma_w * chroma_h];
+    let mut r = BitReader::new(bitstream);
+
+    decode_one_plane(extra, &tables[0], &mut r, &mut y_plane, width, height)?;
+    decode_one_plane(extra, &tables[1], &mut r, &mut u_plane, chroma_w, chroma_h)?;
+    decode_one_plane(extra, &tables[2], &mut r, &mut v_plane, chroma_w, chroma_h)?;
+
+    Ok(VideoFrame {
+        pts,
+        planes: vec![
+            VideoPlane {
+                stride: width,
+                data: y_plane,
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: u_plane,
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: v_plane,
+            },
+        ],
+    })
+}
+
 /// Plane-sequential decode for v3 (and v3-style single-plane) layouts.
 /// Trace doc §5.3: each row is read left-to-right; row 0 is fully
 /// LEFT-predicted with `left = 0` initial register; rows 1..H-1 use
 /// the configured predictor.
+///
+/// When `extra.interlace` is `Interlaced`, row 1 is treated as a fresh
+/// field-start: it is fully LEFT-predicted (not GRADIENT or MEDIAN), and
+/// the MEDIAN bootstrap (row 1 partial-left) is shifted to row 2.
 fn decode_one_plane(
     extra: &Extradata,
     table: &HuffTable,
@@ -1029,6 +1109,8 @@ fn decode_one_plane(
     if width == 0 || height == 0 {
         return Ok(());
     }
+    let interlaced = matches!(extra.interlace, InterlaceMode::Interlaced)
+        || (extra.interlace == InterlaceMode::AutoByHeight && height > 288);
     let mut row = vec![0u8; width];
     // Row 0.
     for x in 0..width {
@@ -1043,6 +1125,16 @@ fn decode_one_plane(
             row[x] = read_sym8(r, table)?;
         }
         let prev_off = (y - 1) * width;
+        // In interlaced mode, row 1 is the start of the bottom field:
+        // treat it as LEFT-predicted (reset left to 0, no cross-row
+        // reference). The MEDIAN bootstrap then applies at row 2.
+        if interlaced && y == 1 {
+            left = pred_left_inplace(&mut row, 0);
+            top_left = 0;
+            let off = y * width;
+            plane[off..off + width].copy_from_slice(&row);
+            continue;
+        }
         match extra.predictor {
             Predictor::Left => {
                 left = pred_left_inplace(&mut row, left);
@@ -1056,8 +1148,8 @@ fn decode_one_plane(
             Predictor::Median => {
                 let top = &plane[prev_off..prev_off + width];
                 // v3 planar median: top_left threads across rows.
-                // For row 1 (first MEDIAN row), the initial top_left
-                // is 0 (canonical Paeth out-of-bounds).
+                // For row 1 non-interlaced (first MEDIAN row) top_left is 0.
+                // Interlaced: bootstrap shifts to row 2 (row 1 handled above).
                 let (nl, ntl) = pred_median_inplace_full(&mut row, top, left, top_left);
                 left = nl;
                 top_left = ntl;
@@ -1139,6 +1231,53 @@ fn decode_v3_yuv_planar_hbd(
     })
 }
 
+// ─────────────────── v3 GBRP / GBRAP planar ───────────────────
+
+/// Decode v3 GBRP or GBRAP. Planes are stored in G→B→R[→A] order.
+/// 8-bit streams are promoted to the 16-bit LE container (low 8 bits
+/// used) to fill `Gbrp10Le` / `Gbrap10Le` VideoPlanes.
+#[allow(clippy::too_many_arguments)]
+fn decode_v3_gbrp(
+    extra: &Extradata,
+    tables: &[HuffTable],
+    bitstream: &[u8],
+    width: usize,
+    height: usize,
+    pixel_format: PixelFormat,
+    bps: u8,
+    pts: Option<i64>,
+) -> Result<VideoFrame> {
+    let has_alpha = matches!(
+        pixel_format,
+        PixelFormat::Gbrap10Le | PixelFormat::Gbrap12Le
+    );
+    let n_planes = if has_alpha { 4 } else { 3 };
+    if tables.len() < n_planes {
+        return Err(Error::invalid(format!(
+            "huffyuv gbrp decode: expected {n_planes} tables, got {}",
+            tables.len()
+        )));
+    }
+    let mut planes: Vec<Vec<u16>> = (0..n_planes)
+        .map(|_| vec![0u16; width * height])
+        .collect();
+    let mut r = BitReader::new(bitstream);
+    for p in 0..n_planes {
+        decode_one_plane_u16(extra, &tables[p], &mut r, &mut planes[p], width, height, bps)?;
+    }
+    let stride = width * 2;
+    Ok(VideoFrame {
+        pts,
+        planes: planes
+            .into_iter()
+            .map(|s| VideoPlane {
+                stride,
+                data: u16_plane_to_le_bytes(&s),
+            })
+            .collect(),
+    })
+}
+
 fn decode_one_plane_u16(
     extra: &Extradata,
     table: &HuffTable,
@@ -1151,6 +1290,8 @@ fn decode_one_plane_u16(
     if width == 0 || height == 0 {
         return Ok(());
     }
+    let interlaced = matches!(extra.interlace, InterlaceMode::Interlaced)
+        || (extra.interlace == InterlaceMode::AutoByHeight && height > 288);
     let mask: u32 = if bps >= 16 { 0xFFFF } else { (1u32 << bps) - 1 };
     let mut row = vec![0u16; width];
     // Row 0.
@@ -1166,6 +1307,14 @@ fn decode_one_plane_u16(
             row[x] = read_sym_hbd(r, table, bps)? as u16;
         }
         let prev_off = (y - 1) * width;
+        // Interlaced: row 1 is the bottom-field start; LEFT-predict with left=0.
+        if interlaced && y == 1 {
+            left = pred_left_inplace_u16(&mut row, 0, mask);
+            top_left = 0;
+            let off = y * width;
+            plane[off..off + width].copy_from_slice(&row);
+            continue;
+        }
         match extra.predictor {
             Predictor::Left => {
                 left = pred_left_inplace_u16(&mut row, left, mask);

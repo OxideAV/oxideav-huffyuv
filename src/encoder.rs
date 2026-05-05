@@ -124,7 +124,7 @@ fn synthesise_extradata(
         (PixelFormat::Yuv420P, true) => (12u8, per_frame_flag, 0u8, 3, 256),
         (PixelFormat::Rgb24, true) => (24u8, per_frame_flag, 0u8, 3, 256),
         (PixelFormat::Bgra, true) => (32u8, per_frame_flag, 0u8, 3, 256),
-        (pf, _) => v3_extradata_bytes(pf, per_frame_flag)?,
+        (pf, _) => v3_extradata_bytes(pf, per_frame_flag, predictor)?,
     };
 
     extra.extend_from_slice(&[e0, e1, e2, e3]);
@@ -168,13 +168,18 @@ fn uniform_lengths(symbols: usize) -> Vec<u8> {
     }
 }
 
-fn v3_extradata_bytes(pf: PixelFormat, per_frame_flag: u8) -> Result<(u8, u8, u8, usize, usize)> {
+fn v3_extradata_bytes(
+    pf: PixelFormat,
+    per_frame_flag: u8,
+    _predictor: Predictor,
+) -> Result<(u8, u8, u8, usize, usize)> {
     // Returns (e1, e2, e3=1, n_tables, symbols_per_table).
     let (bps, h_shift, v_shift, yuv, chroma, alpha) = match pf {
         PixelFormat::Gray8 => (8u8, 0u8, 0u8, false, false, false),
         PixelFormat::Yuv444P => (8, 0, 0, true, true, false),
         PixelFormat::Yuv422P => (8, 1, 0, true, true, false),
         PixelFormat::Yuv420P => (8, 1, 1, true, true, false),
+        PixelFormat::Yuv411P => (8, 2, 0, true, true, false),
         PixelFormat::Yuv420P10Le => (10, 1, 1, true, true, false),
         PixelFormat::Yuv422P10Le => (10, 1, 0, true, true, false),
         PixelFormat::Yuv444P10Le => (10, 0, 0, true, true, false),
@@ -184,6 +189,13 @@ fn v3_extradata_bytes(pf: PixelFormat, per_frame_flag: u8) -> Result<(u8, u8, u8
         PixelFormat::Gray10Le => (10, 0, 0, false, false, false),
         PixelFormat::Gray12Le => (12, 0, 0, false, false, false),
         PixelFormat::Gray16Le => (16, 0, 0, false, false, false),
+        // GBRP / GBRAP planar: yuv=0, chroma=1 (explicit bit-1 set).
+        // 8-bit values ride in Gbrp10Le / Gbrap10Le containers but
+        // the on-wire bps is 8 (low 8 bits of the 16-bit LE words used).
+        PixelFormat::Gbrp10Le => (10, 0, 0, false, true, false),
+        PixelFormat::Gbrap10Le => (10, 0, 0, false, true, true),
+        PixelFormat::Gbrp12Le => (12, 0, 0, false, true, false),
+        PixelFormat::Gbrap12Le => (12, 0, 0, false, true, true),
         other => {
             return Err(Error::unsupported(format!(
                 "huffyuv encoder: pixel format {other:?} not supported in v3 extradata"
@@ -317,6 +329,9 @@ fn encode_frame(
         (FormatVersion::V3(_), PixelFormat::Gray16Le) => {
             build_v3_gray(extra, v, width, height, 16)?
         }
+        (FormatVersion::V3(_), PixelFormat::Yuv411P) => {
+            build_v3_yuv(extra, v, width, height, 2, 0, 8)?
+        }
         (FormatVersion::V3(_), PixelFormat::Yuv420P) => {
             build_v3_yuv(extra, v, width, height, 1, 1, 8)?
         }
@@ -343,6 +358,19 @@ fn encode_frame(
         }
         (FormatVersion::V3(_), PixelFormat::Yuv444P12Le) => {
             build_v3_yuv(extra, v, width, height, 0, 0, 12)?
+        }
+        // GBRP / GBRAP planar — same plane-sequential path as YUV v3.
+        (FormatVersion::V3(_), PixelFormat::Gbrp10Le) => {
+            build_v3_gbrp(extra, v, width, height, 10, false)?
+        }
+        (FormatVersion::V3(_), PixelFormat::Gbrap10Le) => {
+            build_v3_gbrp(extra, v, width, height, 10, true)?
+        }
+        (FormatVersion::V3(_), PixelFormat::Gbrp12Le) => {
+            build_v3_gbrp(extra, v, width, height, 12, false)?
+        }
+        (FormatVersion::V3(_), PixelFormat::Gbrap12Le) => {
+            build_v3_gbrp(extra, v, width, height, 12, true)?
         }
         _ => {
             return Err(Error::unsupported(format!(
@@ -1181,6 +1209,36 @@ fn build_v3_yuv(
     }
     for r in res_v {
         stream.push((2, r));
+    }
+    Ok((stream, Vec::new()))
+}
+
+// ───────────── v3 GBRP / GBRAP ─────────────
+
+fn build_v3_gbrp(
+    extra: &Extradata,
+    v: &VideoFrame,
+    width: usize,
+    height: usize,
+    bps: u8,
+    has_alpha: bool,
+) -> Result<(Vec<TaggedResidual>, Vec<u8>)> {
+    let n_planes = if has_alpha { 4 } else { 3 };
+    if v.planes.len() < n_planes {
+        return Err(Error::invalid(format!(
+            "huffyuv encode v3 gbrp: need {n_planes} planes, got {}",
+            v.planes.len()
+        )));
+    }
+    // Planes are stored in G→B→R[→A] order matching the PixelFormat.
+    let mut stream: Vec<TaggedResidual> = Vec::with_capacity(width * height * n_planes);
+    for p in 0..n_planes {
+        let samples = plane_to_u32_16(&v.planes[p], width, height)?;
+        let mut residuals: Vec<u32> = Vec::with_capacity(width * height);
+        encode_plane_residuals(extra, &samples, width, height, bps, &mut residuals);
+        for r in residuals {
+            stream.push((p as u8, r));
+        }
     }
     Ok((stream, Vec::new()))
 }

@@ -23,16 +23,17 @@ same reverse-engineered behaviour-trace spec described in
 | YUV 4:2:2 planar (v2 `bsbpp=16`)       | decode + encode |
 | YUV 4:2:0 planar (v2 `bsbpp=12`)       | decode + encode |
 | YUV 4:4:4 planar (v3, 8-bit)           | decode + encode |
-| YUV 4:1:1 planar (v3, 8-bit)           | not yet       |
+| YUV 4:1:1 planar (v3, 8-bit)           | decode + encode |
 | Gray 8 (v3)                            | decode + encode |
 | RGB 24 packed + decorrelate (v2)       | decode + encode |
 | BGRA 32 packed + decorrelate (v2)      | decode + encode |
 | Per-frame Huffman tables (FFVHuff)     | decode + encode |
-| GBRP / GBRAP planar (v3)               | not yet       |
+| GBRP 8/10/12-bit planar (v3)           | decode + encode |
+| GBRAP 8/10/12-bit planar + alpha (v3)  | decode + encode |
 | 10 / 12-bit YUV 4:2:0/4:2:2/4:4:4 (v3) | decode + encode |
 | 10 / 12 / 16-bit Gray (v3)             | decode + encode |
 | 15 / 16-bit "huff hi-bits + 2 raw" splice (§5.5) | implemented |
-| Interlaced bootstrap                   | not yet       |
+| Interlaced bootstrap (v2 + v3)         | decode         |
 | `hymt` slice variant                   | not in scope  |
 
 The crate exposes itself through `oxideav-core`'s `CodecRegistry`
@@ -95,12 +96,14 @@ Reproduced from the trace doc; see that document for full justification:
   `$PATH`. When it is, the suite cross-decodes ffmpeg-encoded
   HuffYUV / FFVHuff bitstreams through this crate (yuv422p LEFT /
   PLANE / MEDIAN, yuv420p LEFT, yuv444p PLANE / MEDIAN, gray8 LEFT /
-  PLANE, gray16le LEFT, yuv422p10le LEFT, yuv444p12le LEFT) AND runs
-  the reverse direction (our encoder → minimal AVI → ffmpeg's
-  decoder → byte-identical rawvideo) for yuv422p LEFT / PLANE,
-  yuv420p LEFT and gray8 PLANE. None of the tests are `#[ignore]`d;
-  they print `ffmpeg not on PATH; skipping` and return cleanly when
-  the binary is missing.
+  MEDIAN, gray16le LEFT, yuv422p10le LEFT, yuv444p12le LEFT,
+  yuv411p LEFT / PLANE, gbrp LEFT / MEDIAN, gbrap LEFT, interlaced
+  yuv422p LEFT) AND runs the reverse direction (our encoder → minimal
+  AVI → ffmpeg decoder → byte-identical rawvideo) for yuv422p LEFT /
+  PLANE, yuv420p LEFT, gray8 PLANE, yuv411p LEFT, gbrp10le LEFT.
+  None of the tests are `#[ignore]`d; they print
+  `ffmpeg not on PATH; skipping` and return cleanly when the binary
+  is missing.
 
 ## License
 

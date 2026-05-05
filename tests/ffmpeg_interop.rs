@@ -203,8 +203,65 @@ fn assert_planes_match(
             (width / 2, height / 2, 1),
             (width / 2, height / 2, 1),
         ],
+        PixelFormat::Yuv411P => vec![
+            (width, height, 1),
+            (width / 4, height, 1),
+            (width / 4, height, 1),
+        ],
         PixelFormat::Yuv444P => vec![(width, height, 1); 3],
         PixelFormat::Gray8 => vec![(width, height, 1)],
+        // GBRP/GBRAP 8-bit stored in Gbrp10Le/Gbrap10Le containers (u16 LE, low 8 bits used).
+        // ffmpeg rawvideo `gbrp` is 1 byte/sample; we compare low byte only.
+        PixelFormat::Gbrp10Le => {
+            assert_eq!(video.planes.len(), 3, "gbrp plane count");
+            let n = width * height;
+            for p in 0..3 {
+                let ref_plane = &raw[p * n..(p + 1) * n];
+                for y in 0..height {
+                    for x in 0..width {
+                        let decoded_lo =
+                            video.planes[p].data[y * video.planes[p].stride + x * 2];
+                        let decoded_hi =
+                            video.planes[p].data[y * video.planes[p].stride + x * 2 + 1];
+                        let ref_val = ref_plane[y * width + x];
+                        assert_eq!(
+                            decoded_lo, ref_val,
+                            "gbrp plane {p} pixel [{y}][{x}]: decoded lo={decoded_lo} ref={ref_val}"
+                        );
+                        assert_eq!(
+                            decoded_hi, 0,
+                            "gbrp plane {p} pixel [{y}][{x}]: hi byte should be 0"
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        PixelFormat::Gbrap10Le => {
+            assert_eq!(video.planes.len(), 4, "gbrap plane count");
+            let n = width * height;
+            for p in 0..4 {
+                let ref_plane = &raw[p * n..(p + 1) * n];
+                for y in 0..height {
+                    for x in 0..width {
+                        let decoded_lo =
+                            video.planes[p].data[y * video.planes[p].stride + x * 2];
+                        let decoded_hi =
+                            video.planes[p].data[y * video.planes[p].stride + x * 2 + 1];
+                        let ref_val = ref_plane[y * width + x];
+                        assert_eq!(
+                            decoded_lo, ref_val,
+                            "gbrap plane {p} pixel [{y}][{x}]: decoded lo={decoded_lo} ref={ref_val}"
+                        );
+                        assert_eq!(
+                            decoded_hi, 0,
+                            "gbrap plane {p} pixel [{y}][{x}]: hi byte should be 0"
+                        );
+                    }
+                }
+            }
+            return;
+        }
         _ => panic!("assert_planes_match: unsupported format {pf:?} (extend the helper)"),
     };
     assert_eq!(video.planes.len(), plane_dims.len(), "plane count");
@@ -497,6 +554,276 @@ fn ffmpeg_ffvhuff_round_trip_yuv422p10le_left() {
     }
 }
 
+/// YUV 4:1:1 planar via ffvhuff — decoded by us, compared to rawvideo.
+#[test]
+fn ffmpeg_ffvhuff_round_trip_yuv411p_left() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    // yuv411p: width must be a multiple of 4.
+    cross_decode_huffyuv("left", "yuv411p", PixelFormat::Yuv411P, 16, 16, "ffvhuff");
+}
+
+#[test]
+fn ffmpeg_ffvhuff_round_trip_yuv411p_plane() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    cross_decode_huffyuv("plane", "yuv411p", PixelFormat::Yuv411P, 16, 16, "ffvhuff");
+}
+
+/// GBRP 8-bit via ffvhuff — decoded by us into Gbrp10Le container,
+/// compared sample-by-sample to the 8-bit rawvideo reference.
+#[test]
+fn ffmpeg_ffvhuff_round_trip_gbrp8_left() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    cross_decode_huffyuv("left", "gbrp", PixelFormat::Gbrp10Le, W, H, "ffvhuff");
+}
+
+#[test]
+fn ffmpeg_ffvhuff_round_trip_gbrp8_median() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    cross_decode_huffyuv("median", "gbrp", PixelFormat::Gbrp10Le, W, H, "ffvhuff");
+}
+
+/// GBRAP 8-bit (with alpha) via ffvhuff.
+#[test]
+fn ffmpeg_ffvhuff_round_trip_gbrap8_left() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    cross_decode_huffyuv("left", "gbrap", PixelFormat::Gbrap10Le, W, H, "ffvhuff");
+}
+
+/// Interlaced YUV 4:2:2 (v2 huffyuv) — decoded by us, compared to rawvideo.
+/// ffmpeg -flags +ilme+ildct -top 1 forces top-field-first interlaced.
+#[test]
+fn ffmpeg_huffyuv_round_trip_yuv422p_interlaced_left() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    let avi = run_ffmpeg(&[
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("testsrc=size={W}x{H}:rate=1:duration=0.04"),
+        "-c:v",
+        "huffyuv",
+        "-pred",
+        "left",
+        "-pix_fmt",
+        "yuv422p",
+        "-flags",
+        "+ilme+ildct",
+        "-top",
+        "1",
+        "-f",
+        "avi",
+        "-",
+    ])
+    .expect("ffmpeg encode");
+    let raw = run_ffmpeg(&[
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("testsrc=size={W}x{H}:rate=1:duration=0.04"),
+        "-pix_fmt",
+        "yuv422p",
+        "-vframes",
+        "1",
+        "-f",
+        "rawvideo",
+        "-",
+    ])
+    .expect("ffmpeg rawvideo");
+    let (extradata, packet) = extract_huffyuv_from_avi(&avi).expect("avi walk");
+    let mut reg = CodecRegistry::new();
+    register(&mut reg);
+    let mut params = CodecParameters::video(CodecId::new("huffyuv"));
+    params.width = Some(W);
+    params.height = Some(H);
+    params.pixel_format = Some(PixelFormat::Yuv422P);
+    params.extradata = extradata;
+    let mut decoder = reg.make_decoder(&params).expect("make_decoder");
+    let pkt = Packet::new(0, TimeBase::new(1, 25), packet).with_keyframe(true);
+    decoder.send_packet(&pkt).expect("send_packet");
+    let frame = decoder.receive_frame().expect("receive_frame");
+    let video = match frame {
+        oxideav_core::Frame::Video(v) => v,
+        _ => panic!("expected video"),
+    };
+    assert_planes_match(&video, &raw, W as usize, H as usize, PixelFormat::Yuv422P);
+}
+
+/// Self-roundtrip: encode gbrp8 with our encoder, decode with our decoder,
+/// compare to the original planes.
+#[test]
+fn self_roundtrip_gbrp8_left() {
+    let width = 16usize;
+    let height = 8usize;
+    let n = width * height;
+    // Synthesise 3 planes (G, B, R) with distinct patterns.
+    let g: Vec<u8> = (0..n).map(|i| ((i * 7 + 11) & 0xFF) as u8).collect();
+    let b: Vec<u8> = (0..n).map(|i| ((i * 13 + 23) & 0xFF) as u8).collect();
+    let r: Vec<u8> = (0..n).map(|i| ((i * 17 + 37) & 0xFF) as u8).collect();
+    // Convert 8-bit planes to 16-bit LE words (low byte = value, hi = 0).
+    let to_u16_plane = |src: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(src.len() * 2);
+        for &v in src {
+            out.push(v);
+            out.push(0);
+        }
+        out
+    };
+    let gp = to_u16_plane(&g);
+    let bp = to_u16_plane(&b);
+    let rp = to_u16_plane(&r);
+
+    use oxideav_core::frame::VideoPlane;
+    use oxideav_core::VideoFrame;
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: width * 2,
+                data: gp.clone(),
+            },
+            VideoPlane {
+                stride: width * 2,
+                data: bp.clone(),
+            },
+            VideoPlane {
+                stride: width * 2,
+                data: rp.clone(),
+            },
+        ],
+    };
+
+    use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame};
+    let mut reg = CodecRegistry::new();
+    register(&mut reg);
+    let mut enc_params = CodecParameters::video(CodecId::new("ffvhuff"));
+    enc_params.width = Some(width as u32);
+    enc_params.height = Some(height as u32);
+    enc_params.pixel_format = Some(PixelFormat::Gbrp10Le);
+    let mut enc = reg.make_encoder(&enc_params).expect("encoder");
+    enc.send_frame(&Frame::Video(frame)).unwrap();
+    let pkt = enc.receive_packet().unwrap();
+    let dec_extra = enc.output_params().extradata.clone();
+
+    let mut dec_params = CodecParameters::video(CodecId::new("ffvhuff"));
+    dec_params.width = Some(width as u32);
+    dec_params.height = Some(height as u32);
+    dec_params.pixel_format = Some(PixelFormat::Gbrp10Le);
+    dec_params.extradata = dec_extra;
+    let mut dec = reg.make_decoder(&dec_params).expect("decoder");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), pkt.data).with_keyframe(true))
+        .unwrap();
+    let decoded = match dec.receive_frame().unwrap() {
+        Frame::Video(v) => v,
+        _ => panic!(),
+    };
+    assert_eq!(decoded.planes[0].data, gp, "G plane mismatch");
+    assert_eq!(decoded.planes[1].data, bp, "B plane mismatch");
+    assert_eq!(decoded.planes[2].data, rp, "R plane mismatch");
+}
+
+/// Self-roundtrip: encode yuv411p with our encoder, decode with our decoder.
+#[test]
+fn self_roundtrip_yuv411p_left() {
+    let width = 16usize;
+    let height = 8usize;
+    let cw = width / 4;
+    let ch = height;
+    let yn = width * height;
+    let cn = cw * ch;
+    let y: Vec<u8> = (0..yn).map(|i| ((i * 7 + 11) & 0xFF) as u8).collect();
+    let u: Vec<u8> = (0..cn).map(|i| ((i * 13 + 23) & 0xFF) as u8).collect();
+    let v: Vec<u8> = (0..cn).map(|i| ((i * 17 + 37) & 0xFF) as u8).collect();
+
+    use oxideav_core::frame::VideoPlane;
+    use oxideav_core::VideoFrame;
+    let frame = VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: width,
+                data: y.clone(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: u.clone(),
+            },
+            VideoPlane {
+                stride: cw,
+                data: v.clone(),
+            },
+        ],
+    };
+
+    use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame};
+    let mut reg = CodecRegistry::new();
+    register(&mut reg);
+    let mut enc_params = CodecParameters::video(CodecId::new("ffvhuff"));
+    enc_params.width = Some(width as u32);
+    enc_params.height = Some(height as u32);
+    enc_params.pixel_format = Some(PixelFormat::Yuv411P);
+    let mut enc = reg.make_encoder(&enc_params).expect("encoder");
+    enc.send_frame(&Frame::Video(frame)).unwrap();
+    let pkt = enc.receive_packet().unwrap();
+    let dec_extra = enc.output_params().extradata.clone();
+
+    let mut dec_params = CodecParameters::video(CodecId::new("ffvhuff"));
+    dec_params.width = Some(width as u32);
+    dec_params.height = Some(height as u32);
+    dec_params.pixel_format = Some(PixelFormat::Yuv411P);
+    dec_params.extradata = dec_extra;
+    let mut dec = reg.make_decoder(&dec_params).expect("decoder");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), pkt.data).with_keyframe(true))
+        .unwrap();
+    let decoded = match dec.receive_frame().unwrap() {
+        Frame::Video(v) => v,
+        _ => panic!(),
+    };
+    assert_eq!(decoded.planes[0].data, y, "Y plane mismatch");
+    assert_eq!(decoded.planes[1].data, u, "U plane mismatch");
+    assert_eq!(decoded.planes[2].data, v, "V plane mismatch");
+}
+
+/// Our ffvhuff encoder producing yuv411p decoded by ffmpeg.
+#[test]
+fn our_encoder_decoded_by_ffmpeg_yuv411p_left() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    cross_encode_then_ffmpeg_decode_v3("left", "yuv411p", PixelFormat::Yuv411P, 16, 16);
+}
+
+/// Our ffvhuff encoder producing gbrp10le decoded by ffmpeg.
+#[test]
+fn our_encoder_decoded_by_ffmpeg_gbrp10le_left() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not on PATH; skipping");
+        return;
+    }
+    // The encoder synthesises bps=10 extradata for Gbrp10Le.
+    // ffmpeg can decode the resulting stream as gbrp10le (2 bytes/sample).
+    cross_encode_then_ffmpeg_decode_v3("left", "gbrp10le", PixelFormat::Gbrp10Le, W, H);
+}
+
 /// Encode a frame through OUR encoder and decode it back through
 /// ffmpeg's `huffyuv` decoder. Asserts every plane sample matches a
 /// rawvideo reference produced from the same lavfi input.
@@ -703,6 +1030,52 @@ fn build_frame_from_raw(
                     },
                     VideoPlane {
                         stride: width,
+                        data: raw[2 * n..3 * n].to_vec(),
+                    },
+                ],
+            }
+        }
+        PixelFormat::Yuv411P => {
+            let cw = width / 4;
+            let yn = width * height;
+            let cn = cw * height;
+            let y = raw[0..yn].to_vec();
+            let u = raw[yn..yn + cn].to_vec();
+            let v = raw[yn + cn..yn + 2 * cn].to_vec();
+            VideoFrame {
+                pts: Some(0),
+                planes: vec![
+                    VideoPlane {
+                        stride: width,
+                        data: y,
+                    },
+                    VideoPlane {
+                        stride: cw,
+                        data: u,
+                    },
+                    VideoPlane {
+                        stride: cw,
+                        data: v,
+                    },
+                ],
+            }
+        }
+        // gbrp10le from ffmpeg rawvideo is 2 bytes/sample (16-bit LE); pass through directly.
+        PixelFormat::Gbrp10Le => {
+            let n = width * height * 2; // 2 bytes per sample
+            VideoFrame {
+                pts: Some(0),
+                planes: vec![
+                    VideoPlane {
+                        stride: width * 2,
+                        data: raw[..n].to_vec(),
+                    },
+                    VideoPlane {
+                        stride: width * 2,
+                        data: raw[n..2 * n].to_vec(),
+                    },
+                    VideoPlane {
+                        stride: width * 2,
                         data: raw[2 * n..3 * n].to_vec(),
                     },
                 ],
