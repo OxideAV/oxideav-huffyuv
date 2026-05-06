@@ -1,3 +1,40 @@
+NOTICE — clean-room methodology audit retired the source documentation
+(scoped to the current `master` branch only)
+
+The implementation on the current `master` branch was derived from a
+trace-document writeup that has been retired by the OxideAV docs audit
+dated 2026-05-06. The audit found that the writeup's authoring
+methodology did not satisfy clean-room separation (FFmpeg source files
+cited as the writeup's basis, not merely as the trace-instrumentation
+host). The audit document, including the codec-by-codec verdict, lives
+at:
+
+    https://github.com/OxideAV/docs/blob/master/AUDIT-2026-05-06.md
+
+Retired trace document(s) for this codec:
+  * video/huffyuv/huffyuv-trace-reverse-engineering.md
+  * video/huffyuv/data/ffvhuff-default-huffman.md
+
+Retirement commit:
+    https://github.com/OxideAV/docs/commit/669bc9f
+    (docs: retire 8 second-wave trace-RE writeups)
+
+A clean-room rebuild against a strict-isolation workspace
+(Specifier / Extractor / Implementer / Auditor roles, with explicit
+allow-list and forbidden-input list per role; FFmpeg source excluded
+under any path) is on the rebuild backlog, modelled on
+docs/video/msmpeg4/ and docs/video/magicyuv/.
+
+Plan: once the clean-room rounds complete and a fresh implementation
+derived solely from the new spec is ready, the current `master` branch
+will be renamed to `old/master` for archival and a freshly-orphaned
+`master` will ship the replacement implementation. The MIT licence
+below applies cleanly to that replacement; for any artifact in the
+current branch, the contestation status should be assessed against
+the audit document.
+
+================================================================================
+
 MIT License
 
 Copyright (c) 2026 Karpelès Lab Inc.
