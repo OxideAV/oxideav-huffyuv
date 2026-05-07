@@ -1,0 +1,418 @@
+//! HuffYUV / FFVHuff frame decoder.
+//!
+//! Consumes one AVI `00dc` chunk's worth of bytes plus the
+//! `BITMAPINFOHEADER` (parsed by [`crate::header::StreamConfig`]) and
+//! returns a [`DecodedFrame`] holding the per-pixel-family-shaped
+//! reconstructed bytes.
+
+use crate::bitio::BitReader;
+use crate::error::{Error, Result};
+use crate::header::{PixelFamily, Predictor, StreamConfig};
+use crate::predict::{inverse_gradient_post, inverse_rgb_decorr_bgr, inverse_rgb_decorr_bgra};
+use crate::tables::{
+    classic_blob_bytes, decode_one, rle_decode_one_channel, rle_decode_three_channels,
+    v1x_codes_set_a, v1x_codes_set_b, v1x_lengths_set_a, v1x_lengths_set_b, v1x_table_from_pair,
+    HuffTable,
+};
+
+/// Reconstructed frame produced by [`decode_frame`].
+#[derive(Debug, Clone)]
+pub struct DecodedFrame {
+    pub family: PixelFamily,
+    pub width: u32,
+    pub height: u32,
+    /// Pixel bytes in the family's wire layout (YUY2: `Y₁ U Y₂ V` per
+    /// 4-byte macropixel, top-down; RGB24: `B G R` per 3 bytes,
+    /// bottom-up; RGB32: `B G R A` per 4 bytes, bottom-up).
+    pub pixels: Vec<u8>,
+}
+
+/// Decode one HuffYUV frame.
+///
+/// `config` is the per-stream configuration parsed once at
+/// `ICDecompressBegin` time; `frame_bytes` is the raw payload of one
+/// AVI `00dc` chunk.
+pub fn decode_frame(config: &StreamConfig, frame_bytes: &[u8]) -> Result<DecodedFrame> {
+    let three_tables = build_three_tables(config)?;
+    match config.family {
+        PixelFamily::Yuy2 => decode_yuy2(config, frame_bytes, &three_tables),
+        PixelFamily::Rgb24 => decode_rgb24(config, frame_bytes, &three_tables),
+        PixelFamily::Rgb32 => decode_rgb32(config, frame_bytes, &three_tables),
+    }
+}
+
+/// The three per-channel-slot Huffman tables (spec/03 §1.2 slot
+/// architecture). Slot 1 = Y / B / B-G; Slot 2 = U / G / G; Slot 3 =
+/// V / R / R-G (and reused for RGB32 alpha).
+struct ThreeTables {
+    slot1: HuffTable,
+    slot2: HuffTable,
+    slot3: HuffTable,
+}
+
+fn build_three_tables(config: &StreamConfig) -> Result<ThreeTables> {
+    if config.has_extradata {
+        // v2.x extradata path: 3 RLE-compressed length tables in
+        // slot-1, slot-2, slot-3 order, then build canonical Huffman.
+        let lengths = if !config.extradata_tables.is_empty() {
+            rle_decode_three_channels(&config.extradata_tables)?
+        } else {
+            // Fallback: extradata-present flag set but the table
+            // region is empty — shouldn't happen on the wire but we
+            // accept it by falling through to the classic blob for
+            // this (family, method).
+            let blob = classic_blob_bytes(config.family, config.method);
+            rle_decode_three_channels(blob)?
+        };
+        Ok(ThreeTables {
+            slot1: HuffTable::build_from_lengths(&lengths[0])?,
+            slot2: HuffTable::build_from_lengths(&lengths[1])?,
+            slot3: HuffTable::build_from_lengths(&lengths[2])?,
+        })
+    } else {
+        // v1.x precomputed-codes path (spec/04 §4): the per-channel
+        // sharing depends on the family.
+        let lens_a_blob = v1x_lengths_set_a();
+        let lens_b_blob = v1x_lengths_set_b();
+        let mut cursor: &[u8] = lens_a_blob;
+        let lens_a = rle_decode_one_channel(&mut cursor)?;
+        let mut cursor: &[u8] = lens_b_blob;
+        let lens_b = rle_decode_one_channel(&mut cursor)?;
+        let codes_a_buf = v1x_codes_set_a();
+        let codes_b_buf = v1x_codes_set_b();
+        let mut codes_a = [0u8; 256];
+        codes_a.copy_from_slice(codes_a_buf);
+        let mut codes_b = [0u8; 256];
+        codes_b.copy_from_slice(codes_b_buf);
+        let table_a = v1x_table_from_pair(&lens_a, &codes_a)?;
+        let table_b = v1x_table_from_pair(&lens_b, &codes_b)?;
+
+        match config.family {
+            PixelFamily::Yuy2 => Ok(ThreeTables {
+                // v1.x YUY2: Y uses set A; both U and V use set B.
+                slot1: table_a,
+                slot2: table_b.clone(),
+                slot3: table_b,
+            }),
+            PixelFamily::Rgb24 | PixelFamily::Rgb32 => Ok(ThreeTables {
+                // v1.x RGB: all three of B, G, R use set A.
+                slot1: table_a.clone(),
+                slot2: table_a.clone(),
+                slot3: table_a,
+            }),
+        }
+    }
+}
+
+fn decode_yuy2(
+    config: &StreamConfig,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<DecodedFrame> {
+    let width = config.width as usize;
+    let height = config.height as usize;
+    if width % 2 != 0 {
+        return Err(Error::invalid("YUY2 width must be even"));
+    }
+    let row_bytes = width * 2; // Y₁ U Y₂ V per 2 px = 4 bytes per pair × (width/2) pairs = width × 2.
+    let total_bytes = row_bytes * height;
+    if frame_bytes.len() < 4 {
+        return Err(Error::invalid(
+            "YUY2 frame: missing 4-byte uncompressed pixel",
+        ));
+    }
+    let mut pixels = vec![0u8; total_bytes];
+    pixels[..4].copy_from_slice(&frame_bytes[..4]);
+
+    // Bit reader starts at the first byte after the uncompressed
+    // first pixel. spec/02 §4: 32-bit-LE-word framing of the
+    // codeword stream. The first word is at frame_bytes[4..8].
+    let bit_data = &frame_bytes[4..];
+    let mut reader = BitReader::new(bit_data);
+
+    // Wire byte → channel slot, repeating every 4 bytes:
+    //   +0 (Y₁) → slot1; +1 (U) → slot2; +2 (Y₂) → slot1; +3 (V) → slot3
+    // Total per-frame codes: (width × height) channel samples - 4
+    // (uncompressed first pixel). For YUY2, channel-sample count =
+    // total_bytes - 4.
+    for (byte_idx, slot_pixel) in pixels.iter_mut().enumerate().take(total_bytes).skip(4) {
+        let slot = match byte_idx % 4 {
+            0 | 2 => &tables.slot1,
+            1 => &tables.slot2,
+            _ => &tables.slot3,
+        };
+        let window = reader.peek_window();
+        let (sym, len) = decode_one(slot, window)?;
+        reader.consume_bits(len as u32)?;
+        *slot_pixel = sym;
+    }
+
+    // Apply the YUY2 predictor inverse. spec/03 §2.1.1 / §2.2.2 /
+    // §2.3.2.
+    //
+    // - LEFT: walk the per-byte-position-strided LEFT pass over
+    //   bytes 4..end of the linear raster.
+    // - GRADIENT: same as LEFT then per-row paddb (rows 1..H).
+    // - MEDIAN: LEFT pass over row 0 + the first 8 wire bytes of
+    //   row 1; median per-byte add elsewhere.
+    match config.method.predictor() {
+        Predictor::Left => {
+            inverse_yuy2_left(&mut pixels);
+        }
+        Predictor::Gradient => {
+            inverse_yuy2_left(&mut pixels);
+            inverse_gradient_post(&mut pixels, row_bytes, height);
+        }
+        Predictor::Median => {
+            inverse_yuy2_median(&mut pixels, row_bytes);
+        }
+    }
+
+    Ok(DecodedFrame {
+        family: PixelFamily::Yuy2,
+        width: config.width,
+        height: config.height,
+        pixels,
+    })
+}
+
+fn decode_rgb24(
+    config: &StreamConfig,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<DecodedFrame> {
+    let width = config.width as usize;
+    let height = config.height as usize;
+    let row_bytes = width * 3;
+    let total_bytes = row_bytes * height;
+    if frame_bytes.len() < 4 {
+        return Err(Error::invalid(
+            "RGB24 frame: missing 4-byte uncompressed pixel",
+        ));
+    }
+    let mut pixels = vec![0u8; total_bytes];
+    // First uncompressed pixel: stored as `00 B G R` (4 wire bytes,
+    // X = 0). The reconstructed buffer holds 3-byte BGR, so write
+    // bytes 1..4 of the first 4-byte cell into the first 3 output
+    // bytes (spec/03 §1.1 + §1.4: encoder writes pad as 0, decoder
+    // discards).
+    pixels[0] = frame_bytes[1]; // B
+    pixels[1] = frame_bytes[2]; // G
+    pixels[2] = frame_bytes[3]; // R
+
+    let bit_data = &frame_bytes[4..];
+    let mut reader = BitReader::new(bit_data);
+
+    // For each subsequent pixel, the codeword count + slot order
+    // depends on whether decorrelation is enabled (spec/03 §1.4):
+    //   - non-decorr:  3 codes per pixel: B (slot1), G (slot2), R (slot3)
+    //   - decorr:      3 codes per pixel: G (slot2), B-G (slot1), R-G (slot3)
+    // The reconstructed buffer always stores 3-byte BGR.
+    let n_pixels = width * height;
+    for px in 1..n_pixels {
+        let bgr_off = px * 3;
+        if config.method.decorrelate() {
+            // G first.
+            let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
+            reader.consume_bits(lg as u32)?;
+            // B-G next.
+            let (bg, lb) = decode_one(&tables.slot1, reader.peek_window())?;
+            reader.consume_bits(lb as u32)?;
+            // R-G last.
+            let (rg, lr) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits(lr as u32)?;
+            // Store decorrelated values in BGR layout: B = (B-G), G,
+            // R = (R-G). The decorrelation transform inverse runs
+            // after the predictor pass below.
+            pixels[bgr_off] = bg;
+            pixels[bgr_off + 1] = g;
+            pixels[bgr_off + 2] = rg;
+        } else {
+            let (b, lb) = decode_one(&tables.slot1, reader.peek_window())?;
+            reader.consume_bits(lb as u32)?;
+            let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
+            reader.consume_bits(lg as u32)?;
+            let (r, lr) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits(lr as u32)?;
+            pixels[bgr_off] = b;
+            pixels[bgr_off + 1] = g;
+            pixels[bgr_off + 2] = r;
+        }
+    }
+
+    // Predictor inverse on the per-channel residual stream. Channels
+    // are interleaved 3-byte BGR; LEFT walks each channel via stride
+    // 3.
+    inverse_left_per_channel(&mut pixels, 3);
+    match config.method.predictor() {
+        Predictor::Left => {}
+        Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height),
+        Predictor::Median => {
+            return Err(Error::invalid("median predictor not legal for RGB"));
+        }
+    }
+    if config.method.decorrelate() {
+        // Inverse decorrelation: B = (B-G) + G, R = (R-G) + G.
+        inverse_rgb_decorr_bgr(&mut pixels);
+    }
+
+    Ok(DecodedFrame {
+        family: PixelFamily::Rgb24,
+        width: config.width,
+        height: config.height,
+        pixels,
+    })
+}
+
+fn decode_rgb32(
+    config: &StreamConfig,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<DecodedFrame> {
+    let width = config.width as usize;
+    let height = config.height as usize;
+    let row_bytes = width * 4;
+    let total_bytes = row_bytes * height;
+    if frame_bytes.len() < 4 {
+        return Err(Error::invalid(
+            "RGB32 frame: missing 4-byte uncompressed pixel",
+        ));
+    }
+    let mut pixels = vec![0u8; total_bytes];
+    // First pixel verbatim (B G R A). spec/03 §1.3: alpha is real
+    // data, no pad-byte zeroing.
+    pixels[..4].copy_from_slice(&frame_bytes[..4]);
+
+    let bit_data = &frame_bytes[4..];
+    let mut reader = BitReader::new(bit_data);
+    let n_pixels = width * height;
+
+    for px in 1..n_pixels {
+        let off = px * 4;
+        if config.method.decorrelate() {
+            // wire order: G, B-G, R-G, A. Slot mapping: G→slot2,
+            // B-G→slot1, R-G→slot3, A→slot3 (alpha shares slot-3
+            // codebook per spec/03 §1.2).
+            let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
+            reader.consume_bits(lg as u32)?;
+            let (bg, lb) = decode_one(&tables.slot1, reader.peek_window())?;
+            reader.consume_bits(lb as u32)?;
+            let (rg, lr) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits(lr as u32)?;
+            let (a, la) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits(la as u32)?;
+            pixels[off] = bg;
+            pixels[off + 1] = g;
+            pixels[off + 2] = rg;
+            pixels[off + 3] = a;
+        } else {
+            let (b, lb) = decode_one(&tables.slot1, reader.peek_window())?;
+            reader.consume_bits(lb as u32)?;
+            let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
+            reader.consume_bits(lg as u32)?;
+            let (r, lr) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits(lr as u32)?;
+            // A residual reuses slot-3 codebook (spec/03 §1.2).
+            let (a, la) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits(la as u32)?;
+            pixels[off] = b;
+            pixels[off + 1] = g;
+            pixels[off + 2] = r;
+            pixels[off + 3] = a;
+        }
+    }
+
+    // Per-channel LEFT inverse, stride 4.
+    inverse_left_per_channel(&mut pixels, 4);
+    match config.method.predictor() {
+        Predictor::Left => {}
+        Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height),
+        Predictor::Median => {
+            return Err(Error::invalid("median predictor not legal for RGB"));
+        }
+    }
+    if config.method.decorrelate() {
+        inverse_rgb_decorr_bgra(&mut pixels);
+    }
+
+    Ok(DecodedFrame {
+        family: PixelFamily::Rgb32,
+        width: config.width,
+        height: config.height,
+        pixels,
+    })
+}
+
+/// Per-channel LEFT inverse on an N-channel-interleaved buffer. Each
+/// channel walks its own LEFT-pass via stride `n_channels`. spec/03
+/// §2.1.
+fn inverse_left_per_channel(out: &mut [u8], n_channels: usize) {
+    if out.len() <= n_channels {
+        return;
+    }
+    for i in n_channels..out.len() {
+        out[i] = out[i].wrapping_add(out[i - n_channels]);
+    }
+}
+
+/// YUY2 LEFT inverse with the per-byte-position strides of spec/03
+/// §2.1.1 (Y₁ ← Y₂_prev_macro at -2; U ← U_prev_macro at -4 (= -3
+/// from byte 1); Y₂ ← Y₁_same_macro at -2; V ← V_prev_macro at -4
+/// (= -3 from byte 3)). Walks the linear raster from byte 4 onward;
+/// the first 4 bytes are the uncompressed seed.
+fn inverse_yuy2_left(out: &mut [u8]) {
+    inverse_yuy2_left_range(out, 4, out.len());
+}
+
+fn inverse_yuy2_left_range(out: &mut [u8], begin: usize, end: usize) {
+    if end <= begin {
+        return;
+    }
+    let mut i = begin;
+    while i < end {
+        match i & 3 {
+            0 | 2 => out[i] = out[i].wrapping_add(out[i - 2]),
+            _ => out[i] = out[i].wrapping_add(out[i - 4]),
+        }
+        i += 1;
+    }
+}
+
+/// YUY2 MEDIAN inverse: spec/03 §2.3.2. LEFT-predicts row 0 + the
+/// first 8 wire bytes of row 1, then per-byte median add for rows 1
+/// pos ≥ 8 + every later row.
+fn inverse_yuy2_median(out: &mut [u8], row_bytes: usize) {
+    let len = out.len();
+    if len <= 4 {
+        return;
+    }
+    // Row 0 LEFT pass.
+    let row0_end = row_bytes.min(len);
+    inverse_yuy2_left_range(out, 4, row0_end);
+    // First 8 bytes of row 1 (LEFT exemption).
+    if len > row_bytes {
+        let row1_left_end = (row_bytes + 8).min(len);
+        inverse_yuy2_left_range(out, row_bytes, row1_left_end);
+        // Median per-byte add for the remaining bytes of row 1 + all
+        // rows ≥ 2. spec/03 §2.3 trace: L at -2, A at -row_stride,
+        // AL at -row_stride - 2.
+        let mut pos = row1_left_end;
+        while pos < len {
+            if pos < 2 || pos < row_bytes {
+                pos += 1;
+                continue;
+            }
+            let l = out[pos - 2];
+            let a = out[pos - row_bytes];
+            let al = if pos >= row_bytes + 2 {
+                out[pos - row_bytes - 2]
+            } else {
+                0
+            };
+            let g = l.wrapping_add(a).wrapping_sub(al);
+            let predictor = crate::predict::median3(l, a, g);
+            out[pos] = out[pos].wrapping_add(predictor);
+            pos += 1;
+        }
+    }
+}

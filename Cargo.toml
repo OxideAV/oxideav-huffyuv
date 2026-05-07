@@ -13,8 +13,12 @@ homepage = "https://github.com/OxideAV/oxideav-huffyuv"
 keywords = ["multimedia", "video", "huffyuv", "lossless", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
-[dependencies]
-oxideav-core = "0.1"
+[features]
+default = ["registry"]
+# Wire the crate's `Decoder` impl + `register(ctx)` entry point into
+# `oxideav-core`'s codec registry. Disable for standalone builds that
+# want the decoder without dragging in the framework.
+registry = ["dep:oxideav-core"]
 
-[dev-dependencies]
-oxideav-avi = "0.0"
+[dependencies]
+oxideav-core = { version = "0.1", optional = true }
