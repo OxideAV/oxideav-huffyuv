@@ -1,0 +1,20 @@
+[package]
+name = "oxideav-huffyuv"
+version = "0.0.2"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-huffyuv"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust HuffYUV / FFVHuff lossless intra-only video decoder for oxideav"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-huffyuv"
+keywords = ["multimedia", "video", "huffyuv", "lossless", "codec"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"
+
+[dev-dependencies]
+oxideav-avi = "0.0"
