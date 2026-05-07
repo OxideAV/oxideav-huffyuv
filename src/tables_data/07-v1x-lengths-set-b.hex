@@ -1,0 +1,70 @@
+# huffyuv.dll record 07 — v1x-lengths-set-b          
+# Source binary (primary): system32/huffyuv.dll  (PE32+ x86-64, 55,296 B)
+# SHA-256: c2810bd0d3737025c92f505733dff6538da2ac4e4cae7e62f7aae1967476efc8
+# Source RVA (x86-64): 0x1000a9d0
+# File offset (x86-64): 0x000093d0
+# Encoded size (bytes):  59
+# Shape: v1.x compact-encoded 256-symbol length array (used by U,V on YUY2)
+# Cross-arch verification (i386, syswow64/huffyuv.dll, SHA-256 a8511c530ac83d15225d3eeebf764513fcbad98a1d51994e3c2aebd8e26404e9):
+#   i386 RVA: 0x100074f0   file offset: 0x000064f0   bytes: byte-identical to x86-64
+# Tool: xxd (extracted by tables/extract-huffyuv-records.sh)
+# Format: raw bytes, one byte per line as 'XX' (uppercase hex)
+42
+24
+25
+26
+27
+28
+29
+4B
+4C
+4D
+6E
+EF
+90
+51
+52
+53
+54
+55
+76
+B7
+38
+39
+58
+59
+38
+59
+9A
+39
+3A
+39
+1A
+8D
+39
+38
+3A
+39
+3A
+39
+B8
+77
+D6
+F5
+74
+53
+52
+31
+50
+4F
+4E
+4D
+2C
+4B
+29
+28
+27
+26
+25
+24
+22

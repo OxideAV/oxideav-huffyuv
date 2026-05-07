@@ -1,0 +1,123 @@
+# huffyuv.dll record 03 — rgb-left-blob              
+# Source binary (primary): system32/huffyuv.dll  (PE32+ x86-64, 55,296 B)
+# SHA-256: c2810bd0d3737025c92f505733dff6538da2ac4e4cae7e62f7aae1967476efc8
+# Source RVA (x86-64): 0x1000a790
+# File offset (x86-64): 0x00009190
+# Encoded size (bytes): 111
+# Decoded size (bytes, expected per orchestrator-verified shape): 768
+# Shape: RGB / left predictor (methods 0x00, 0xFE); decoded=B(256)+G(256)+R(256), lengths in [0,31]
+# Cross-arch verification (i386, syswow64/huffyuv.dll, SHA-256 a8511c530ac83d15225d3eeebf764513fcbad98a1d51994e3c2aebd8e26404e9):
+#   i386 RVA: 0x100072c0   file offset: 0x000062c0   bytes: byte-identical to x86-64
+# Tool: xxd (extracted by tables/extract-huffyuv-records.sh)
+# Format: raw bytes, one byte per line as 'XX' (uppercase hex)
+63
+24
+25
+26
+47
+88
+C9
+0A
+0D
+0B
+13
+0C
+16
+0D
+1C
+0E
+21
+0F
+09
+2E
+2F
+0E
+0F
+0D
+18
+2C
+2D
+0C
+15
+0B
+13
+0A
+0B
+09
+08
+A8
+47
+26
+25
+24
+43
+22
+43
+25
+46
+47
+A8
+09
+09
+0A
+0E
+0B
+16
+0C
+18
+0D
+1A
+0E
+2E
+0D
+11
+0C
+1B
+0B
+14
+0A
+0E
+09
+0A
+C8
+67
+46
+25
+24
+23
+22
+23
+44
+25
+26
+47
+88
+E9
+0A
+0B
+0B
+12
+0C
+18
+0D
+1C
+2E
+2D
+0E
+3D
+0D
+16
+0C
+15
+0B
+13
+0A
+0B
+09
+08
+A8
+47
+26
+25
+44
+23

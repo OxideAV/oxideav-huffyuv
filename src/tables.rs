@@ -19,25 +19,17 @@ use crate::header::{Method, PixelFamily};
 // per blob) and the parsed bytes are `'static` after the first lookup
 // via `OnceLock`.
 
-const YUV_LEFT_HEX: &str = include_str!("../../../docs/video/huffyuv/tables/00-yuv-left-blob.hex");
-const YUV_GRADIENT_HEX: &str =
-    include_str!("../../../docs/video/huffyuv/tables/01-yuv-gradient-blob.hex");
-const YUV_MEDIAN_HEX: &str =
-    include_str!("../../../docs/video/huffyuv/tables/02-yuv-median-blob.hex");
-const RGB_LEFT_HEX: &str = include_str!("../../../docs/video/huffyuv/tables/03-rgb-left-blob.hex");
-const RGB_LEFT_DECORR_HEX: &str =
-    include_str!("../../../docs/video/huffyuv/tables/04-rgb-left-decorr-blob.hex");
-const RGB_GRADIENT_DECORR_HEX: &str =
-    include_str!("../../../docs/video/huffyuv/tables/05-rgb-gradient-decorr-blob.hex");
+const YUV_LEFT_HEX: &str = include_str!("tables_data/00-yuv-left-blob.hex");
+const YUV_GRADIENT_HEX: &str = include_str!("tables_data/01-yuv-gradient-blob.hex");
+const YUV_MEDIAN_HEX: &str = include_str!("tables_data/02-yuv-median-blob.hex");
+const RGB_LEFT_HEX: &str = include_str!("tables_data/03-rgb-left-blob.hex");
+const RGB_LEFT_DECORR_HEX: &str = include_str!("tables_data/04-rgb-left-decorr-blob.hex");
+const RGB_GRADIENT_DECORR_HEX: &str = include_str!("tables_data/05-rgb-gradient-decorr-blob.hex");
 
-const V1X_LENGTHS_SET_A_HEX: &str =
-    include_str!("../../../docs/video/huffyuv/tables/06-v1x-lengths-set-a.hex");
-const V1X_LENGTHS_SET_B_HEX: &str =
-    include_str!("../../../docs/video/huffyuv/tables/07-v1x-lengths-set-b.hex");
-const V1X_CODES_SET_A_CSV: &str =
-    include_str!("../../../docs/video/huffyuv/tables/08-v1x-codes-set-a.csv");
-const V1X_CODES_SET_B_CSV: &str =
-    include_str!("../../../docs/video/huffyuv/tables/09-v1x-codes-set-b.csv");
+const V1X_LENGTHS_SET_A_HEX: &str = include_str!("tables_data/06-v1x-lengths-set-a.hex");
+const V1X_LENGTHS_SET_B_HEX: &str = include_str!("tables_data/07-v1x-lengths-set-b.hex");
+const V1X_CODES_SET_A_CSV: &str = include_str!("tables_data/08-v1x-codes-set-a.csv");
+const V1X_CODES_SET_B_CSV: &str = include_str!("tables_data/09-v1x-codes-set-b.csv");
 
 /// Identify which of the six classic blobs a `(family, method)` pair
 /// selects (spec/03 §4 / spec/04 §3.1).
