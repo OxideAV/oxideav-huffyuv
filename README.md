@@ -5,12 +5,12 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 1 — clean-room rebuild.** The crate's `master` branch is a
-fresh orphan; the previous implementation was retired alongside the
-docs audit dated 2026-05-06 (the source-of-record trace document for
-this codec did not satisfy clean-room separation). This round-1 build
-implements the wire format from the strict-isolation clean-room
-workspace at [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
+**Round 2 — encoder push.** Round 1 (decoder) and round 2 (encoder)
+both ship from the strict-isolation clean-room workspace at
+[`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
+The previous (pre-orphan) implementation was retired alongside the
+docs audit dated 2026-05-06; the prior history is preserved on the
+`old` branch.
 
 ## What works (Round 1)
 
@@ -32,12 +32,27 @@ workspace at [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master
   codec registry so `oxideav-avi` resolves a HuffYUV stream's
   `biCompression` straight through `CodecResolver`.
 
+## What works (Round 2)
+
+- **Frame encoder** for the same six methods × three pixel families
+  the decoder accepts (where the spec/01 §3.1 method/family allow-list
+  permits — RGB doesn't carry `Median` and YUV doesn't carry the
+  decorr methods, so the cross-product is 12 legal pairs).
+- Three extradata paths via `ExtradataMode`:
+  - **`ClassicV2`** (default) — embeds the matching pre-baked classic
+    blob (the proprietary's default, spec/04 §3).
+  - **`CustomV2`** — builds per-channel histograms from the residual
+    stream, runs a length-limited (max-31) package-merge Huffman
+    builder, and RLE-encodes the resulting length tables in line.
+  - **`V1xCompat`** — emits `biSize == 0x28` with no extradata; the
+    decoder reads its codebook from the v1.x precomputed-codes set.
+- Public **`build_bitmapinfoheader`** BIH writer for muxers that need
+  to synthesise an AVI `strf` payload.
+
 ## Out of scope (deferred)
 
 - 10/12-bit FFVHuff family.
 - Interlaced field-stride=2 prediction (`biHeight > 288`).
-- Encoder is round-1 self-test only; a public encoder API will land
-  with the Auditor's lockstep trace harness in round 2+.
 
 ## Cargo features
 

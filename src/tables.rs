@@ -234,6 +234,238 @@ pub fn rle_decode_three_channels(blob: &[u8]) -> Result<[[u8; 256]; 3]> {
     Ok([s1, s2, s3])
 }
 
+// ───────────────────────── RLE encoder ─────────────────────────
+//
+// spec/01 §5 (encoder side). The decoder grammar is:
+//   leading byte b: value = b & 0x1F, count_hint = b >> 5
+//   if count_hint == 0: read second byte c; c == 0 ends the channel,
+//                       otherwise c is the run count
+//   else                count = count_hint (1..7)
+//
+// The decoder's outer loop terminates at `idx == 256` regardless of
+// whether a terminator follows. The six classic blobs (151..217 wire
+// bytes for 768 expanded length-table bytes) contain NO `0x00` bytes:
+// each per-channel block fills exactly 256 slots and the next block
+// starts immediately. The lstrcpyA terminator at the end of the whole
+// 3-channel concat is just the C-string null and is not a per-channel
+// in-band signal — see [`spec/01`](spec/01) §5 for the audit notes.
+//
+// So our encoder does NOT emit a `0x00 0x00` between channels. Each
+// `rle_encode_one_channel` call emits exactly the bytes the decoder
+// will consume to fill 256 slots, and nothing more.
+
+/// RLE-encode one 256-byte length table to `out`. spec/01 §5: each
+/// run uses the count-hint when count ≤ 7, otherwise the long-form
+/// `value 0x_NN` (NN > 0) for runs of 8..255. No trailing `0x00 0x00`
+/// is appended — see module-level note.
+pub fn rle_encode_one_channel(lengths: &[u8; 256], out: &mut Vec<u8>) -> Result<()> {
+    for &l in lengths.iter() {
+        if l > 31 {
+            return Err(Error::invalid(format!(
+                "RLE encode: length {l} out of [0, 31]"
+            )));
+        }
+    }
+    // Run-length pass.
+    let mut i = 0usize;
+    while i < 256 {
+        let v = lengths[i];
+        let mut run = 1usize;
+        while i + run < 256 && lengths[i + run] == v && run < 255 {
+            run += 1;
+        }
+        // Emit (v, run).
+        let mut remaining = run;
+        while remaining > 0 {
+            if remaining <= 7 {
+                let chunk = remaining as u8;
+                let b = (chunk << 5) | (v & 0x1F);
+                // chunk ≥ 1 → count_hint ≥ 1 → `b` ≥ 0x20 regardless
+                // of `v`. Safe (no in-band `0x00` produced).
+                out.push(b);
+                remaining = 0;
+            } else {
+                // Long-form: count_hint = 0 (leading byte = v),
+                // followed by an explicit count in 1..=255.
+                let chunk = remaining.min(255) as u8;
+                let leading = v & 0x1F;
+                out.push(leading);
+                out.push(chunk);
+                remaining -= chunk as usize;
+            }
+        }
+        i += run;
+    }
+    Ok(())
+}
+
+/// RLE-encode three per-channel length tables into one extradata
+/// `tables` blob (the bytes that live at +0x2C in the BIH).
+pub fn rle_encode_three_channels(lengths: &[[u8; 256]; 3]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for slot in lengths.iter() {
+        rle_encode_one_channel(slot, &mut out)?;
+    }
+    Ok(out)
+}
+
+// ───────── Length-limited canonical-Huffman length computation ─────────
+//
+// Round-2 v2.x custom-tables encoder path: given a per-channel byte
+// histogram, compute the length table that minimises the expected
+// codeword length subject to `max_length ≤ 31` (spec/03 §3.2.3 #2).
+//
+// We use the "package-merge" algorithm (Larmore-Hirschberg) in the
+// plain length-limited Huffman form. It's the textbook recipe; the
+// algorithm itself is mathematics, not codec-specific. For 256-symbol
+// alphabets it runs in O(256 * 31) = O(8192) work, which is trivial.
+//
+// Spec invariants we honour:
+// - lengths in 0..=31 (spec/03 §3.2.3 #2)
+// - length 0 ⇔ symbol absent (zero count)
+// - Kraft equality (sum 2^-L_i == 1) when at least one symbol is
+//   present.
+// - For a single-symbol histogram we still emit length 1 (single-bit
+//   code) so that decode windows have at least one bit to consume.
+
+/// Build a per-symbol length table from a 256-entry histogram. Symbols
+/// with a zero count get length 0; everything else gets a length in
+/// 1..=31.
+pub fn compute_canonical_lengths(histogram: &[u32; 256]) -> Result<[u8; 256]> {
+    // Collect (sym, freq) for present symbols.
+    let mut active: Vec<(u16, u32)> = Vec::new();
+    for (sym, &f) in histogram.iter().enumerate() {
+        if f > 0 {
+            active.push((sym as u16, f));
+        }
+    }
+    let mut lengths = [0u8; 256];
+    if active.is_empty() {
+        return Ok(lengths);
+    }
+    if active.len() == 1 {
+        // A single-symbol alphabet: assign length 1 (the code is just
+        // "0" or "1" — either works; we pick whatever canonical-build
+        // emits).
+        lengths[active[0].0 as usize] = 1;
+        return Ok(lengths);
+    }
+    if active.len() == 2 {
+        lengths[active[0].0 as usize] = 1;
+        lengths[active[1].0 as usize] = 1;
+        return Ok(lengths);
+    }
+
+    const MAX_L: usize = 31;
+    let n = active.len();
+    // Sort active symbols by frequency ascending (then by symbol).
+    active.sort_by_key(|&(s, f)| (f, s));
+
+    // package-merge state: per length-tier `tier`, a vector of
+    // "packages" each carrying weight + a bitset (or list) of which
+    // original symbols it contributed to. Since n ≤ 256, we can store
+    // package memberships compactly as `Vec<u16>` (sorted symbol ids).
+    #[derive(Clone)]
+    struct Pkg {
+        weight: u64,
+        // List of original symbol indices (sorted) contributing to this package.
+        members: Vec<u16>,
+    }
+
+    // Tier 0 (deepest): one package per active symbol with weight = freq.
+    let mut tier: Vec<Pkg> = active
+        .iter()
+        .map(|&(s, f)| Pkg {
+            weight: f as u64,
+            members: vec![s],
+        })
+        .collect();
+
+    let leaves: Vec<Pkg> = tier.clone();
+
+    // Iterate up MAX_L - 1 levels; each level packages the previous
+    // tier (consecutive pairs) and merges with the leaf list.
+    for _ in 0..(MAX_L - 1) {
+        // Package: pair up tier[0..2*k] into k packages.
+        let mut packaged: Vec<Pkg> = Vec::with_capacity(tier.len() / 2);
+        let mut i = 0;
+        while i + 1 < tier.len() {
+            let mut members = tier[i].members.clone();
+            members.extend_from_slice(&tier[i + 1].members);
+            members.sort_unstable();
+            packaged.push(Pkg {
+                weight: tier[i].weight + tier[i + 1].weight,
+                members,
+            });
+            i += 2;
+        }
+        // Merge with leaves (both already sorted by weight ascending).
+        let mut merged: Vec<Pkg> = Vec::with_capacity(packaged.len() + leaves.len());
+        let mut a = 0usize;
+        let mut b = 0usize;
+        while a < packaged.len() && b < leaves.len() {
+            if packaged[a].weight <= leaves[b].weight {
+                merged.push(packaged[a].clone());
+                a += 1;
+            } else {
+                merged.push(leaves[b].clone());
+                b += 1;
+            }
+        }
+        while a < packaged.len() {
+            merged.push(packaged[a].clone());
+            a += 1;
+        }
+        while b < leaves.len() {
+            merged.push(leaves[b].clone());
+            b += 1;
+        }
+        tier = merged;
+    }
+
+    // Take the cheapest 2*n - 2 packages from the final tier; for each,
+    // each contributing leaf gets +1 length contribution.
+    // Actually the standard formulation: take 2*n - 2 cheapest from the
+    // top tier; symbol's length = number of times it appears among the
+    // 2n-2 selected packages.
+    let take = 2 * n - 2;
+    if tier.len() < take {
+        return Err(Error::invalid(
+            "package-merge: insufficient packages — alphabet too small for max length",
+        ));
+    }
+    // tier is already sorted by weight ascending.
+    let mut counts = [0u8; 256];
+    for pkg in tier.iter().take(take) {
+        for &s in pkg.members.iter() {
+            counts[s as usize] = counts[s as usize].saturating_add(1);
+        }
+    }
+    for &(s, _) in active.iter() {
+        let l = counts[s as usize];
+        if l == 0 || l > MAX_L as u8 {
+            return Err(Error::invalid(format!(
+                "package-merge: symbol {s} got out-of-range length {l}"
+            )));
+        }
+        lengths[s as usize] = l;
+    }
+    // Sanity: Kraft equality.
+    let mut kraft: u64 = 0;
+    for &l in lengths.iter() {
+        if l > 0 {
+            kraft = kraft.saturating_add(1u64 << (MAX_L as u8 - l));
+        }
+    }
+    let target: u64 = 1u64 << (MAX_L as u8);
+    if kraft != target {
+        return Err(Error::invalid(format!(
+            "package-merge: Kraft sum {kraft} != target {target}"
+        )));
+    }
+    Ok(lengths)
+}
+
 // ───────────────────────── canonical Huffman ─────────────────────────
 //
 // spec/03 §3 + §3.2 + spec/04 §2.6. The proprietary binary's variant
