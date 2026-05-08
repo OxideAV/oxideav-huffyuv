@@ -46,6 +46,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod avi;
 pub mod bitio;
 pub mod decoder;
 pub mod encoder;

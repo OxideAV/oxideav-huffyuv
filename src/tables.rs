@@ -489,16 +489,30 @@ pub struct HuffEntry {
 #[derive(Debug, Clone)]
 pub struct HuffTable {
     pub entries: [HuffEntry; 256],
-    /// `decode[i].len` and `decode[i].sym` for i in 0..256 — a flat,
-    /// length-then-symbol-indexed lookup is built lazily by the
-    /// decoder via [`decode_one`]; we keep the per-symbol entries here
-    /// and walk them for decode rather than rebuilding a separate
-    /// prefix tree. This keeps the table tiny and removes a class of
-    /// bugs at the cost of O(256) per-symbol decode (acceptable for
-    /// round 1; round 2 can swap in a fast LUT once a trace lockstep
-    /// is in place).
+    /// Maximum non-zero length present in `entries` (1..=31, or 0 if
+    /// the table is empty).
     pub max_length: u8,
+    /// Fast decode LUT keyed on the top 16 bits of the bit window.
+    /// Each `u16` slot encodes either:
+    /// - **fast hit** (top bit clear): low 8 bits = symbol; bits 8..15
+    ///   = length (1..=16). The decoder consumes `length` bits.
+    /// - **overflow** (top bit set, value `0x8000`): the code matching
+    ///   this 16-bit window is longer than 16 bits; caller falls back
+    ///   to [`decode_one_slow`] which walks the per-symbol entries on
+    ///   the full 32-bit window.
+    ///
+    /// Built once at table-construction time by
+    /// [`HuffTable::build_from_lengths`] /
+    /// [`v1x_table_from_pair`]; subsequent decode is O(1) for the
+    /// common path. spec/03 §3.2.2 (the proprietary's primary-LUT +
+    /// secondary-walk pattern). 65 536 × `u16` = 128 KiB per table,
+    /// allocated on the heap to avoid blowing the stack.
+    pub primary_lut: Box<[u16; 65536]>,
 }
+
+/// Sentinel value in [`HuffTable::primary_lut`] that means "code is
+/// longer than 16 bits; walk the slow path".
+pub const PRIMARY_LUT_OVERFLOW: u16 = 0x8000;
 
 impl HuffTable {
     /// Build canonical-Huffman codes from a 256-byte length table per
@@ -550,9 +564,11 @@ impl HuffTable {
                 "non-canonical length distribution (Kraft inequality not 0)",
             ));
         }
+        let primary_lut = build_primary_lut(&entries);
         Ok(Self {
             entries,
             max_length,
+            primary_lut,
         })
     }
 
@@ -581,9 +597,11 @@ impl HuffTable {
             }
         }
         if max_length == 0 {
+            let primary_lut = build_primary_lut(&entries);
             return Ok(Self {
                 entries,
                 max_length,
+                primary_lut,
             });
         }
         // Shortest length first, ascending symbol within each tier.
@@ -614,11 +632,51 @@ impl HuffTable {
             code = code.wrapping_add(1);
             prev_len = l;
         }
+        let primary_lut = build_primary_lut(&entries);
         Ok(Self {
             entries,
             max_length,
+            primary_lut,
         })
     }
+}
+
+/// Build the 65 536-entry primary LUT for [`decode_one`]'s fast
+/// path. For each (length, code) ≤ 16 bits, every 16-bit window whose
+/// top `length` bits match the code is filled with `(length << 8) |
+/// symbol`. Slots whose top bits select a code longer than 16 bits
+/// are filled with [`PRIMARY_LUT_OVERFLOW`]. spec/03 §3.2.2 (the
+/// proprietary's primary-LUT-then-walk pattern: ~99 % of codes hit
+/// the primary table for the binary's ship-shipped 8-bit-mode
+/// classic blobs).
+fn build_primary_lut(entries: &[HuffEntry; 256]) -> Box<[u16; 65536]> {
+    let mut lut: Box<[u16; 65536]> = vec![PRIMARY_LUT_OVERFLOW; 65536]
+        .into_boxed_slice()
+        .try_into()
+        .expect("65536 element vec");
+    for (sym, e) in entries.iter().enumerate() {
+        let l = e.length;
+        if l == 0 || l > 16 {
+            // Length 0 = absent; length > 16 = overflow handled by
+            // slow path. The slow path does the full per-symbol scan
+            // when the LUT slot is `PRIMARY_LUT_OVERFLOW`.
+            continue;
+        }
+        // Top L bits of the 32-bit MSB-aligned code, right-aligned.
+        let prefix = (e.code >> (32 - l as u32)) as u16;
+        // The 16-bit LUT slot has L "fixed" high bits (= prefix shifted
+        // up by 16-L) and (16-L) "free" low bits. We fill all 2^(16-L)
+        // such slots with the same hit-record.
+        let shift = 16 - l as u32;
+        let base = (prefix as u32) << shift;
+        let count = 1u32 << shift;
+        let payload = ((l as u16) << 8) | sym as u16;
+        for i in 0..count {
+            let idx = (base | i) as usize;
+            lut[idx] = payload;
+        }
+    }
+    lut
 }
 
 /// Produce a `HuffTable` directly from raw 256-byte length and
@@ -658,27 +716,42 @@ pub fn v1x_table_from_pair(lengths: &[u8; 256], codes: &[u8; 256]) -> Result<Huf
             code: msb_aligned,
         };
     }
+    let primary_lut = build_primary_lut(&entries);
     Ok(HuffTable {
         entries,
         max_length,
+        primary_lut,
     })
 }
 
-/// Decode the next symbol from a 32-bit MSB-first bit window, by
-/// scanning per-symbol entries directly. Returns `(symbol, length)`.
-/// Round-1 simple linear scan; Round-2 will swap in a length-bucketed
-/// LUT once Auditor lockstep is in place.
+/// Decode the next symbol from a 32-bit MSB-first bit window. Returns
+/// `(symbol, length)`. Hot path: a single 16-bit indexed load into
+/// the primary LUT (≤ 16-bit codes). For codes longer than 16 bits
+/// the LUT slot is [`PRIMARY_LUT_OVERFLOW`] and we fall through to
+/// [`decode_one_slow`]. spec/03 §3.2.2.
+#[inline]
 pub fn decode_one(table: &HuffTable, window: u32) -> Result<(u8, u8)> {
-    // Walk lengths in ascending order; for each candidate length, the
-    // top L bits of `window` form the code value to compare. We can
-    // find the first matching (length, code) by tier.
-    // For correctness we walk each of the 256 entries and check
-    // whether the entry's MSB-aligned code matches the top L bits of
-    // window. Cost: ≤ 256 iterations / symbol; sufficient for round 1
-    // self-roundtrip tests.
-    for entry in table.entries.iter() {
+    let prefix = (window >> 16) as usize;
+    let slot = table.primary_lut[prefix];
+    if slot != PRIMARY_LUT_OVERFLOW {
+        // Fast hit: low 8 bits = symbol, bits 8..15 = length.
+        let length = (slot >> 8) as u8;
+        let symbol = (slot & 0xFF) as u8;
+        return Ok((symbol, length));
+    }
+    decode_one_slow(table, window)
+}
+
+/// Slow-path decoder for codes longer than 16 bits — walks the
+/// per-symbol entries on the full 32-bit window. Only invoked from
+/// [`decode_one`] when the primary LUT signals overflow.
+pub fn decode_one_slow(table: &HuffTable, window: u32) -> Result<(u8, u8)> {
+    for (sym, entry) in table.entries.iter().enumerate() {
         let l = entry.length;
-        if l == 0 {
+        if l == 0 || l <= 16 {
+            // Length 0 = absent; length ≤ 16 would have been served by
+            // the LUT — if we reached the slow path, the matching code
+            // must be > 16 bits (overflow slot).
             continue;
         }
         let mask: u32 = if l == 32 {
@@ -686,21 +759,8 @@ pub fn decode_one(table: &HuffTable, window: u32) -> Result<(u8, u8)> {
         } else {
             !0u32 << (32 - l as u32)
         };
-        let candidate = window & mask;
-        if candidate == entry.code {
-            // Found.
-            // Identify the symbol by index — we need to walk in
-            // declaration order again. Caller wants `symbol` (u8) and
-            // `length` (u8).
-            // We already have the entry but not the index; iterate to
-            // find. Cheaper: encode the index as part of the entry?
-            // Defer: linear find of matching (length, code).
-            // Re-walk to recover the symbol.
-            for (sym, e) in table.entries.iter().enumerate() {
-                if e.length == l && e.code == entry.code {
-                    return Ok((sym as u8, l));
-                }
-            }
+        if (window & mask) == entry.code {
+            return Ok((sym as u8, l));
         }
     }
     Err(Error::invalid("no Huffman code matched bit window"))

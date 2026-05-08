@@ -334,6 +334,235 @@ fn roundtrip_rgb32_predict_old_v1x_4x4() {
     assert_eq!(out.pixels, pixels);
 }
 
+// ───────── v1.x compat — Left / Gradient / Median (extending round 2) ─────────
+//
+// Round 3 wires the verify pass through ALL legal (family, method)
+// pairs; the v1.x codebook covers all 256 symbols (set A max length
+// 17, set B max length 26 — confirmed at table-build time), so any
+// residual stream produced by the encoder is decodable. The decoder's
+// `low3 → method` resolution from `biBitCount` (spec/01 §1.4) routes
+// the parse correctly for each method; we assert here that the
+// reconstructed pixels match the source.
+
+#[test]
+fn roundtrip_yuy2_left_v1x_8x4() {
+    let pixels = synth_yuy2(8, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Yuy2,
+        Method::Left,
+        8,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::Left);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_gradient_v1x_8x4() {
+    let pixels = synth_yuy2(8, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Yuy2,
+        Method::Gradient,
+        8,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::Gradient);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_median_v1x_8x6() {
+    let pixels = synth_yuy2(8, 6);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Yuy2,
+        Method::Median,
+        8,
+        6,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::Median);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb24_left_v1x_4x4() {
+    let pixels = synth_rgb24(4, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb24,
+        Method::Left,
+        4,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::Left);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb24_left_decorr_v1x_4x4() {
+    let pixels = synth_rgb24(4, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb24,
+        Method::LeftDecorr,
+        4,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::LeftDecorr);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb24_gradient_decorr_v1x_6x4() {
+    let pixels = synth_rgb24(6, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb24,
+        Method::GradientDecorr,
+        6,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::GradientDecorr);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb32_left_v1x_4x4() {
+    let pixels = synth_rgb32(4, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb32,
+        Method::Left,
+        4,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::Left);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb32_left_decorr_v1x_4x4() {
+    let pixels = synth_rgb32(4, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb32,
+        Method::LeftDecorr,
+        4,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::LeftDecorr);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb32_gradient_decorr_v1x_4x4() {
+    let pixels = synth_rgb32(4, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb32,
+        Method::GradientDecorr,
+        4,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert!(!cfg.has_extradata);
+    assert_eq!(cfg.method, Method::GradientDecorr);
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+// ───────── primary-LUT decoder fast-path coverage ─────────
+//
+// `tables::decode_one` now hits a 65 536-entry primary LUT for every
+// code length ≤ 16. Long codes (length > 16) trickle through
+// `decode_one_slow`. v1.x set B has max length 26, so the slow path
+// is exercised by every v1.x roundtrip above. The check below
+// instruments the LUT directly to confirm it returns the same answer
+// as the per-symbol entries on every well-formed window.
+
+#[test]
+fn primary_lut_matches_per_symbol_entries_classic_yuv_left() {
+    use crate::tables::{decode_one, rle_decode_three_channels, HuffTable};
+    // Use the YUV-LEFT classic blob's slot-1 (Y) length table.
+    let blob = crate::tables::classic_blob_bytes(PixelFamily::Yuy2, Method::Left);
+    let lengths = rle_decode_three_channels(blob).unwrap();
+    let table = HuffTable::build_from_lengths(&lengths[0]).unwrap();
+    // For every symbol whose length ≤ 16, the LUT slot under the
+    // canonical code's prefix must yield (sym, length) directly.
+    for (sym, e) in table.entries.iter().enumerate() {
+        if e.length == 0 || e.length > 16 {
+            continue;
+        }
+        // Construct a window whose top `length` bits exactly match
+        // the canonical code for `sym`; trailing bits arbitrary.
+        let window = e.code | 0xDEAD; // arbitrary low garbage
+        let (decoded_sym, decoded_len) = decode_one(&table, window).unwrap();
+        assert_eq!(decoded_sym as usize, sym, "sym {sym} mismatched");
+        assert_eq!(decoded_len, e.length, "len for sym {sym} mismatched");
+    }
+}
+
+#[test]
+fn primary_lut_overflow_falls_back_to_slow_path_v1x_set_b() {
+    use crate::tables::{
+        decode_one, rle_decode_one_channel, v1x_codes_set_b, v1x_lengths_set_b, v1x_table_from_pair,
+    };
+    let mut cur: &[u8] = v1x_lengths_set_b();
+    let lens_b = rle_decode_one_channel(&mut cur).unwrap();
+    let codes_b = v1x_codes_set_b();
+    let mut codes_arr = [0u8; 256];
+    codes_arr.copy_from_slice(codes_b);
+    let table = v1x_table_from_pair(&lens_b, &codes_arr).unwrap();
+    // v1.x set B max length is 26 — the LUT will mark some prefixes
+    // as overflow; pick a symbol with length > 16 and confirm the
+    // slow path returns it.
+    let (sym, e) = table
+        .entries
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.length > 16)
+        .expect("set B has codes longer than 16 bits");
+    let window = e.code; // exact MSB-aligned code; trailing bits = 0
+    let (decoded_sym, decoded_len) = decode_one(&table, window).unwrap();
+    assert_eq!(decoded_sym as usize, sym);
+    assert_eq!(decoded_len, e.length);
+}
+
 // ───────── tables — RLE encoder + canonical-length builder unit tests ─────────
 
 #[test]

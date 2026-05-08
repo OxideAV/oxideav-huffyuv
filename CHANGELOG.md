@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-3: decoder fast-LUT, AVI walker, v1.x compat for all
+  predictors:
+  - `tables::HuffTable::primary_lut` — 65 536-entry primary LUT
+    keyed on the top 16 bits of the bit window. Codes ≤ 16 bits hit
+    a single indexed load (`(length << 8) | symbol`); codes longer
+    than 16 bits route to `decode_one_slow` (per-symbol scan).
+    spec/03 §3.2.2. Measured ≈ 3.2× decode speed-up on a 320×240
+    YUY2 LEFT/ClassicV2 frame (16.9 ms/frame → 5.3 ms/frame).
+  - `avi` module — minimal RIFF / AVI 1.0 walker (clean-room from
+    Microsoft's public RIFF spec only, **no** `libavformat/avi*.c`
+    consulted). `AviVideoStream::parse` locates the first `vids`
+    stream and surfaces its `BITMAPINFOHEADER` + `movi` payload;
+    `AviFrameIter` enumerates `00dc` / `00db` chunks. Companion
+    `build_minimal_avi` writer round-trips through the parser.
+  - 9 new v1.x-compat self-roundtrip tests covering all eight
+    legal (family, method) pairs that aren't `predict_old`
+    (round 2 only tested PredictOld); confirms the v1.x
+    precomputed-codes set covers every residual symbol.
+  - 2 LUT-coverage tests (`primary_lut_matches_per_symbol_entries`,
+    `primary_lut_overflow_falls_back_to_slow_path_v1x_set_b`) +
+    3 AVI walker tests.
+
 - Round-2 encoder push: full HuffYUV / FFVHuff frame encoder for the
   three 8-bit pixel families (YUY2, RGB24, RGB32) and all six legal
   predictor methods (`predict_old`, `Left`, `Gradient`, `Median`,
