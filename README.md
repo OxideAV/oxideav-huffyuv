@@ -5,13 +5,17 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 3 — fast-LUT decoder + AVI walker.** Rounds 1 (decoder),
-2 (encoder), and 3 (decoder LUT + clean-room AVI 1.0 walker)
-all ship from the strict-isolation clean-room workspace at
+**Round 3 — fast-LUT decoder.** Rounds 1 (decoder), 2 (encoder),
+and 3 (decoder fast-LUT) all ship from the strict-isolation
+clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
 The previous (pre-orphan) implementation was retired alongside the
 docs audit dated 2026-05-06; the prior history is preserved on the
 `old` branch.
+
+This crate decodes/encodes HuffYUV / FFVHuff frames given raw
+codec bytes; AVI / OpenDML container handling lives one layer up
+in `oxideav-avi`.
 
 ## What works (Round 1)
 
