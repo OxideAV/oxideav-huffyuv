@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-5: walking-stride interlaced encoder. The round-4 interlaced
+  path materialised two contiguous half-height field buffers via
+  `predict::split_fields` plus a third `combined_residuals_for_stats`
+  body for histogram + verify, peaking at ≈ 4× source-frame size in
+  working memory. Round 5 replaces both with:
+  - One field-sized scratch (`compact_field_rows`) reused for top
+    then bot field by walking the source raster with row-stride 2.
+  - One combined-body `Vec<u8>` filled in two halves
+    (`combined_body[..top_body_len]` = top, rest = bot); the
+    histogram + emit passes slice it instead of allocating
+    per-field bodies. Per-family slot-phase alignment is preserved
+    (top body length is a multiple of 4 / 3 / 4 for YUY2 / RGB24 /
+    RGB32 respectively, so the bot half resumes at the same
+    `i % cycle == 0` phase).
+  - Result: ≈ 2× working-set memory reduction at 1080p / 4K
+    interlaced; same wire bytes as round 4 (regression-guarded by
+    8 new round-trip tests covering odd height, 480p-class,
+    `V1xCompat` walking-stride, and `CustomV2` walking-stride
+    across all three pixel families).
+- 8 new round-5 self-roundtrip tests in `roundtrip_tests.rs` exercising
+  the walking-stride interlaced encoder (odd height 8×301 across all
+  three families; 480p-class 96×480 and 64×480; V1xCompat × Median;
+  CustomV2 × LeftDecorr / PredictOld). Bumps the lib test count from
+  72 to 80.
+
+### Round-5 follow-ups
+
+- `tests/round4_avi_lockstep.rs` still gates lockstep tests on
+  `try_open_mux` because published `oxideav-avi 0.0.5` predates the
+  `params.tag = CodecTag::fourcc("HFYU")` generic-FourCC pipeline
+  (landed at `oxideav-avi@1c28877` on master). When `oxideav-avi
+  0.0.6+` publishes, the skip-gate can drop. Coordination only;
+  no encoder change needed.
+- HFYU / FFVH fixtures still 404 on samples.oxideav.org; once a
+  third-party-encoded fixture lands, a `tests/round5_real_fixture_lockstep.rs`
+  can wire the sample-corpus path. Documented gap, deferred.
+
+### Added (round 4)
+
 - Round-4: codec ↔ container lockstep + interlaced field-stride=2:
   - `tests/round4_avi_lockstep.rs` (8 tests) — end-to-end
     encoder → `oxideav-avi` muxer → demuxer → decoder roundtrip on

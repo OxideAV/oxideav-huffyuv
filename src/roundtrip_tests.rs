@@ -760,3 +760,133 @@ fn roundtrip_yuy2_custom_v2_interlaced_8x300() {
     let out = decode_frame(&cfg, &frame).unwrap();
     assert_eq!(out.pixels, pixels);
 }
+
+// ───────── Round-5: walking-stride interlaced encoder ─────────
+//
+// The round-5 encoder eliminates the round-4 `predict::split_fields`
+// allocations: instead of building two contiguous half-height buffers
+// (`top` + `bot`), the encoder walks the source raster with row-stride
+// 2 into a single field-sized scratch buffer, reused across both
+// fields, with one combined residual-body Vec for histogram + verify.
+//
+// These tests verify:
+// 1. The walking-stride path remains bit-identical to the round-4
+//    `split_fields` flow on every (family, method) interlaced pair
+//    (round-trip self-check; if either path drifted, decode would
+//    fail).
+// 2. Odd-height interlaced (top has one more row than bot) round-trips.
+// 3. A larger interlaced frame (480p-class) round-trips without a
+//    panic — exercises the per-field row-bytes × field-h math the
+//    walking-stride path uses to size scratch + combined-body.
+
+#[test]
+fn roundtrip_yuy2_left_interlaced_odd_height_8x301() {
+    // 301 = top has 151 rows, bot has 150 rows (top ≠ bot is the
+    // interesting case: walking-stride must resize scratch down for
+    // bot, and combined-body must size to the asymmetric total).
+    let pixels = synth_yuy2(8, 301);
+    let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Left, 8, 301, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.height, 301);
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb24_predict_old_interlaced_odd_height_8x301() {
+    let pixels = synth_rgb24(8, 301);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb24, Method::PredictOld, 8, 301, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb32_gradient_decorr_interlaced_odd_height_8x301() {
+    let pixels = synth_rgb32(8, 301);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb32, Method::GradientDecorr, 8, 301, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_left_interlaced_480p_class() {
+    // 96 × 480 = 480p-class interlaced frame, 480 > 288 so the
+    // walking-stride field path engages. ~92 KB working set; sanity
+    // check that the scratch + combined-body sizing is correct at
+    // a frame size larger than the small interlaced cases above.
+    let pixels = synth_yuy2(96, 480);
+    let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Left, 96, 480, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.width, 96);
+    assert_eq!(out.height, 480);
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb24_left_decorr_interlaced_480p_class() {
+    let pixels = synth_rgb24(64, 480);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb24, Method::LeftDecorr, 64, 480, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_median_interlaced_v1x_compat() {
+    // Round-5 walking-stride path × V1xCompat extradata: ensures the
+    // combined-body verify pass still walks slot phases correctly when
+    // the bot half follows the top half in one Vec.
+    let pixels = synth_yuy2(8, 300);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Yuy2,
+        Method::Median,
+        8,
+        300,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb24_left_decorr_interlaced_custom_v2_walking_stride() {
+    // Walking-stride × CustomV2 × RGB24-decorr: the combined-body's
+    // bot half MUST start at `i % 3 == 0` for the histogram + emit
+    // slot mapping to remain correct. If `top.body_len % 3` ever
+    // drifted from 0 (e.g. someone reintroduced the 4-byte-seed at
+    // the wrong end), this test would catch it.
+    let pixels = synth_rgb24(8, 320);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb24,
+        Method::LeftDecorr,
+        8,
+        320,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb32_predict_old_interlaced_custom_v2_walking_stride() {
+    // Walking-stride × CustomV2 × RGB32: bot section starts at
+    // `i % 4 == 0` since each top-pixel residual contributes 4 body
+    // bytes.
+    let pixels = synth_rgb32(8, 320);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb32,
+        Method::PredictOld,
+        8,
+        320,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}

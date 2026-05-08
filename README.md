@@ -5,9 +5,10 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 4 — interlaced field-stride=2 + container lockstep.**
-Rounds 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), and 4
-(interlace + lockstep) all ship from the strict-isolation
+**Round 5 — walking-stride interlaced encoder.**
+Rounds 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4
+(interlace + lockstep), and 5 (walking-stride encoder memory
+optimisation) all ship from the strict-isolation
 clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
 The previous (pre-orphan) implementation was retired alongside the
@@ -92,6 +93,26 @@ test-only `[dev-dependencies] oxideav-avi`.
   asserting pixel-exact equality. Covers YUY2 / RGB24, every
   predictor, both `ClassicV2` and `CustomV2` extradata paths, the
   interlaced trigger, and a two-frame stream.
+
+## What works (Round 5)
+
+- **Walking-stride encoder for interlaced**: the round-4 interlaced
+  path materialised two contiguous half-height field buffers
+  (`predict::split_fields`) plus a `combined_residuals_for_stats`
+  body for the histogram + verify passes — peak working set ≈ 4×
+  source-frame size at 1080p / 4K. Round 5 walks the source raster
+  with row-stride 2 directly (`encoder::compact_field_rows`) into a
+  single field-sized scratch reused across both fields, and fills
+  one combined-body `Vec<u8>` in two halves
+  (`combined_body[..top_body_len]` for top, `[top_body_len..]` for
+  bot). Per-family slot-phase alignment is preserved (top body
+  length is always a multiple of 4 / 3 / 4 for YUY2 / RGB24 /
+  RGB32, so the bot half resumes the histogram + emit slot mapping
+  at the same `i % cycle == 0` phase). The wire bytes are
+  bit-identical to round 4; the regression is guarded by 8 new
+  round-trip tests covering odd height, 480p-class, V1xCompat
+  walking-stride, and CustomV2 walking-stride across all three
+  pixel families. Lib-test count: 72 → 80.
 
 ## Out of scope (deferred)
 

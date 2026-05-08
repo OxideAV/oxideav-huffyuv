@@ -21,7 +21,7 @@
 use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
 use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
-use crate::predict::{gradient_predictor, is_interlaced_height, median3, split_fields};
+use crate::predict::{gradient_predictor, is_interlaced_height, median3};
 use crate::tables::{
     classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
     rle_decode_three_channels, rle_encode_three_channels, v1x_codes_set_a, v1x_codes_set_b,
@@ -99,52 +99,117 @@ pub fn encode_frame_with_mode(
     // Compute the per-channel residual stream first (independent of
     // table choice) so we can drive both the histogram computation
     // (CustomV2) and the bit-emit pass. For interlaced streams we
-    // compute residuals once per field; for progressive a single
-    // whole-frame pass.
+    // run the **walking-stride** path (round-5): we never materialise
+    // a contiguous top-field or bottom-field copy of `pixels` — we
+    // reuse a single field-sized scratch buffer for the predictor
+    // working set and append both fields' residual bodies into ONE
+    // combined `Vec<u8>` (the bot half starts at `top_body_len`).
+    // This roughly halves the encoder's working-set memory at 1080p
+    // / 4K versus the round-4 `split_fields` two-buffer approach.
     let progressive_residuals = if interlaced {
         None
     } else {
         Some(compute_residuals(family, method, width, height, pixels)?)
     };
-    let (top_residuals, bot_residuals) = if interlaced {
+    let (top_seed, bot_seed_opt, top_body_len, combined_body): (
+        [u8; 4],
+        Option<[u8; 4]>,
+        usize,
+        Vec<u8>,
+    ) = if interlaced {
         let row_bytes = match family {
             PixelFamily::Yuy2 => width as usize * 2,
             PixelFamily::Rgb24 => width as usize * 3,
             PixelFamily::Rgb32 => width as usize * 4,
         };
         let h = height as usize;
-        let (top, bot) = split_fields(pixels, row_bytes, h);
         let top_h = h.div_ceil(2) as u32;
         let bot_h = (h / 2) as u32;
-        let top_res = compute_residuals(family, method, width, top_h, &top)?;
-        let bot_res = if bot_h > 0 {
-            Some(compute_residuals(family, method, width, bot_h, &bot)?)
+        // One field-sized scratch reused across top + bot — replaces
+        // the two `split_fields` allocations of round 4.
+        let mut scratch = vec![0u8; (top_h as usize) * row_bytes];
+        // One combined-body Vec sized for the worst-case total
+        // residual stream: avoids the extra `[top.body || bot.body]`
+        // concat allocation that round 4 paid for histogram + verify
+        // passes.
+        let body_capacity = match family {
+            PixelFamily::Yuy2 => row_bytes * h - if h > 0 { 4 } else { 0 },
+            PixelFamily::Rgb24 => {
+                let n_top = (width as usize) * (top_h as usize);
+                let n_bot = (width as usize) * (bot_h as usize);
+                let mut c = 0usize;
+                if n_top > 0 {
+                    c += (n_top - 1) * 3;
+                }
+                if n_bot > 0 {
+                    c += (n_bot - 1) * 3;
+                }
+                c
+            }
+            PixelFamily::Rgb32 => {
+                let n_top = (width as usize) * (top_h as usize);
+                let n_bot = (width as usize) * (bot_h as usize);
+                let mut c = 0usize;
+                if n_top > 0 {
+                    c += (n_top - 1) * 4;
+                }
+                if n_bot > 0 {
+                    c += (n_bot - 1) * 4;
+                }
+                c
+            }
+        };
+        let mut combined: Vec<u8> = Vec::with_capacity(body_capacity);
+        // Top field: rows 0, 2, 4, … of the source raster.
+        compact_field_rows(pixels, &mut scratch, row_bytes, h, 0);
+        let top_res = compute_residuals(
+            family,
+            method,
+            width,
+            top_h,
+            &scratch[..(top_h as usize) * row_bytes],
+        )?;
+        let top_seed = top_res.seed;
+        let top_len = top_res.body.len();
+        combined.extend_from_slice(&top_res.body);
+        drop(top_res);
+        let bot_seed_opt = if bot_h > 0 {
+            // Bot field: rows 1, 3, 5, … of the source raster.
+            // Reuse `scratch` (resize down if bot has fewer rows).
+            scratch.resize((bot_h as usize) * row_bytes, 0);
+            compact_field_rows(pixels, &mut scratch, row_bytes, h, 1);
+            let bot_res = compute_residuals(
+                family,
+                method,
+                width,
+                bot_h,
+                &scratch[..(bot_h as usize) * row_bytes],
+            )?;
+            let bs = bot_res.seed;
+            combined.extend_from_slice(&bot_res.body);
+            Some(bs)
         } else {
             None
         };
-        (Some(top_res), bot_res)
+        (top_seed, bot_seed_opt, top_len, combined)
     } else {
-        (None, None)
+        ([0; 4], None, 0, Vec::new())
     };
 
     // For histogram (CustomV2) and table verification (V1xCompat)
     // we treat all residual bodies as one combined symbol stream.
-    let combined_residuals_for_stats: Residuals = if interlaced {
-        let mut body = Vec::new();
-        if let Some(r) = &top_residuals {
-            body.extend_from_slice(&r.body);
-        }
-        if let Some(r) = &bot_residuals {
-            body.extend_from_slice(&r.body);
-        }
-        Residuals {
-            seed: top_residuals.as_ref().map(|r| r.seed).unwrap_or([0; 4]),
-            body,
-        }
+    // Round 5: pass `combined_body` (interlaced) or
+    // `progressive_residuals.body` (progressive) as a slice directly
+    // to the slice-based helpers — no per-call `Residuals` clone.
+    // Per-field slot-phase alignment is preserved on the interlaced
+    // side: top.body_len is a multiple of the per-family slot cycle
+    // (YUY2: 4; RGB24: 3; RGB32: 4) for any legal width ×
+    // field-height, so the bot half starts at the same
+    // `i % cycle == 0` phase.
+    let stats_body: &[u8] = if interlaced {
+        &combined_body
     } else {
-        // Cheap clone via take + reinsert; we'll keep the original
-        // for the emit pass below.
-        progressive_residuals.as_ref().unwrap().clone()
+        &progressive_residuals.as_ref().unwrap().body
     };
 
     let (extradata_tables, slot1, slot2, slot3, has_extradata): (
@@ -163,8 +228,7 @@ pub fn encode_frame_with_mode(
             (extra, s1, s2, s3, true)
         }
         ExtradataMode::CustomV2 => {
-            let lengths =
-                compute_lengths_from_residuals(family, method, &combined_residuals_for_stats);
+            let lengths = compute_lengths_from_body(family, method, stats_body);
             let s1 = HuffTable::build_from_lengths(&lengths[0])?;
             let s2 = HuffTable::build_from_lengths(&lengths[1])?;
             let s3 = HuffTable::build_from_lengths(&lengths[2])?;
@@ -177,14 +241,7 @@ pub fn encode_frame_with_mode(
             // length in the v1.x codebooks — otherwise the wire would
             // be undecodable. (The classic v1.x sets cover all 256
             // symbols, so this is a belt-and-braces check.)
-            verify_residuals_in_table(
-                family,
-                method,
-                &combined_residuals_for_stats,
-                &s1,
-                &s2,
-                &s3,
-            )?;
+            verify_body_in_table(family, method, stats_body, &s1, &s2, &s3)?;
             (Vec::new(), s1, s2, s3, false)
         }
     };
@@ -200,26 +257,29 @@ pub fn encode_frame_with_mode(
 
     let frame_bytes = if interlaced {
         let mut out = Vec::new();
-        if let Some(r) = &top_residuals {
-            let mut top_bytes = emit_bitstream(&EmitParams {
+        // Top field: pass the seed + the [..top_body_len] slice of
+        // the combined body directly to `emit_bitstream_parts`. No
+        // per-field body Vec allocation needed.
+        let mut top_bytes = emit_bitstream_parts(
+            family,
+            method,
+            &top_seed,
+            &combined_body[..top_body_len],
+            &slot1,
+            &slot2,
+            &slot3,
+        )?;
+        out.append(&mut top_bytes);
+        if let Some(bot_seed) = bot_seed_opt {
+            let mut bot_bytes = emit_bitstream_parts(
                 family,
                 method,
-                res: r,
-                slot1: &slot1,
-                slot2: &slot2,
-                slot3: &slot3,
-            })?;
-            out.append(&mut top_bytes);
-        }
-        if let Some(r) = &bot_residuals {
-            let mut bot_bytes = emit_bitstream(&EmitParams {
-                family,
-                method,
-                res: r,
-                slot1: &slot1,
-                slot2: &slot2,
-                slot3: &slot3,
-            })?;
+                &bot_seed,
+                &combined_body[top_body_len..],
+                &slot1,
+                &slot2,
+                &slot3,
+            )?;
             out.append(&mut bot_bytes);
         }
         out
@@ -380,6 +440,41 @@ fn compute_residuals(
         PixelFamily::Yuy2 => yuy2_residuals(method, width, height, pixels),
         PixelFamily::Rgb24 => rgb24_residuals(method, width, height, pixels),
         PixelFamily::Rgb32 => rgb32_residuals(method, width, height, pixels),
+    }
+}
+
+/// Walking-stride field row gather. Round-5 walks the source raster
+/// with row-stride 2 (writing the picked rows into `dst`'s start)
+/// instead of allocating a new top-field / bottom-field buffer via
+/// `predict::split_fields`. `field_idx == 0` selects even rows
+/// (top field); `field_idx == 1` selects odd rows (bottom field).
+///
+/// `dst` must already be sized to at least `field_h * row_bytes`
+/// where `field_h = (full_h + 1 - field_idx) / 2`. The function does
+/// not resize.
+///
+/// Spec/02 §2 says nothing about HOW the encoder happens to extract
+/// fields — only that the on-wire chunk concatenates the two
+/// per-field bit-streams. The walking-stride read pattern matches
+/// the round-4 `split_fields(...)` output byte-for-byte; a
+/// regression test in `roundtrip_tests::walking_stride_matches_split_fields_path`
+/// guards against drift.
+fn compact_field_rows(
+    pixels: &[u8],
+    dst: &mut [u8],
+    row_bytes: usize,
+    full_h: usize,
+    field_idx: usize,
+) {
+    debug_assert!(field_idx < 2);
+    let mut logical = 0usize;
+    let mut row = field_idx;
+    while row < full_h {
+        let src = row * row_bytes;
+        let d = logical * row_bytes;
+        dst[d..d + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+        row += 2;
+        logical += 1;
     }
 }
 
@@ -603,14 +698,13 @@ fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
 
 // ───────────────────────── histogram + length building ─────────────────────────
 
-fn compute_lengths_from_residuals(
-    family: PixelFamily,
-    method: Method,
-    res: &Residuals,
-) -> [[u8; 256]; 3] {
-    // Build per-slot histograms by walking `res.body` with the
-    // family-specific slot-mapping rule.
-    let (h1, h2, h3) = histogramise(family, method, &res.body);
+/// Walks `body` directly to build the per-channel histograms, then
+/// runs the package-merge length-limited Huffman builder. Round 5
+/// drops the round-4 `&Residuals` wrapper here so the combined-body
+/// Vec from the interlaced walking-stride path can drive histogram
+/// building without an intermediate per-frame `Residuals` clone.
+fn compute_lengths_from_body(family: PixelFamily, method: Method, body: &[u8]) -> [[u8; 256]; 3] {
+    let (h1, h2, h3) = histogramise(family, method, body);
     [
         compute_canonical_lengths(&h1).unwrap_or([1u8; 256]),
         compute_canonical_lengths(&h2).unwrap_or([1u8; 256]),
@@ -703,19 +797,20 @@ fn build_v1x_tables(family: PixelFamily) -> Result<(HuffTable, HuffTable, HuffTa
     }
 }
 
-fn verify_residuals_in_table(
+/// V1xCompat verification: walk the body in slot order and ensure
+/// each emitted symbol has a non-zero length in its slot's table.
+/// Round 5 takes `body: &[u8]` directly so the interlaced
+/// walking-stride path's combined body can be verified without an
+/// intermediate `Residuals` clone.
+fn verify_body_in_table(
     family: PixelFamily,
     method: Method,
-    res: &Residuals,
+    body: &[u8],
     s1: &HuffTable,
     s2: &HuffTable,
     s3: &HuffTable,
 ) -> Result<()> {
-    // Walk body in slot order; ensure each symbol has a non-zero
-    // length in its slot's table. Any miss returns an Unsupported
-    // error so callers know to fall back to a custom or classic
-    // table.
-    for (byte_idx, (i, &sym)) in (4usize..).zip(res.body.iter().enumerate()) {
+    for (byte_idx, (i, &sym)) in (4usize..).zip(body.iter().enumerate()) {
         let slot = match family {
             PixelFamily::Yuy2 => match byte_idx & 3 {
                 0 | 2 => s1,
@@ -776,35 +871,61 @@ struct EmitParams<'a> {
 }
 
 fn emit_bitstream(p: &EmitParams) -> Result<Vec<u8>> {
+    emit_bitstream_parts(
+        p.family,
+        p.method,
+        &p.res.seed,
+        &p.res.body,
+        p.slot1,
+        p.slot2,
+        p.slot3,
+    )
+}
+
+/// Round-5 walking-stride entry: emit one field's seed + body
+/// without copying body bytes into a per-field `Residuals`. The
+/// interlaced encoder calls this twice on the combined-body Vec
+/// (once with body=[..top_body_len], once with body=[top_body_len..])
+/// to avoid the round-4 per-field body allocations at emit time.
+#[allow(clippy::too_many_arguments)]
+fn emit_bitstream_parts(
+    family: PixelFamily,
+    method: Method,
+    seed: &[u8; 4],
+    body: &[u8],
+    slot1: &HuffTable,
+    slot2: &HuffTable,
+    slot3: &HuffTable,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&p.res.seed);
+    out.extend_from_slice(seed);
     let mut writer = BitWriter::new();
-    match p.family {
+    match family {
         PixelFamily::Yuy2 => {
-            for (byte_idx, &sym) in (4usize..).zip(p.res.body.iter()) {
+            for (byte_idx, &sym) in (4usize..).zip(body.iter()) {
                 let slot = match byte_idx & 3 {
-                    0 | 2 => p.slot1,
-                    1 => p.slot2,
-                    _ => p.slot3,
+                    0 | 2 => slot1,
+                    1 => slot2,
+                    _ => slot3,
                 };
                 let (code, length) = lookup_code(slot, sym)?;
                 writer.write_msb(code, length);
             }
         }
         PixelFamily::Rgb24 => {
-            for (i, &sym) in p.res.body.iter().enumerate() {
+            for (i, &sym) in body.iter().enumerate() {
                 let in_pixel = i % 3;
-                let slot = if p.method.decorrelate() {
+                let slot = if method.decorrelate() {
                     match in_pixel {
-                        0 => p.slot2,
-                        1 => p.slot1,
-                        _ => p.slot3,
+                        0 => slot2,
+                        1 => slot1,
+                        _ => slot3,
                     }
                 } else {
                     match in_pixel {
-                        0 => p.slot1,
-                        1 => p.slot2,
-                        _ => p.slot3,
+                        0 => slot1,
+                        1 => slot2,
+                        _ => slot3,
                     }
                 };
                 let (code, length) = lookup_code(slot, sym)?;
@@ -812,19 +933,19 @@ fn emit_bitstream(p: &EmitParams) -> Result<Vec<u8>> {
             }
         }
         PixelFamily::Rgb32 => {
-            for (i, &sym) in p.res.body.iter().enumerate() {
+            for (i, &sym) in body.iter().enumerate() {
                 let in_pixel = i % 4;
-                let slot = if p.method.decorrelate() {
+                let slot = if method.decorrelate() {
                     match in_pixel {
-                        0 => p.slot2,
-                        1 => p.slot1,
-                        _ => p.slot3,
+                        0 => slot2,
+                        1 => slot1,
+                        _ => slot3,
                     }
                 } else {
                     match in_pixel {
-                        0 => p.slot1,
-                        1 => p.slot2,
-                        _ => p.slot3,
+                        0 => slot1,
+                        1 => slot2,
+                        _ => slot3,
                     }
                 };
                 let (code, length) = lookup_code(slot, sym)?;
