@@ -7,6 +7,14 @@
 //! The decoder calls these to *reconstruct* pixel values from
 //! residuals; the encoder calls them to *produce* residuals from
 //! pixels. Both directions are byte-modular.
+//!
+//! # Interlaced mode (spec/02 §2 + spec/05 planned)
+//!
+//! When `biHeight > 288` the codec splits the source into two fields
+//! (even rows = top field; odd rows = bottom field) and predicts each
+//! field independently. The two fields' bitstreams are concatenated
+//! per-frame. Helpers [`is_interlaced_height`], [`split_fields`] and
+//! [`interleave_fields`] implement the row demux / mux.
 
 /// Branchless three-value median over unsigned bytes (mod-256
 /// gradient context). spec/03 §2.3:
@@ -172,6 +180,66 @@ pub fn inverse_rgb_decorr_bgra(out: &mut [u8]) {
     }
 }
 
+/// Spec/02 §2 / spec/05 (planned): the codec engages its
+/// field-stride=2 interlaced path when `biHeight > 288`. The
+/// threshold is the i386 build's compiled-in constant `0x120` (= 288)
+/// per spec/01 §1.3 disassembly note.
+#[inline]
+pub fn is_interlaced_height(height: u32) -> bool {
+    height > 288
+}
+
+/// Split a packed pixel buffer into two field-buffers (even rows →
+/// top field; odd rows → bottom field). `row_bytes` is the per-row
+/// byte count (= width * bytes_per_pixel, with `width`
+/// macropixel-doubled for YUY2 already accounted for by the caller).
+///
+/// The returned tuple is `(top_field, bottom_field)`. If `height` is
+/// odd the top field has `(height + 1) / 2` rows and the bottom field
+/// has `height / 2` rows.
+pub fn split_fields(pixels: &[u8], row_bytes: usize, height: usize) -> (Vec<u8>, Vec<u8>) {
+    if row_bytes == 0 || height == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let top_rows = height.div_ceil(2);
+    let bot_rows = height / 2;
+    let mut top = vec![0u8; top_rows * row_bytes];
+    let mut bot = vec![0u8; bot_rows * row_bytes];
+    for row in 0..height {
+        let src = row * row_bytes;
+        if row & 1 == 0 {
+            let dst = (row / 2) * row_bytes;
+            top[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+        } else {
+            let dst = (row / 2) * row_bytes;
+            bot[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+        }
+    }
+    (top, bot)
+}
+
+/// Inverse of [`split_fields`]: interleave two field-buffers back into
+/// a packed top-down (or bottom-up; this routine doesn't care about
+/// vertical orientation, only row interleave) pixel raster of the
+/// original `height`.
+pub fn interleave_fields(top: &[u8], bot: &[u8], row_bytes: usize, height: usize) -> Vec<u8> {
+    if row_bytes == 0 || height == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; row_bytes * height];
+    for row in 0..height {
+        let dst = row * row_bytes;
+        if row & 1 == 0 {
+            let src = (row / 2) * row_bytes;
+            out[dst..dst + row_bytes].copy_from_slice(&top[src..src + row_bytes]);
+        } else {
+            let src = (row / 2) * row_bytes;
+            out[dst..dst + row_bytes].copy_from_slice(&bot[src..src + row_bytes]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +277,41 @@ mod tests {
         let mut buf = residuals;
         inverse_left_full(&mut buf, 8, 1);
         assert_eq!(&buf, &pixels);
+    }
+
+    #[test]
+    fn interlace_threshold_matches_spec() {
+        // spec/01 §1.3 / spec/02 §2: `biHeight > 288` engages interlace.
+        assert!(!is_interlaced_height(0));
+        assert!(!is_interlaced_height(288));
+        assert!(is_interlaced_height(289));
+        assert!(is_interlaced_height(720));
+        assert!(is_interlaced_height(1080));
+    }
+
+    #[test]
+    fn split_then_interleave_round_trips_even_height() {
+        // 4 rows × 6 bytes/row.
+        let pixels: Vec<u8> = (0..24u8).collect();
+        let (top, bot) = split_fields(&pixels, 6, 4);
+        assert_eq!(top.len(), 12); // rows 0, 2
+        assert_eq!(bot.len(), 12); // rows 1, 3
+        assert_eq!(&top[..6], &pixels[0..6]); // row 0
+        assert_eq!(&top[6..12], &pixels[12..18]); // row 2
+        assert_eq!(&bot[..6], &pixels[6..12]); // row 1
+        assert_eq!(&bot[6..12], &pixels[18..24]); // row 3
+        let merged = interleave_fields(&top, &bot, 6, 4);
+        assert_eq!(merged, pixels);
+    }
+
+    #[test]
+    fn split_then_interleave_round_trips_odd_height() {
+        // 5 rows × 4 bytes/row: top has 3 rows (0,2,4), bot has 2 (1,3).
+        let pixels: Vec<u8> = (0..20u8).collect();
+        let (top, bot) = split_fields(&pixels, 4, 5);
+        assert_eq!(top.len(), 12);
+        assert_eq!(bot.len(), 8);
+        let merged = interleave_fields(&top, &bot, 4, 5);
+        assert_eq!(merged, pixels);
     }
 }

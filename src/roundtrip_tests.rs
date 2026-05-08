@@ -652,3 +652,111 @@ fn canonical_lengths_single_symbol_assigns_one_bit() {
         }
     }
 }
+
+// ───────── Round-4: interlaced field-stride=2 (height > 288) ─────────
+//
+// spec/02 §2 / spec/05 (planned): when biHeight > 288 the codec
+// splits the frame into two fields (even rows = top; odd rows =
+// bottom), predicts each independently, and concatenates the two
+// bit-streams in the per-frame chunk. These tests verify the
+// self-roundtrip for that path across the three pixel families and
+// the four predictor methods.
+
+#[test]
+fn roundtrip_yuy2_left_interlaced_8x300() {
+    // 8×300 YUY2 = 4 800 bytes. height > 288 → interlaced path.
+    let pixels = synth_yuy2(8, 300);
+    let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Left, 8, 300, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.height, 300);
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_gradient_interlaced_8x320() {
+    let pixels = synth_yuy2(8, 320);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Yuy2, Method::Gradient, 8, 320, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_median_interlaced_8x300() {
+    let pixels = synth_yuy2(8, 300);
+    let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Median, 8, 300, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb24_left_decorr_interlaced_8x300() {
+    let pixels = synth_rgb24(8, 300);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb24, Method::LeftDecorr, 8, 300, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb24_gradient_decorr_interlaced_8x320() {
+    let pixels = synth_rgb24(8, 320);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb24, Method::GradientDecorr, 8, 320, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb32_left_decorr_interlaced_8x300() {
+    let pixels = synth_rgb32(8, 300);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb32, Method::LeftDecorr, 8, 300, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_rgb32_predict_old_interlaced_8x300() {
+    let pixels = synth_rgb32(8, 300);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb32, Method::PredictOld, 8, 300, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_left_just_below_threshold_8x288() {
+    // Boundary: 288 = NOT interlaced; 289 = interlaced.
+    let pixels = synth_yuy2(8, 288);
+    let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Left, 8, 288, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_left_just_above_threshold_8x290() {
+    let pixels = synth_yuy2(8, 290);
+    let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Left, 8, 290, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn roundtrip_yuy2_custom_v2_interlaced_8x300() {
+    // Interlaced + CustomV2 (per-frame computed length tables): the
+    // histogram must be the union of both fields' residuals, which we
+    // verify by encode/decode round-tripping.
+    let pixels = synth_yuy2(8, 300);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Yuy2,
+        Method::Left,
+        8,
+        300,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}

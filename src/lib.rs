@@ -17,6 +17,14 @@
 //! fallback (`biSize == 0x28`, length-table set A and code-template
 //! set A/B from the proprietary's `.rdata`) are supported.
 //!
+//! Interlaced streams (`biHeight > 288`, spec/02 §2) engage the
+//! field-stride=2 path: the frame is split into two fields (even
+//! rows = top; odd rows = bottom), each field is encoded
+//! independently with the shared Huffman tables, and the two
+//! per-field bitstreams are concatenated on the wire. The decoder
+//! detects the trigger from `cfg.height` and reverses the split
+//! transparently.
+//!
 //! # Pipeline
 //!
 //! 1. **BIH parse** ([`header::StreamConfig::parse_bitmapinfoheader`])

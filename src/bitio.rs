@@ -37,6 +37,17 @@ impl<'a> BitReader<'a> {
         self.cursor_bits
     }
 
+    /// Number of source bytes the bit cursor has crossed, rounded up
+    /// to the next 4-byte word boundary. Used by the interlaced
+    /// decoder to advance from the top field's bit-stream tail to the
+    /// bottom field's uncompressed seed (spec/02 §4: each field's bit
+    /// stream is flushed in 32-bit LE words; the next field starts on
+    /// the byte after the final flushed word).
+    pub fn bytes_consumed(&self) -> usize {
+        let words = self.cursor_bits.div_ceil(32) as usize;
+        words * 4
+    }
+
     /// Peek the next 32 bits as a u32 with the next-unread bit at bit
     /// position 31 (MSB). Returns a zero-padded window when the
     /// underlying stream is exhausted.

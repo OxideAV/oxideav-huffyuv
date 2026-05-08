@@ -21,7 +21,7 @@
 use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
 use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
-use crate::predict::{gradient_predictor, median3};
+use crate::predict::{gradient_predictor, is_interlaced_height, median3, split_fields};
 use crate::tables::{
     classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
     rle_decode_three_channels, rle_encode_three_channels, v1x_codes_set_a, v1x_codes_set_b,
@@ -87,10 +87,65 @@ pub fn encode_frame_with_mode(
         return Err(Error::invalid("encoder: method not legal for YUV"));
     }
 
+    // Spec/02 §2 + spec/05 (planned): when biHeight > 288 the codec
+    // splits the source into two fields (even rows = top; odd rows =
+    // bottom) and predicts each independently. The two fields share
+    // the same per-stream Huffman tables (the BIH carries one
+    // extradata blob), but each field gets its own uncompressed seed +
+    // bit-packed body. The on-wire frame is `top_seed | top_bits |
+    // bot_seed | bot_bits`.
+    let interlaced = is_interlaced_height(height);
+
     // Compute the per-channel residual stream first (independent of
     // table choice) so we can drive both the histogram computation
-    // (CustomV2) and the bit-emit pass.
-    let residuals = compute_residuals(family, method, width, height, pixels)?;
+    // (CustomV2) and the bit-emit pass. For interlaced streams we
+    // compute residuals once per field; for progressive a single
+    // whole-frame pass.
+    let progressive_residuals = if interlaced {
+        None
+    } else {
+        Some(compute_residuals(family, method, width, height, pixels)?)
+    };
+    let (top_residuals, bot_residuals) = if interlaced {
+        let row_bytes = match family {
+            PixelFamily::Yuy2 => width as usize * 2,
+            PixelFamily::Rgb24 => width as usize * 3,
+            PixelFamily::Rgb32 => width as usize * 4,
+        };
+        let h = height as usize;
+        let (top, bot) = split_fields(pixels, row_bytes, h);
+        let top_h = h.div_ceil(2) as u32;
+        let bot_h = (h / 2) as u32;
+        let top_res = compute_residuals(family, method, width, top_h, &top)?;
+        let bot_res = if bot_h > 0 {
+            Some(compute_residuals(family, method, width, bot_h, &bot)?)
+        } else {
+            None
+        };
+        (Some(top_res), bot_res)
+    } else {
+        (None, None)
+    };
+
+    // For histogram (CustomV2) and table verification (V1xCompat)
+    // we treat all residual bodies as one combined symbol stream.
+    let combined_residuals_for_stats: Residuals = if interlaced {
+        let mut body = Vec::new();
+        if let Some(r) = &top_residuals {
+            body.extend_from_slice(&r.body);
+        }
+        if let Some(r) = &bot_residuals {
+            body.extend_from_slice(&r.body);
+        }
+        Residuals {
+            seed: top_residuals.as_ref().map(|r| r.seed).unwrap_or([0; 4]),
+            body,
+        }
+    } else {
+        // Cheap clone via take + reinsert; we'll keep the original
+        // for the emit pass below.
+        progressive_residuals.as_ref().unwrap().clone()
+    };
 
     let (extradata_tables, slot1, slot2, slot3, has_extradata): (
         Vec<u8>,
@@ -108,7 +163,8 @@ pub fn encode_frame_with_mode(
             (extra, s1, s2, s3, true)
         }
         ExtradataMode::CustomV2 => {
-            let lengths = compute_lengths_from_residuals(family, method, &residuals);
+            let lengths =
+                compute_lengths_from_residuals(family, method, &combined_residuals_for_stats);
             let s1 = HuffTable::build_from_lengths(&lengths[0])?;
             let s2 = HuffTable::build_from_lengths(&lengths[1])?;
             let s3 = HuffTable::build_from_lengths(&lengths[2])?;
@@ -121,7 +177,14 @@ pub fn encode_frame_with_mode(
             // length in the v1.x codebooks — otherwise the wire would
             // be undecodable. (The classic v1.x sets cover all 256
             // symbols, so this is a belt-and-braces check.)
-            verify_residuals_in_table(family, method, &residuals, &s1, &s2, &s3)?;
+            verify_residuals_in_table(
+                family,
+                method,
+                &combined_residuals_for_stats,
+                &s1,
+                &s2,
+                &s3,
+            )?;
             (Vec::new(), s1, s2, s3, false)
         }
     };
@@ -134,14 +197,43 @@ pub fn encode_frame_with_mode(
         &extradata_tables,
         has_extradata,
     );
-    let frame_bytes = emit_bitstream(&EmitParams {
-        family,
-        method,
-        res: &residuals,
-        slot1: &slot1,
-        slot2: &slot2,
-        slot3: &slot3,
-    })?;
+
+    let frame_bytes = if interlaced {
+        let mut out = Vec::new();
+        if let Some(r) = &top_residuals {
+            let mut top_bytes = emit_bitstream(&EmitParams {
+                family,
+                method,
+                res: r,
+                slot1: &slot1,
+                slot2: &slot2,
+                slot3: &slot3,
+            })?;
+            out.append(&mut top_bytes);
+        }
+        if let Some(r) = &bot_residuals {
+            let mut bot_bytes = emit_bitstream(&EmitParams {
+                family,
+                method,
+                res: r,
+                slot1: &slot1,
+                slot2: &slot2,
+                slot3: &slot3,
+            })?;
+            out.append(&mut bot_bytes);
+        }
+        out
+    } else {
+        emit_bitstream(&EmitParams {
+            family,
+            method,
+            res: progressive_residuals.as_ref().unwrap(),
+            slot1: &slot1,
+            slot2: &slot2,
+            slot3: &slot3,
+        })?
+    };
+
     // width/height already encoded into the BIH; no further use here.
     let _ = (width, height);
     Ok((strf, frame_bytes))

@@ -5,8 +5,9 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 3 — fast-LUT decoder.** Rounds 1 (decoder), 2 (encoder),
-and 3 (decoder fast-LUT) all ship from the strict-isolation
+**Round 4 — interlaced field-stride=2 + container lockstep.**
+Rounds 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), and 4
+(interlace + lockstep) all ship from the strict-isolation
 clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
 The previous (pre-orphan) implementation was retired alongside the
@@ -15,7 +16,9 @@ docs audit dated 2026-05-06; the prior history is preserved on the
 
 This crate decodes/encodes HuffYUV / FFVHuff frames given raw
 codec bytes; AVI / OpenDML container handling lives one layer up
-in `oxideav-avi`.
+in `oxideav-avi`. End-to-end (encode → AVI mux → AVI demux →
+decode) is exercised in `tests/round4_avi_lockstep.rs` via a
+test-only `[dev-dependencies] oxideav-avi`.
 
 ## What works (Round 1)
 
@@ -62,17 +65,33 @@ in `oxideav-avi`.
   (`(length << 8) | symbol`), codes longer than 16 bits route to a
   per-symbol slow path. Measured ≈ 3.2× speed-up on a 320×240 YUY2
   LEFT/ClassicV2 frame (16.9 ms/frame → 5.3 ms/frame).
-- **`avi` module — clean-room RIFF / AVI 1.0 walker**: locates the
-  first `vids` stream, surfaces its `BITMAPINFOHEADER` + `movi`
-  payload, enumerates `00dc` / `00db` chunks. Companion
-  `build_minimal_avi` writer round-trips through the parser. No
-  external dep; no third-party AVI-demuxer source consulted.
 - **v1.x compat** (`ExtradataMode::V1xCompat`) now exercised against
   every legal (family, method) pair — the v1.x precomputed-codes
   set covers all 256 symbols (set A max length 17, set B max
   length 26), so `Left`, `Gradient`, `Median`, `LeftDecorr`, and
   `GradientDecorr` all round-trip via the no-extradata `biSize ==
   0x28` BIH layout that v1.x decoders expect.
+
+## What works (Round 4)
+
+- **Interlaced field-stride=2 prediction** (`biHeight > 288`,
+  spec/02 §2 + spec/05 planned): when a frame trips the
+  `is_interlaced_height` threshold the encoder splits it into two
+  fields (even rows = top; odd rows = bottom), predicts each
+  independently with the shared per-stream Huffman tables, and
+  concatenates `top_seed | top_bits | bot_seed | bot_bits` on the
+  wire. The decoder reverses the split via
+  `BitReader::bytes_consumed` + `interleave_fields`. Self-roundtrip
+  tests at heights 288 (boundary), 290, 300, and 320 across all
+  three pixel families and four predictor methods.
+- **AVI lockstep** (`tests/round4_avi_lockstep.rs`, 8 tests): the
+  test-only `oxideav-avi` dev-dep wraps the codec/container
+  interface end-to-end. Each test encodes a synthetic frame,
+  muxes it via `oxideav_avi::muxer`, demuxes via
+  `oxideav_avi::demuxer`, and decodes the resulting packet,
+  asserting pixel-exact equality. Covers YUY2 / RGB24, every
+  predictor, both `ClassicV2` and `CustomV2` extradata paths, the
+  interlaced trigger, and a two-frame stream.
 
 ## Out of scope (deferred)
 
@@ -81,12 +100,20 @@ in `oxideav-avi`.
   "FFVHuff is **out of scope** for this workspace; only the
   original `HFYU` FOURCC HuffYUV from Rudiak-Gould's binary
   distribution is targeted here").
-- Interlaced field-stride=2 prediction (`biHeight > 288`).
 - Third-party-fixture lockstep — the host
-  `samples.oxideav.org` returned 404 on every probed HuffYUV
-  path at round-3 time, so we ship the AVI walker alone with a
-  self-authored AVI roundtrip; the lockstep harness picks up
-  fixtures once they land at the canonical URL.
+  `samples.oxideav.org` carried no `HFYU` / `FFVH` fixtures at
+  round-4 time, so the lockstep test runs against synthetic
+  encoder output. When fixtures land we expect to add a
+  `samples_lockstep_*` test that consumes them via the
+  `oxideav-avi` dev-dep without any change to this crate's
+  source layout.
+- The interlaced wire format follows the spec/02 §2 directive
+  ("two fields each of height H/2, predicted independently") but
+  spec/05 — the canonical interlace chapter — is still flagged
+  "planned" in the docs workspace. The implementation is
+  self-roundtrip-correct; lockstep against a third-party
+  interlaced HuffYUV encoder will need spec/05 + a fixture before
+  it can be claimed bit-exact.
 
 ## Cargo features
 

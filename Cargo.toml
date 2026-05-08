@@ -22,3 +22,12 @@ registry = ["dep:oxideav-core"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# Test-only dev-dep on the AVI container so we can exercise the
+# codec/container interface end-to-end (encode → mux → demux → decode)
+# without shadow-implementing AVI walking inside this crate. spec/02
+# §1: HuffYUV streams live in AVI `00dc` chunks; the container is
+# oxideav-avi's responsibility, not this crate's.
+oxideav-avi = "0.0"
+oxideav-core = "0.1"

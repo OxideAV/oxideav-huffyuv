@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-4: codec ↔ container lockstep + interlaced field-stride=2:
+  - `tests/round4_avi_lockstep.rs` (8 tests) — end-to-end
+    encoder → `oxideav-avi` muxer → demuxer → decoder roundtrip on
+    synthetic frames, exercising the codec/container interface
+    without dragging an AVI walker into this crate. Test-only
+    `[dev-dependencies] oxideav-avi` per `docs/IMPLEMENTOR_ROUND.md`
+    §"Crate-purpose discipline". Covers YUY2/RGB24 + every predictor,
+    `ClassicV2` and `CustomV2` extradata paths, interlaced (height
+    > 288), and a two-frame stream.
+  - Interlaced field-stride=2 prediction path (spec/02 §2 +
+    spec/05 planned) on both encode and decode sides: when
+    `biHeight > 288` the encoder splits the frame into two fields
+    (even rows = top; odd rows = bottom), predicts each
+    independently with the shared per-stream Huffman tables, and
+    concatenates `top_seed | top_bits | bot_seed | bot_bits` on
+    the wire. Decoder reverses the split via `BitReader::bytes_consumed`
+    + `interleave_fields`. 10 new self-roundtrip tests at heights
+    288 (boundary), 290, 300, and 320 across all three pixel
+    families and four predictor methods, plus the threshold
+    constants test in `predict.rs`.
+  - `predict::is_interlaced_height`, `predict::split_fields`,
+    `predict::interleave_fields` — public helpers usable by
+    integration tests verifying the spec/02 §2 trigger.
+
 - Round-3: decoder fast-LUT + v1.x compat for all predictors:
   - `tables::HuffTable::primary_lut` — 65 536-entry primary LUT
     keyed on the top 16 bits of the bit window. Codes ≤ 16 bits hit

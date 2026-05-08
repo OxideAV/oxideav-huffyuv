@@ -8,7 +8,10 @@
 use crate::bitio::BitReader;
 use crate::error::{Error, Result};
 use crate::header::{PixelFamily, Predictor, StreamConfig};
-use crate::predict::{inverse_gradient_post, inverse_rgb_decorr_bgr, inverse_rgb_decorr_bgra};
+use crate::predict::{
+    interleave_fields, inverse_gradient_post, inverse_rgb_decorr_bgr, inverse_rgb_decorr_bgra,
+    is_interlaced_height,
+};
 use crate::tables::{
     classic_blob_bytes, decode_one, rle_decode_one_channel, rle_decode_three_channels,
     v1x_codes_set_a, v1x_codes_set_b, v1x_lengths_set_a, v1x_lengths_set_b, v1x_table_from_pair,
@@ -32,12 +35,101 @@ pub struct DecodedFrame {
 /// `config` is the per-stream configuration parsed once at
 /// `ICDecompressBegin` time; `frame_bytes` is the raw payload of one
 /// AVI `00dc` chunk.
+///
+/// When `config.height > 288` the spec engages the field-stride=2
+/// interlaced path (spec/02 §2): the chunk holds two concatenated
+/// sub-frames (top field then bottom field), each with its own
+/// uncompressed seed + bit-packed body. We decode each field as if
+/// its own H/2-tall frame, then interleave rows back into a single
+/// `height`-row raster.
 pub fn decode_frame(config: &StreamConfig, frame_bytes: &[u8]) -> Result<DecodedFrame> {
     let three_tables = build_three_tables(config)?;
-    match config.family {
-        PixelFamily::Yuy2 => decode_yuy2(config, frame_bytes, &three_tables),
-        PixelFamily::Rgb24 => decode_rgb24(config, frame_bytes, &three_tables),
-        PixelFamily::Rgb32 => decode_rgb32(config, frame_bytes, &three_tables),
+    if is_interlaced_height(config.height) {
+        return decode_frame_interlaced(config, frame_bytes, &three_tables);
+    }
+    decode_field(
+        config.family,
+        config.method.predictor(),
+        config.method.decorrelate(),
+        config.width,
+        config.height,
+        frame_bytes,
+        &three_tables,
+    )
+    .map(|(frame, _consumed)| frame)
+}
+
+fn decode_frame_interlaced(
+    config: &StreamConfig,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<DecodedFrame> {
+    let h = config.height as usize;
+    let top_h = h.div_ceil(2) as u32;
+    let bot_h = (h / 2) as u32;
+    let (top_frame, top_consumed) = decode_field(
+        config.family,
+        config.method.predictor(),
+        config.method.decorrelate(),
+        config.width,
+        top_h,
+        frame_bytes,
+        tables,
+    )?;
+    let bot_frame = if bot_h > 0 {
+        let rest = &frame_bytes[top_consumed..];
+        let (bf, _) = decode_field(
+            config.family,
+            config.method.predictor(),
+            config.method.decorrelate(),
+            config.width,
+            bot_h,
+            rest,
+            tables,
+        )?;
+        Some(bf)
+    } else {
+        None
+    };
+    let row_bytes = match config.family {
+        PixelFamily::Yuy2 => config.width as usize * 2,
+        PixelFamily::Rgb24 => config.width as usize * 3,
+        PixelFamily::Rgb32 => config.width as usize * 4,
+    };
+    let merged = if let Some(bot) = bot_frame {
+        interleave_fields(&top_frame.pixels, &bot.pixels, row_bytes, h)
+    } else {
+        top_frame.pixels
+    };
+    Ok(DecodedFrame {
+        family: config.family,
+        width: config.width,
+        height: config.height,
+        pixels: merged,
+    })
+}
+
+/// Decode one field (or one full progressive frame).  Returns the
+/// reconstructed pixels plus the byte count consumed from
+/// `frame_bytes` (used by the interlaced path to find the start of
+/// the bottom field).
+fn decode_field(
+    family: PixelFamily,
+    predictor: Predictor,
+    decorrelate: bool,
+    width: u32,
+    height: u32,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<(DecodedFrame, usize)> {
+    match family {
+        PixelFamily::Yuy2 => decode_yuy2_field(predictor, width, height, frame_bytes, tables),
+        PixelFamily::Rgb24 => {
+            decode_rgb24_field(predictor, decorrelate, width, height, frame_bytes, tables)
+        }
+        PixelFamily::Rgb32 => {
+            decode_rgb32_field(predictor, decorrelate, width, height, frame_bytes, tables)
+        }
     }
 }
 
@@ -104,18 +196,20 @@ fn build_three_tables(config: &StreamConfig) -> Result<ThreeTables> {
     }
 }
 
-fn decode_yuy2(
-    config: &StreamConfig,
+fn decode_yuy2_field(
+    predictor: Predictor,
+    width: u32,
+    height: u32,
     frame_bytes: &[u8],
     tables: &ThreeTables,
-) -> Result<DecodedFrame> {
-    let width = config.width as usize;
-    let height = config.height as usize;
-    if width % 2 != 0 {
+) -> Result<(DecodedFrame, usize)> {
+    let width_us = width as usize;
+    let height_us = height as usize;
+    if width_us % 2 != 0 {
         return Err(Error::invalid("YUY2 width must be even"));
     }
-    let row_bytes = width * 2; // Y₁ U Y₂ V per 2 px = 4 bytes per pair × (width/2) pairs = width × 2.
-    let total_bytes = row_bytes * height;
+    let row_bytes = width_us * 2; // Y₁ U Y₂ V per 2 px = 4 bytes per pair × (width/2) pairs = width × 2.
+    let total_bytes = row_bytes * height_us;
     if frame_bytes.len() < 4 {
         return Err(Error::invalid(
             "YUY2 frame: missing 4-byte uncompressed pixel",
@@ -155,36 +249,43 @@ fn decode_yuy2(
     // - GRADIENT: same as LEFT then per-row paddb (rows 1..H).
     // - MEDIAN: LEFT pass over row 0 + the first 8 wire bytes of
     //   row 1; median per-byte add elsewhere.
-    match config.method.predictor() {
+    match predictor {
         Predictor::Left => {
             inverse_yuy2_left(&mut pixels);
         }
         Predictor::Gradient => {
             inverse_yuy2_left(&mut pixels);
-            inverse_gradient_post(&mut pixels, row_bytes, height);
+            inverse_gradient_post(&mut pixels, row_bytes, height_us);
         }
         Predictor::Median => {
             inverse_yuy2_median(&mut pixels, row_bytes);
         }
     }
 
-    Ok(DecodedFrame {
-        family: PixelFamily::Yuy2,
-        width: config.width,
-        height: config.height,
-        pixels,
-    })
+    let consumed = 4 + reader.bytes_consumed();
+    Ok((
+        DecodedFrame {
+            family: PixelFamily::Yuy2,
+            width,
+            height,
+            pixels,
+        },
+        consumed,
+    ))
 }
 
-fn decode_rgb24(
-    config: &StreamConfig,
+fn decode_rgb24_field(
+    predictor: Predictor,
+    decorrelate: bool,
+    width: u32,
+    height: u32,
     frame_bytes: &[u8],
     tables: &ThreeTables,
-) -> Result<DecodedFrame> {
-    let width = config.width as usize;
-    let height = config.height as usize;
-    let row_bytes = width * 3;
-    let total_bytes = row_bytes * height;
+) -> Result<(DecodedFrame, usize)> {
+    let width_us = width as usize;
+    let height_us = height as usize;
+    let row_bytes = width_us * 3;
+    let total_bytes = row_bytes * height_us;
     if frame_bytes.len() < 4 {
         return Err(Error::invalid(
             "RGB24 frame: missing 4-byte uncompressed pixel",
@@ -208,10 +309,10 @@ fn decode_rgb24(
     //   - non-decorr:  3 codes per pixel: B (slot1), G (slot2), R (slot3)
     //   - decorr:      3 codes per pixel: G (slot2), B-G (slot1), R-G (slot3)
     // The reconstructed buffer always stores 3-byte BGR.
-    let n_pixels = width * height;
+    let n_pixels = width_us * height_us;
     for px in 1..n_pixels {
         let bgr_off = px * 3;
-        if config.method.decorrelate() {
+        if decorrelate {
             // G first.
             let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
             reader.consume_bits(lg as u32)?;
@@ -240,39 +341,47 @@ fn decode_rgb24(
         }
     }
 
+    let consumed = 4 + reader.bytes_consumed();
+
     // Predictor inverse on the per-channel residual stream. Channels
     // are interleaved 3-byte BGR; LEFT walks each channel via stride
     // 3.
     inverse_left_per_channel(&mut pixels, 3);
-    match config.method.predictor() {
+    match predictor {
         Predictor::Left => {}
-        Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height),
+        Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height_us),
         Predictor::Median => {
             return Err(Error::invalid("median predictor not legal for RGB"));
         }
     }
-    if config.method.decorrelate() {
+    if decorrelate {
         // Inverse decorrelation: B = (B-G) + G, R = (R-G) + G.
         inverse_rgb_decorr_bgr(&mut pixels);
     }
 
-    Ok(DecodedFrame {
-        family: PixelFamily::Rgb24,
-        width: config.width,
-        height: config.height,
-        pixels,
-    })
+    Ok((
+        DecodedFrame {
+            family: PixelFamily::Rgb24,
+            width,
+            height,
+            pixels,
+        },
+        consumed,
+    ))
 }
 
-fn decode_rgb32(
-    config: &StreamConfig,
+fn decode_rgb32_field(
+    predictor: Predictor,
+    decorrelate: bool,
+    width: u32,
+    height: u32,
     frame_bytes: &[u8],
     tables: &ThreeTables,
-) -> Result<DecodedFrame> {
-    let width = config.width as usize;
-    let height = config.height as usize;
-    let row_bytes = width * 4;
-    let total_bytes = row_bytes * height;
+) -> Result<(DecodedFrame, usize)> {
+    let width_us = width as usize;
+    let height_us = height as usize;
+    let row_bytes = width_us * 4;
+    let total_bytes = row_bytes * height_us;
     if frame_bytes.len() < 4 {
         return Err(Error::invalid(
             "RGB32 frame: missing 4-byte uncompressed pixel",
@@ -285,11 +394,11 @@ fn decode_rgb32(
 
     let bit_data = &frame_bytes[4..];
     let mut reader = BitReader::new(bit_data);
-    let n_pixels = width * height;
+    let n_pixels = width_us * height_us;
 
     for px in 1..n_pixels {
         let off = px * 4;
-        if config.method.decorrelate() {
+        if decorrelate {
             // wire order: G, B-G, R-G, A. Slot mapping: G→slot2,
             // B-G→slot1, R-G→slot3, A→slot3 (alpha shares slot-3
             // codebook per spec/03 §1.2).
@@ -322,25 +431,30 @@ fn decode_rgb32(
         }
     }
 
+    let consumed = 4 + reader.bytes_consumed();
+
     // Per-channel LEFT inverse, stride 4.
     inverse_left_per_channel(&mut pixels, 4);
-    match config.method.predictor() {
+    match predictor {
         Predictor::Left => {}
-        Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height),
+        Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height_us),
         Predictor::Median => {
             return Err(Error::invalid("median predictor not legal for RGB"));
         }
     }
-    if config.method.decorrelate() {
+    if decorrelate {
         inverse_rgb_decorr_bgra(&mut pixels);
     }
 
-    Ok(DecodedFrame {
-        family: PixelFamily::Rgb32,
-        width: config.width,
-        height: config.height,
-        pixels,
-    })
+    Ok((
+        DecodedFrame {
+            family: PixelFamily::Rgb32,
+            width,
+            height,
+            pixels,
+        },
+        consumed,
+    ))
 }
 
 /// Per-channel LEFT inverse on an N-channel-interleaved buffer. Each
