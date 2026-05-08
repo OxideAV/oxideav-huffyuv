@@ -99,20 +99,29 @@ test-only `[dev-dependencies] oxideav-avi`.
 - **Walking-stride encoder for interlaced**: the round-4 interlaced
   path materialised two contiguous half-height field buffers
   (`predict::split_fields`) plus a `combined_residuals_for_stats`
-  body for the histogram + verify passes — peak working set ≈ 4×
-  source-frame size at 1080p / 4K. Round 5 walks the source raster
-  with row-stride 2 directly (`encoder::compact_field_rows`) into a
+  body for the histogram + verify passes (clone of both fields'
+  bodies concatenated). Round 5 walks the source raster with
+  row-stride 2 directly (`encoder::compact_field_rows`) into a
   single field-sized scratch reused across both fields, and fills
   one combined-body `Vec<u8>` in two halves
   (`combined_body[..top_body_len]` for top, `[top_body_len..]` for
-  bot). Per-family slot-phase alignment is preserved (top body
-  length is always a multiple of 4 / 3 / 4 for YUY2 / RGB24 /
-  RGB32, so the bot half resumes the histogram + emit slot mapping
-  at the same `i % cycle == 0` phase). The wire bytes are
-  bit-identical to round 4; the regression is guarded by 8 new
-  round-trip tests covering odd height, 480p-class, V1xCompat
-  walking-stride, and CustomV2 walking-stride across all three
-  pixel families. Lib-test count: 72 → 80.
+  bot). The histogram + verify + emit passes consume slices of the
+  combined body directly via slice-based helpers
+  (`compute_lengths_from_body`, `verify_body_in_table`,
+  `emit_bitstream_parts`) — no per-field `Residuals` clone, no
+  per-field body Vec at emit time. Per-family slot-phase alignment
+  is preserved (top body length is always a multiple of 4 / 3 / 4
+  for YUY2 / RGB24 / RGB32, so the bot half resumes the histogram
+  + emit slot mapping at the same `i % cycle == 0` phase).
+  Encoder peak working set drops from ~3.5× source-frame size
+  (round 4: split_top + split_bot + per-field
+  intermediate/residuals/body + combined-stats clone) to ~2.5×
+  (round 5: scratch + per-field intermediate/residuals/body +
+  combined). Wire bytes are bit-identical to round 4; the
+  regression is guarded by 8 new round-trip tests covering odd
+  height, 480p-class, V1xCompat walking-stride, and CustomV2
+  walking-stride across all three pixel families. Lib-test count:
+  72 → 80.
 
 ## Out of scope (deferred)
 

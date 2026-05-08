@@ -11,22 +11,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Round-5: walking-stride interlaced encoder. The round-4 interlaced
   path materialised two contiguous half-height field buffers via
   `predict::split_fields` plus a third `combined_residuals_for_stats`
-  body for histogram + verify, peaking at ≈ 4× source-frame size in
-  working memory. Round 5 replaces both with:
+  body (clone of both fields' bodies concatenated) for histogram +
+  verify. Round 5 replaces both with:
   - One field-sized scratch (`compact_field_rows`) reused for top
     then bot field by walking the source raster with row-stride 2.
   - One combined-body `Vec<u8>` filled in two halves
     (`combined_body[..top_body_len]` = top, rest = bot); the
-    histogram + emit passes slice it instead of allocating
-    per-field bodies. Per-family slot-phase alignment is preserved
-    (top body length is a multiple of 4 / 3 / 4 for YUY2 / RGB24 /
-    RGB32 respectively, so the bot half resumes at the same
+    histogram + emit passes consume slices of it via new
+    slice-based helpers (`compute_lengths_from_body`,
+    `verify_body_in_table`, `emit_bitstream_parts`) — no per-field
+    `Residuals` clone, no per-field body Vec at emit time.
+    Per-family slot-phase alignment is preserved (top body length
+    is a multiple of 4 / 3 / 4 for YUY2 / RGB24 / RGB32
+    respectively, so the bot half resumes at the same
     `i % cycle == 0` phase).
-  - Result: ≈ 2× working-set memory reduction at 1080p / 4K
-    interlaced; same wire bytes as round 4 (regression-guarded by
-    8 new round-trip tests covering odd height, 480p-class,
-    `V1xCompat` walking-stride, and `CustomV2` walking-stride
-    across all three pixel families).
+  - Result: encoder peak working set drops from ~3.5× source-frame
+    size (split_top + split_bot + per-field
+    intermediate/residuals/body + combined-stats clone) to ~2.5×
+    (scratch + per-field intermediate/residuals/body + combined).
+    Wire bytes identical to round 4 — regression guarded by 8 new
+    round-trip tests covering odd height, 480p-class, `V1xCompat`
+    walking-stride, and `CustomV2` walking-stride across all three
+    pixel families.
 - 8 new round-5 self-roundtrip tests in `roundtrip_tests.rs` exercising
   the walking-stride interlaced encoder (odd height 8×301 across all
   three families; 480p-class 96×480 and 64×480; V1xCompat × Median;
