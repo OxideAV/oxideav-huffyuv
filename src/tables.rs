@@ -344,10 +344,18 @@ pub fn compute_canonical_lengths(histogram: &[u32; 256]) -> Result<[u8; 256]> {
         return Ok(lengths);
     }
     if active.len() == 1 {
-        // A single-symbol alphabet: assign length 1 (the code is just
-        // "0" or "1" — either works; we pick whatever canonical-build
-        // emits).
-        lengths[active[0].0 as usize] = 1;
+        // A single-symbol alphabet still has to satisfy Kraft equality
+        // (`build_from_lengths` accumulates codes per length tier and
+        // requires the accumulator to wrap to 0). One length-1 entry
+        // alone has Kraft sum 1/2; we round it out by giving an
+        // unused dummy symbol the other length-1 code. The dummy is
+        // never emitted (its histogram count is 0), so the wire
+        // bytes are unchanged — this is purely a table-shape
+        // adjustment for the decoder-side build invariant.
+        let only = active[0].0 as usize;
+        lengths[only] = 1;
+        let dummy = if only == 0 { 1 } else { 0 };
+        lengths[dummy] = 1;
         return Ok(lengths);
     }
     if active.len() == 2 {

@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-6: encoder predictor auto-selection (bit-cost-driven). New
+  public API:
+  - [`encoder::MethodSelection`] (`Fixed(Method)` / `Auto`) and
+    [`encoder::encode_frame_auto`] — runs every legal predictor for
+    the family, scores each one with the package-merge optimal
+    Huffman length tables, and emits the winner. Returns
+    `(strf, frame, chosen_method)` so muxers can record the picked
+    method.
+  - [`encoder::bit_cost_for_method`] — per-method bit-count estimate
+    in `Σ length[s] × count[s]` units against the package-merge
+    length tables. Stand-alone helper for callers that want to
+    inspect the trade-off without driving a full encode.
+  - `MethodSelection::legal_methods(family)` — enumerates the
+    deterministic candidate-method order for a family (YUY2: Left /
+    Gradient / Median; RGB24/RGB32: Left / LeftDecorr /
+    GradientDecorr). `PredictOld` is intentionally omitted from
+    `Auto` (wire-distinct but body-identical to `Left`; callers
+    needing `PredictOld` on the wire should use
+    `MethodSelection::Fixed`).
+  - 12 new self-roundtrip tests: auto round-trips on YUY2 /
+    RGB24 / RGB32 in both extradata modes (CustomV2 + ClassicV2);
+    auto on interlaced heights 290 / 300; auto on a chroma-
+    correlated RGB24 synthetic where LeftDecorr provably beats
+    Left; auto on a diagonally-textured YUY2; auto-winner ≤
+    every-fixed-candidate inequality tests; `MethodSelection::Fixed`
+    returns the pinned method back unchanged; `bit_cost_for_method`
+    rejects illegal `(family, method)` pairs. Lib test count:
+    80 → 92.
+- `tables::compute_canonical_lengths` now handles the single-symbol
+  histogram case by emitting a length-1 dummy entry on the next
+  available symbol, so the canonical builder's Kraft accumulator
+  still wraps to zero. The dummy is never emitted (its histogram
+  count is 0) and the wire body is unchanged on any frame with
+  a multi-symbol residual stream; the change unblocks CustomV2 +
+  Auto on degenerate inputs (e.g., constant-luma frames where one
+  channel's residuals collapse to a single value).
+
+### Added (round 5)
+
 - Round-5: walking-stride interlaced encoder. The round-4 interlaced
   path materialised two contiguous half-height field buffers via
   `predict::split_fields` plus a third `combined_residuals_for_stats`

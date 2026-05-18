@@ -372,6 +372,205 @@ pub fn build_bitmapinfoheader(
     v
 }
 
+/// Per-method bit-cost estimate for the package-merge optimal
+/// length tables built from this `(method, pixels)`'s residual
+/// stream. Used by [`encode_frame_auto`] to pick the predictor that
+/// produces the smallest encoded body; exposed publicly so
+/// muxer-side encoders can inspect the trade-off without doing two
+/// emit passes.
+///
+/// Returns the total number of code-bits (excluding the per-field
+/// 4-byte uncompressed seed) the body would occupy using the
+/// per-channel package-merge length tables. This is the same metric
+/// the auto-selector minimises.
+///
+/// Returns `Err` if the `(family, method)` pair isn't legal
+/// per `spec/01 §3.1`, or if the input buffer size is wrong for
+/// `width × height × bytes-per-pixel`.
+pub fn bit_cost_for_method(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<u64> {
+    if family.is_rgb() && !method.is_rgb_legal() {
+        return Err(Error::invalid("bit_cost: method not legal for RGB"));
+    }
+    if !family.is_rgb() && !method.is_yuv_legal() {
+        return Err(Error::invalid("bit_cost: method not legal for YUV"));
+    }
+    let body = compute_combined_body(family, method, width, height, pixels)?;
+    let (h1, h2, h3) = histogramise(family, method, &body);
+    Ok(bit_cost_from_histograms(&h1, &h2, &h3))
+}
+
+/// Compute the residual body the encoder would write for this
+/// `(family, method)` pair. For interlaced heights, this is the
+/// concatenation `top.body || bot.body` — exactly what the
+/// histogramiser sees in the [`encode_frame_with_mode`] path. For
+/// progressive heights it's the single field's body.
+fn compute_combined_body(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<Vec<u8>> {
+    let interlaced = is_interlaced_height(height);
+    if !interlaced {
+        let r = compute_residuals(family, method, width, height, pixels)?;
+        return Ok(r.body);
+    }
+    let row_bytes = match family {
+        PixelFamily::Yuy2 => width as usize * 2,
+        PixelFamily::Rgb24 => width as usize * 3,
+        PixelFamily::Rgb32 => width as usize * 4,
+    };
+    let h = height as usize;
+    let top_h = h.div_ceil(2) as u32;
+    let bot_h = (h / 2) as u32;
+    let mut scratch = vec![0u8; (top_h as usize) * row_bytes];
+    let mut combined: Vec<u8> = Vec::new();
+    compact_field_rows(pixels, &mut scratch, row_bytes, h, 0);
+    let top_res = compute_residuals(
+        family,
+        method,
+        width,
+        top_h,
+        &scratch[..(top_h as usize) * row_bytes],
+    )?;
+    combined.extend_from_slice(&top_res.body);
+    if bot_h > 0 {
+        scratch.resize((bot_h as usize) * row_bytes, 0);
+        compact_field_rows(pixels, &mut scratch, row_bytes, h, 1);
+        let bot_res = compute_residuals(
+            family,
+            method,
+            width,
+            bot_h,
+            &scratch[..(bot_h as usize) * row_bytes],
+        )?;
+        combined.extend_from_slice(&bot_res.body);
+    }
+    Ok(combined)
+}
+
+/// Sum `Σ length[symbol] × count[symbol]` over each slot's
+/// package-merge optimal length table. Each call runs the
+/// length-limited package-merge builder three times (once per slot),
+/// then walks the histogram. Total work is `O(256 × 31 × 3) +
+/// O(256 × 3)` per call — trivially small even at 4K.
+fn bit_cost_from_histograms(h1: &[u32; 256], h2: &[u32; 256], h3: &[u32; 256]) -> u64 {
+    let l1 = compute_canonical_lengths(h1).unwrap_or([1u8; 256]);
+    let l2 = compute_canonical_lengths(h2).unwrap_or([1u8; 256]);
+    let l3 = compute_canonical_lengths(h3).unwrap_or([1u8; 256]);
+    let mut bits: u64 = 0;
+    for (h, l) in [(h1, &l1), (h2, &l2), (h3, &l3)] {
+        for s in 0..256 {
+            if h[s] != 0 {
+                bits += (l[s] as u64) * (h[s] as u64);
+            }
+        }
+    }
+    bits
+}
+
+/// Selects which `(family, method)` combination [`encode_frame_auto`]
+/// considers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MethodSelection {
+    /// Pin the predictor — same behaviour as the fixed-method
+    /// `encode_frame_with_mode`.
+    Fixed(Method),
+    /// Try every legal predictor for this family, pick the one with
+    /// the smallest [`bit_cost_for_method`].
+    #[default]
+    Auto,
+}
+
+impl MethodSelection {
+    fn candidates(&self, family: PixelFamily) -> Vec<Method> {
+        match self {
+            MethodSelection::Fixed(m) => vec![*m],
+            MethodSelection::Auto => Self::legal_methods(family),
+        }
+    }
+
+    /// All `(family, method)` pairs the encoder may legally produce.
+    /// Order is deterministic so test output is stable on ties.
+    pub fn legal_methods(family: PixelFamily) -> Vec<Method> {
+        if family.is_rgb() {
+            vec![
+                Method::Left,
+                Method::LeftDecorr,
+                Method::GradientDecorr,
+                // PredictOld is wire-distinct but produces an
+                // identical body to Left for the auto-selector's
+                // purposes (same predictor + no decorrelation); we
+                // omit it from Auto since Left dominates and Auto
+                // picks one winner deterministically. Callers needing
+                // `PredictOld` on the wire should use `Fixed`.
+            ]
+        } else {
+            vec![Method::Left, Method::Gradient, Method::Median]
+        }
+    }
+}
+
+/// Encode a frame, picking the predictor with the smallest bit cost
+/// over the legal methods for this `family`. Returns the encoded
+/// `(strf, frame_bytes)` plus the [`Method`] the auto-selector chose.
+///
+/// `selection` controls which methods are considered:
+/// [`MethodSelection::Auto`] tries every legal predictor for the
+/// family; [`MethodSelection::Fixed`] runs only the named method and
+/// returns it back unchanged (equivalent to calling
+/// [`encode_frame_with_mode`] directly but with the matching
+/// `chosen_method` return).
+///
+/// `mode` selects the extradata path the chosen frame uses
+/// ([`ExtradataMode::CustomV2`] yields the smallest wire frame for
+/// nontrivial content because it ships per-frame-optimal Huffman
+/// length tables; [`ExtradataMode::ClassicV2`] is bigger on the body
+/// but skips the per-frame extradata RLE and matches the
+/// proprietary's default; [`ExtradataMode::V1xCompat`] forces the
+/// v1.x precomputed codebook).
+pub fn encode_frame_auto(
+    family: PixelFamily,
+    selection: MethodSelection,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    mode: ExtradataMode,
+) -> Result<(Vec<u8>, Vec<u8>, Method)> {
+    let candidates = selection.candidates(family);
+    if candidates.is_empty() {
+        return Err(Error::invalid("encode_frame_auto: no legal methods"));
+    }
+    // Score each candidate; keep the winner. Tie-break: first in
+    // `candidates` order (so output is deterministic).
+    let mut best: Option<(Method, u64)> = None;
+    for &m in &candidates {
+        // Skip methods that can't form a valid v1.x stream when the
+        // caller pinned V1xCompat — surface an error only if the
+        // chosen winner is then incompatible (we'd rather not silently
+        // pick a method that fails verify_body_in_table). The simplest
+        // correct behaviour is to score normally and let the final
+        // emit-pass error propagate; callers that pick V1xCompat are
+        // already accepting the v1.x compat constraint.
+        let cost = bit_cost_for_method(family, m, width, height, pixels)?;
+        match best {
+            None => best = Some((m, cost)),
+            Some((_, prev)) if cost < prev => best = Some((m, cost)),
+            _ => {}
+        }
+    }
+    let (chosen, _) = best.expect("non-empty candidates → some winner");
+    let (strf, frame) = encode_frame_with_mode(family, chosen, width, height, pixels, mode)?;
+    Ok((strf, frame, chosen))
+}
+
 /// Convenience wrapper for tests: encode + parse the strf into a
 /// resolved [`StreamConfig`] in one call.
 pub fn encode_for_test(

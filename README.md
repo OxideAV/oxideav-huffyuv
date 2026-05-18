@@ -5,10 +5,11 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 5 — walking-stride interlaced encoder.**
+**Round 6 — encoder predictor auto-selection.**
 Rounds 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4
-(interlace + lockstep), and 5 (walking-stride encoder memory
-optimisation) all ship from the strict-isolation
+(interlace + lockstep), 5 (walking-stride encoder memory
+optimisation), and 6 (predictor RDO + single-symbol fix)
+all ship from the strict-isolation
 clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
 The previous (pre-orphan) implementation was retired alongside the
@@ -122,6 +123,31 @@ test-only `[dev-dependencies] oxideav-avi`.
   height, 480p-class, V1xCompat walking-stride, and CustomV2
   walking-stride across all three pixel families. Lib-test count:
   72 → 80.
+
+## What works (Round 6)
+
+- **Encoder predictor auto-selection.** New
+  `encode_frame_auto(family, MethodSelection, w, h, pixels, mode)`
+  runs every legal predictor for the family, scores each one with
+  `bit_cost_for_method` (= `Σ length[s] × count[s]` against the
+  package-merge optimal Huffman length tables — the same metric the
+  `CustomV2` extradata path would minimise on the chosen method),
+  and emits the winner. Returns the chosen `Method` back to the
+  caller. Pin a method via `MethodSelection::Fixed(...)` to
+  short-circuit. Body-identical predictors (`PredictOld` vs `Left`)
+  are deduplicated in `Auto`'s candidate list; callers needing
+  `PredictOld` on the wire should use `Fixed`.
+- **Public `bit_cost_for_method` helper** for callers who want to
+  inspect the trade-off without re-running the full encode (e.g., a
+  muxer caching the cheapest predictor between similar frames).
+- **`compute_canonical_lengths` single-symbol fix.** A single-symbol
+  histogram now rounds out the length table with a length-1 dummy
+  entry so `HuffTable::build_from_lengths`'s Kraft accumulator wraps
+  to zero. Unblocks `CustomV2` + `Auto` on degenerate inputs (e.g.,
+  constant-luma frames where one channel's residuals collapse to a
+  single value). Dummy is never emitted (its histogram count is 0)
+  and the wire bytes for any multi-symbol input are unchanged.
+  Lib test count: 80 → 92.
 
 ## Out of scope (deferred)
 
