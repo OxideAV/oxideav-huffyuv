@@ -10,7 +10,7 @@
 use crate::decoder::decode_frame;
 use crate::encoder::{
     bit_cost_for_method, encode_for_test, encode_for_test_with_mode, encode_frame_auto,
-    ExtradataMode, MethodSelection,
+    encode_frame_with_mode, ExtradataMode, MethodSelection,
 };
 use crate::header::{Method, PixelFamily, StreamConfig};
 use crate::tables::{
@@ -1239,4 +1239,222 @@ fn bit_cost_rejects_illegal_method_for_family() {
     let pixels = synth_rgb24(4, 4);
     let err = bit_cost_for_method(PixelFamily::Rgb24, Method::Median, 4, 4, &pixels);
     assert!(err.is_err());
+}
+
+// ───────── round-7: encoder auto + residual reuse, V1xCompat caching ─────────
+//
+// Round 7 collapses the auto-selector's residual computation from
+// N + 1 (one per candidate inside `bit_cost_for_method` + one more
+// inside `encode_frame_with_mode` for the winner) down to N. The
+// pre-computed residuals carry forward into a private
+// `encode_with_precomputed` so the winner's body bytes aren't
+// re-derived from `pixels`. V1xCompat tables are now cached behind a
+// per-family `OnceLock` instead of being rebuilt (LUT-bake included)
+// on every encode call. The tests in this section confirm:
+//
+//   (a) wire identity between `encode_frame_auto(Fixed(m))` and
+//       `encode_frame_with_mode(m)` for every legal (family, method)
+//       pair under each extradata mode (no drift from sharing residuals);
+//   (b) the chosen method's auto-emitted bytes match the bytes you'd
+//       get by calling `encode_frame_with_mode(chosen)` directly;
+//   (c) V1xCompat repeated-call wire stability (cache returns clones
+//       that produce identical bit-streams);
+//   (d) interlaced auto-selection wire-matches the explicit-method
+//       interlaced path.
+
+#[test]
+fn round7_auto_fixed_wire_matches_encode_frame_with_mode_yuy2() {
+    let pixels = synth_yuy2(16, 12);
+    for &m in &[Method::Left, Method::Gradient, Method::Median] {
+        for &mode in &[
+            ExtradataMode::ClassicV2,
+            ExtradataMode::CustomV2,
+            ExtradataMode::V1xCompat,
+        ] {
+            let (strf_a, frame_a) =
+                encode_frame_with_mode(PixelFamily::Yuy2, m, 16, 12, &pixels, mode).unwrap();
+            let (strf_b, frame_b, chosen) = encode_frame_auto(
+                PixelFamily::Yuy2,
+                MethodSelection::Fixed(m),
+                16,
+                12,
+                &pixels,
+                mode,
+            )
+            .unwrap();
+            assert_eq!(chosen, m, "Fixed(m) must return m back");
+            assert_eq!(strf_a, strf_b, "{m:?} {mode:?} strf drift");
+            assert_eq!(frame_a, frame_b, "{m:?} {mode:?} frame drift");
+        }
+    }
+}
+
+#[test]
+fn round7_auto_fixed_wire_matches_encode_frame_with_mode_rgb24() {
+    let pixels = synth_rgb24(12, 12);
+    for &m in &[Method::Left, Method::LeftDecorr, Method::GradientDecorr] {
+        for &mode in &[ExtradataMode::ClassicV2, ExtradataMode::CustomV2] {
+            let (strf_a, frame_a) =
+                encode_frame_with_mode(PixelFamily::Rgb24, m, 12, 12, &pixels, mode).unwrap();
+            let (strf_b, frame_b, _) = encode_frame_auto(
+                PixelFamily::Rgb24,
+                MethodSelection::Fixed(m),
+                12,
+                12,
+                &pixels,
+                mode,
+            )
+            .unwrap();
+            assert_eq!(strf_a, strf_b, "{m:?} {mode:?} strf drift");
+            assert_eq!(frame_a, frame_b, "{m:?} {mode:?} frame drift");
+        }
+    }
+}
+
+#[test]
+fn round7_auto_fixed_wire_matches_encode_frame_with_mode_rgb32() {
+    let pixels = synth_rgb32(12, 12);
+    for &m in &[Method::Left, Method::LeftDecorr, Method::GradientDecorr] {
+        for &mode in &[ExtradataMode::ClassicV2, ExtradataMode::CustomV2] {
+            let (strf_a, frame_a) =
+                encode_frame_with_mode(PixelFamily::Rgb32, m, 12, 12, &pixels, mode).unwrap();
+            let (strf_b, frame_b, _) = encode_frame_auto(
+                PixelFamily::Rgb32,
+                MethodSelection::Fixed(m),
+                12,
+                12,
+                &pixels,
+                mode,
+            )
+            .unwrap();
+            assert_eq!(strf_a, strf_b, "{m:?} {mode:?} strf drift");
+            assert_eq!(frame_a, frame_b, "{m:?} {mode:?} frame drift");
+        }
+    }
+}
+
+#[test]
+fn round7_auto_winner_matches_explicit_winner_encode_yuy2() {
+    // Auto picks a winner; encoding that same winner via
+    // `encode_frame_with_mode` must produce identical bytes (auto's
+    // shared-residual path must not drift from the explicit path).
+    let pixels = synth_yuy2(24, 16);
+    for &mode in &[ExtradataMode::CustomV2, ExtradataMode::ClassicV2] {
+        let (strf_auto, frame_auto, chosen) = encode_frame_auto(
+            PixelFamily::Yuy2,
+            MethodSelection::Auto,
+            24,
+            16,
+            &pixels,
+            mode,
+        )
+        .unwrap();
+        let (strf_exp, frame_exp) =
+            encode_frame_with_mode(PixelFamily::Yuy2, chosen, 24, 16, &pixels, mode).unwrap();
+        assert_eq!(
+            strf_auto, strf_exp,
+            "auto-vs-explicit strf drift, {chosen:?} {mode:?}"
+        );
+        assert_eq!(
+            frame_auto, frame_exp,
+            "auto-vs-explicit frame drift, {chosen:?} {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn round7_auto_winner_matches_explicit_winner_encode_interlaced() {
+    let pixels = synth_yuy2(16, 300);
+    let (strf_auto, frame_auto, chosen) = encode_frame_auto(
+        PixelFamily::Yuy2,
+        MethodSelection::Auto,
+        16,
+        300,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    let (strf_exp, frame_exp) = encode_frame_with_mode(
+        PixelFamily::Yuy2,
+        chosen,
+        16,
+        300,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    assert_eq!(
+        strf_auto, strf_exp,
+        "interlaced auto-vs-explicit strf drift"
+    );
+    assert_eq!(
+        frame_auto, frame_exp,
+        "interlaced auto-vs-explicit frame drift"
+    );
+}
+
+#[test]
+fn round7_v1x_cache_returns_stable_wire_bytes() {
+    // V1xCompat tables are now cached behind a per-family OnceLock.
+    // Two back-to-back encodes on the same input must produce
+    // bit-identical bytes (regression guard against accidental
+    // cache-mutation: the cached tables are cloned out per call, and
+    // the helper must NOT hand out aliased mutable state).
+    let pixels = synth_yuy2(8, 8);
+    let (strf1, frame1) = encode_frame_with_mode(
+        PixelFamily::Yuy2,
+        Method::PredictOld,
+        8,
+        8,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    let (strf2, frame2) = encode_frame_with_mode(
+        PixelFamily::Yuy2,
+        Method::PredictOld,
+        8,
+        8,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert_eq!(strf1, strf2);
+    assert_eq!(frame1, frame2);
+    // RGB family hits a different cache slot — confirm RGB-then-YUV
+    // doesn't poison YUV's cached slot1/slot2/slot3 triple (each
+    // family must end up with its correct (A, B, B) vs (A, A, A)
+    // tuple).
+    let rgb_pixels = synth_rgb24(4, 4);
+    let (_strf_rgb, frame_rgb1) = encode_frame_with_mode(
+        PixelFamily::Rgb24,
+        Method::PredictOld,
+        4,
+        4,
+        &rgb_pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    let (_strf_rgb, frame_rgb2) = encode_frame_with_mode(
+        PixelFamily::Rgb24,
+        Method::PredictOld,
+        4,
+        4,
+        &rgb_pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert_eq!(frame_rgb1, frame_rgb2);
+    // And re-encode YUY2 a third time after touching RGB — still
+    // stable.
+    let (_strf3, frame3) = encode_frame_with_mode(
+        PixelFamily::Yuy2,
+        Method::PredictOld,
+        8,
+        8,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    assert_eq!(frame1, frame3);
 }

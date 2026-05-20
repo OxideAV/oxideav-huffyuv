@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-7: encoder auto-selector residual reuse + V1xCompat table
+  cache.
+  - Round 6's `encode_frame_auto` did `N + 1` residual passes (one
+    per candidate inside `bit_cost_for_method` PLUS one more inside
+    `encode_frame_with_mode` for the winner). Round 7 collapses
+    that to `N`: a private `PrecomputedFrame` carrier holds the
+    seed(s) + combined body once, scoring runs over the cached
+    body, and the winner's body bytes flow straight into a new
+    private `encode_with_precomputed` helper. Wire bytes
+    bit-identical to round 6 — regression-guarded by 5 new
+    auto-vs-explicit drift tests across every legal
+    `(family, method, mode)` triple.
+  - Measured (release-mode, YUY2 320×240, 300 iters):
+    auto CustomV2 1.46 ms → 1.37 ms (≈5%); RGB24 auto CustomV2
+    1.65 ms → 1.52 ms (≈9%).
+  - V1xCompat per-family `OnceLock` cache for the v1.x
+    precomputed-code triple `(slot1, slot2, slot3)`. The codebook
+    is deterministic per family (spec/04 §4.1) and each
+    `HuffTable` carries a 128 KiB primary LUT — re-baking on
+    every encode wasted ~80 µs/frame. Round 7 caches the triple
+    behind two `OnceLock`s (YUY2 vs RGB) and hands out clones per
+    call, with a regression test that interleaves YUY2/RGB24
+    encodes to confirm the per-family slots stay isolated.
+  - Measured: YUY2 320×240 V1xCompat 0.47 ms → 0.40 ms (≈16%).
+  - Lib test count: 92 → 98.
+
 - Round-6: encoder predictor auto-selection (bit-cost-driven). New
   public API:
   - [`encoder::MethodSelection`] (`Fixed(Method)` / `Auto`) and

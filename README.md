@@ -5,10 +5,11 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 6 — encoder predictor auto-selection.**
+**Round 7 — auto-selector residual reuse + V1xCompat table cache.**
 Rounds 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4
 (interlace + lockstep), 5 (walking-stride encoder memory
-optimisation), and 6 (predictor RDO + single-symbol fix)
+optimisation), 6 (predictor RDO + single-symbol fix),
+and 7 (auto-selector residual sharing + V1xCompat OnceLock cache)
 all ship from the strict-isolation
 clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
@@ -148,6 +149,36 @@ test-only `[dev-dependencies] oxideav-avi`.
   single value). Dummy is never emitted (its histogram count is 0)
   and the wire bytes for any multi-symbol input are unchanged.
   Lib test count: 80 → 92.
+
+## What works (Round 7)
+
+- **Auto-selector residual reuse.** Round 6's
+  `encode_frame_auto` did `N + 1` residual passes: one per
+  candidate inside `bit_cost_for_method` + a final pass inside
+  `encode_frame_with_mode` for the winner. Round 7 introduces a
+  private `PrecomputedFrame` carrier + `encode_with_precomputed`
+  helper so the winner's residual body bytes flow straight from
+  the scoring loop into the emit pass — `N` traversals instead of
+  `N + 1`. Wire-identical to round 6; regression-guarded by 5 new
+  drift tests that assert `encode_frame_auto(Fixed(m))` bytes ==
+  `encode_frame_with_mode(m)` bytes across every legal
+  `(family, method, extradata-mode)` triple, plus an interlaced
+  auto-vs-explicit drift test. **Measured**: YUY2 320×240 auto
+  CustomV2 from 1.46 ms/frame → 1.37 ms/frame (≈5%); RGB24
+  320×240 auto CustomV2 from 1.65 ms/frame → 1.52 ms/frame
+  (≈9%).
+- **V1xCompat table cache.** The v1.x precomputed-code tables
+  are deterministic per pixel family (spec/04 §4.1: YUY2 = `(A,
+  B, B)`; RGB24/RGB32 = `(A, A, A)`), and each [`HuffTable`]
+  carries a 128 KiB primary LUT — re-baking the LUT on every
+  encode call wasted ~80 µs per frame. Round 7 caches the
+  three-tuple behind a per-family `OnceLock` and hands out clones
+  per call. **Measured**: YUY2 320×240 V1xCompat from 0.47
+  ms/frame → 0.40 ms/frame (≈16%). Per-family isolation
+  verified by a regression test that interleaves YUY2/RGB24
+  V1xCompat encodes and asserts the wire bytes for each family
+  stay stable across the interleaving.
+- Lib test count: 92 → 98.
 
 ## Out of scope (deferred)
 

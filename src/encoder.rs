@@ -86,131 +86,30 @@ pub fn encode_frame_with_mode(
     if !family.is_rgb() && !method.is_yuv_legal() {
         return Err(Error::invalid("encoder: method not legal for YUV"));
     }
+    // Round-7: factor the residual computation out so it can be
+    // shared across the auto-selector's candidate scoring + the final
+    // emit pass (one residual computation per candidate instead of
+    // candidate + winner-restart = N+1).
+    let frame = compute_frame_residuals(family, method, width, height, pixels)?;
+    encode_with_precomputed(family, method, width, height, &frame, mode)
+}
 
-    // Spec/02 §2 + spec/05 (planned): when biHeight > 288 the codec
-    // splits the source into two fields (even rows = top; odd rows =
-    // bottom) and predicts each independently. The two fields share
-    // the same per-stream Huffman tables (the BIH carries one
-    // extradata blob), but each field gets its own uncompressed seed +
-    // bit-packed body. The on-wire frame is `top_seed | top_bits |
-    // bot_seed | bot_bits`.
-    let interlaced = is_interlaced_height(height);
-
-    // Compute the per-channel residual stream first (independent of
-    // table choice) so we can drive both the histogram computation
-    // (CustomV2) and the bit-emit pass. For interlaced streams we
-    // run the **walking-stride** path (round-5): we never materialise
-    // a contiguous top-field or bottom-field copy of `pixels` — we
-    // reuse a single field-sized scratch buffer for the predictor
-    // working set and append both fields' residual bodies into ONE
-    // combined `Vec<u8>` (the bot half starts at `top_body_len`).
-    // This roughly halves the encoder's working-set memory at 1080p
-    // / 4K versus the round-4 `split_fields` two-buffer approach.
-    let progressive_residuals = if interlaced {
-        None
-    } else {
-        Some(compute_residuals(family, method, width, height, pixels)?)
-    };
-    let (top_seed, bot_seed_opt, top_body_len, combined_body): (
-        [u8; 4],
-        Option<[u8; 4]>,
-        usize,
-        Vec<u8>,
-    ) = if interlaced {
-        let row_bytes = match family {
-            PixelFamily::Yuy2 => width as usize * 2,
-            PixelFamily::Rgb24 => width as usize * 3,
-            PixelFamily::Rgb32 => width as usize * 4,
-        };
-        let h = height as usize;
-        let top_h = h.div_ceil(2) as u32;
-        let bot_h = (h / 2) as u32;
-        // One field-sized scratch reused across top + bot — replaces
-        // the two `split_fields` allocations of round 4.
-        let mut scratch = vec![0u8; (top_h as usize) * row_bytes];
-        // One combined-body Vec sized for the worst-case total
-        // residual stream: avoids the extra `[top.body || bot.body]`
-        // concat allocation that round 4 paid for histogram + verify
-        // passes.
-        let body_capacity = match family {
-            PixelFamily::Yuy2 => row_bytes * h - if h > 0 { 4 } else { 0 },
-            PixelFamily::Rgb24 => {
-                let n_top = (width as usize) * (top_h as usize);
-                let n_bot = (width as usize) * (bot_h as usize);
-                let mut c = 0usize;
-                if n_top > 0 {
-                    c += (n_top - 1) * 3;
-                }
-                if n_bot > 0 {
-                    c += (n_bot - 1) * 3;
-                }
-                c
-            }
-            PixelFamily::Rgb32 => {
-                let n_top = (width as usize) * (top_h as usize);
-                let n_bot = (width as usize) * (bot_h as usize);
-                let mut c = 0usize;
-                if n_top > 0 {
-                    c += (n_top - 1) * 4;
-                }
-                if n_bot > 0 {
-                    c += (n_bot - 1) * 4;
-                }
-                c
-            }
-        };
-        let mut combined: Vec<u8> = Vec::with_capacity(body_capacity);
-        // Top field: rows 0, 2, 4, … of the source raster.
-        compact_field_rows(pixels, &mut scratch, row_bytes, h, 0);
-        let top_res = compute_residuals(
-            family,
-            method,
-            width,
-            top_h,
-            &scratch[..(top_h as usize) * row_bytes],
-        )?;
-        let top_seed = top_res.seed;
-        let top_len = top_res.body.len();
-        combined.extend_from_slice(&top_res.body);
-        drop(top_res);
-        let bot_seed_opt = if bot_h > 0 {
-            // Bot field: rows 1, 3, 5, … of the source raster.
-            // Reuse `scratch` (resize down if bot has fewer rows).
-            scratch.resize((bot_h as usize) * row_bytes, 0);
-            compact_field_rows(pixels, &mut scratch, row_bytes, h, 1);
-            let bot_res = compute_residuals(
-                family,
-                method,
-                width,
-                bot_h,
-                &scratch[..(bot_h as usize) * row_bytes],
-            )?;
-            let bs = bot_res.seed;
-            combined.extend_from_slice(&bot_res.body);
-            Some(bs)
-        } else {
-            None
-        };
-        (top_seed, bot_seed_opt, top_len, combined)
-    } else {
-        ([0; 4], None, 0, Vec::new())
-    };
-
-    // For histogram (CustomV2) and table verification (V1xCompat)
-    // we treat all residual bodies as one combined symbol stream.
-    // Round 5: pass `combined_body` (interlaced) or
-    // `progressive_residuals.body` (progressive) as a slice directly
-    // to the slice-based helpers — no per-call `Residuals` clone.
-    // Per-field slot-phase alignment is preserved on the interlaced
-    // side: top.body_len is a multiple of the per-family slot cycle
-    // (YUY2: 4; RGB24: 3; RGB32: 4) for any legal width ×
-    // field-height, so the bot half starts at the same
-    // `i % cycle == 0` phase.
-    let stats_body: &[u8] = if interlaced {
-        &combined_body
-    } else {
-        &progressive_residuals.as_ref().unwrap().body
-    };
+/// Emit one wire frame from a pre-computed residual stream.
+///
+/// Internal round-7 helper that lets the auto-selector reuse the
+/// residual body it already computed for scoring instead of throwing
+/// it away and rebuilding from `pixels` inside
+/// [`encode_frame_with_mode`]. Direct callers should keep using
+/// [`encode_frame_with_mode`] / [`encode_frame_auto`].
+fn encode_with_precomputed(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    frame: &PrecomputedFrame,
+    mode: ExtradataMode,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let stats_body: &[u8] = &frame.combined_body;
 
     let (extradata_tables, slot1, slot2, slot3, has_extradata): (
         Vec<u8>,
@@ -255,7 +154,7 @@ pub fn encode_frame_with_mode(
         has_extradata,
     );
 
-    let frame_bytes = if interlaced {
+    let frame_bytes = if frame.interlaced {
         let mut out = Vec::new();
         // Top field: pass the seed + the [..top_body_len] slice of
         // the combined body directly to `emit_bitstream_parts`. No
@@ -263,19 +162,19 @@ pub fn encode_frame_with_mode(
         let mut top_bytes = emit_bitstream_parts(
             family,
             method,
-            &top_seed,
-            &combined_body[..top_body_len],
+            &frame.top_seed,
+            &frame.combined_body[..frame.top_body_len],
             &slot1,
             &slot2,
             &slot3,
         )?;
         out.append(&mut top_bytes);
-        if let Some(bot_seed) = bot_seed_opt {
+        if let Some(bot_seed) = frame.bot_seed_opt {
             let mut bot_bytes = emit_bitstream_parts(
                 family,
                 method,
                 &bot_seed,
-                &combined_body[top_body_len..],
+                &frame.combined_body[frame.top_body_len..],
                 &slot1,
                 &slot2,
                 &slot3,
@@ -284,19 +183,150 @@ pub fn encode_frame_with_mode(
         }
         out
     } else {
-        emit_bitstream(&EmitParams {
+        emit_bitstream_parts(
             family,
             method,
-            res: progressive_residuals.as_ref().unwrap(),
-            slot1: &slot1,
-            slot2: &slot2,
-            slot3: &slot3,
-        })?
+            &frame.top_seed,
+            &frame.combined_body,
+            &slot1,
+            &slot2,
+            &slot3,
+        )?
     };
 
-    // width/height already encoded into the BIH; no further use here.
     let _ = (width, height);
     Ok((strf, frame_bytes))
+}
+
+/// Round-7 residual carrier: holds the per-field seed(s) + a single
+/// combined body Vec covering one progressive frame or both interlaced
+/// fields concatenated. Replaces the previous round's mix of
+/// `Option<Residuals>` (progressive) + `(top_seed, bot_seed_opt,
+/// top_body_len, combined_body)` (interlaced) so the same struct can
+/// be reused across the auto-selector's candidate-scoring + final
+/// emit passes.
+#[derive(Debug, Clone)]
+struct PrecomputedFrame {
+    interlaced: bool,
+    top_seed: [u8; 4],
+    /// `None` for progressive frames OR for interlaced frames where the
+    /// bottom field is empty (height == 1, etc.).
+    bot_seed_opt: Option<[u8; 4]>,
+    /// Length of the top field's body within `combined_body`. Equals
+    /// `combined_body.len()` for progressive frames.
+    top_body_len: usize,
+    /// Combined body bytes. Progressive: a single field's body.
+    /// Interlaced: top.body || bot.body (the bot half resumes the
+    /// per-family slot phase because top.body_len is always a multiple
+    /// of the slot cycle — see round-5 notes in this module).
+    combined_body: Vec<u8>,
+}
+
+/// Compute the per-frame residual stream once. Shared by
+/// [`encode_frame_with_mode`], [`encode_frame_auto`] (round-7), and
+/// [`bit_cost_for_method`].
+///
+/// Spec/02 §2 + spec/05 (planned): when biHeight > 288 the codec
+/// splits the source into two fields (even rows = top; odd rows =
+/// bottom) and predicts each independently. The walking-stride path
+/// from round 5 is preserved: a single field-sized scratch buffer is
+/// reused across top + bot field, and both fields' residual bodies
+/// land in ONE combined `Vec<u8>` (the bot half starts at
+/// `top_body_len`).
+fn compute_frame_residuals(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<PrecomputedFrame> {
+    let interlaced = is_interlaced_height(height);
+    if !interlaced {
+        let r = compute_residuals(family, method, width, height, pixels)?;
+        let top_body_len = r.body.len();
+        return Ok(PrecomputedFrame {
+            interlaced: false,
+            top_seed: r.seed,
+            bot_seed_opt: None,
+            top_body_len,
+            combined_body: r.body,
+        });
+    }
+    let row_bytes = match family {
+        PixelFamily::Yuy2 => width as usize * 2,
+        PixelFamily::Rgb24 => width as usize * 3,
+        PixelFamily::Rgb32 => width as usize * 4,
+    };
+    let h = height as usize;
+    let top_h = h.div_ceil(2) as u32;
+    let bot_h = (h / 2) as u32;
+    // One field-sized scratch reused across top + bot (round-5
+    // walking-stride invariant — preserves the ~1.5× memory
+    // reduction over round 4's split_fields approach).
+    let mut scratch = vec![0u8; (top_h as usize) * row_bytes];
+    let body_capacity = match family {
+        PixelFamily::Yuy2 => row_bytes * h - if h > 0 { 4 } else { 0 },
+        PixelFamily::Rgb24 => {
+            let n_top = (width as usize) * (top_h as usize);
+            let n_bot = (width as usize) * (bot_h as usize);
+            let mut c = 0usize;
+            if n_top > 0 {
+                c += (n_top - 1) * 3;
+            }
+            if n_bot > 0 {
+                c += (n_bot - 1) * 3;
+            }
+            c
+        }
+        PixelFamily::Rgb32 => {
+            let n_top = (width as usize) * (top_h as usize);
+            let n_bot = (width as usize) * (bot_h as usize);
+            let mut c = 0usize;
+            if n_top > 0 {
+                c += (n_top - 1) * 4;
+            }
+            if n_bot > 0 {
+                c += (n_bot - 1) * 4;
+            }
+            c
+        }
+    };
+    let mut combined: Vec<u8> = Vec::with_capacity(body_capacity);
+    compact_field_rows(pixels, &mut scratch, row_bytes, h, 0);
+    let top_res = compute_residuals(
+        family,
+        method,
+        width,
+        top_h,
+        &scratch[..(top_h as usize) * row_bytes],
+    )?;
+    let top_seed = top_res.seed;
+    let top_len = top_res.body.len();
+    combined.extend_from_slice(&top_res.body);
+    drop(top_res);
+    let bot_seed_opt = if bot_h > 0 {
+        scratch.resize((bot_h as usize) * row_bytes, 0);
+        compact_field_rows(pixels, &mut scratch, row_bytes, h, 1);
+        let bot_res = compute_residuals(
+            family,
+            method,
+            width,
+            bot_h,
+            &scratch[..(bot_h as usize) * row_bytes],
+        )?;
+        let bs = bot_res.seed;
+        combined.extend_from_slice(&bot_res.body);
+        Some(bs)
+    } else {
+        None
+    };
+    Ok(PrecomputedFrame {
+        interlaced: true,
+        top_seed,
+        bot_seed_opt,
+        top_body_len: top_len,
+        combined_body: combined,
+    })
 }
 
 /// Build a `BITMAPINFOHEADER` for the encoded stream. `with_extradata`
@@ -400,60 +430,12 @@ pub fn bit_cost_for_method(
     if !family.is_rgb() && !method.is_yuv_legal() {
         return Err(Error::invalid("bit_cost: method not legal for YUV"));
     }
-    let body = compute_combined_body(family, method, width, height, pixels)?;
-    let (h1, h2, h3) = histogramise(family, method, &body);
+    // Round-7: share `compute_frame_residuals` with the encoder path
+    // so a subsequent `encode_frame_auto` can reuse this residual
+    // computation rather than redoing it.
+    let frame = compute_frame_residuals(family, method, width, height, pixels)?;
+    let (h1, h2, h3) = histogramise(family, method, &frame.combined_body);
     Ok(bit_cost_from_histograms(&h1, &h2, &h3))
-}
-
-/// Compute the residual body the encoder would write for this
-/// `(family, method)` pair. For interlaced heights, this is the
-/// concatenation `top.body || bot.body` — exactly what the
-/// histogramiser sees in the [`encode_frame_with_mode`] path. For
-/// progressive heights it's the single field's body.
-fn compute_combined_body(
-    family: PixelFamily,
-    method: Method,
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-) -> Result<Vec<u8>> {
-    let interlaced = is_interlaced_height(height);
-    if !interlaced {
-        let r = compute_residuals(family, method, width, height, pixels)?;
-        return Ok(r.body);
-    }
-    let row_bytes = match family {
-        PixelFamily::Yuy2 => width as usize * 2,
-        PixelFamily::Rgb24 => width as usize * 3,
-        PixelFamily::Rgb32 => width as usize * 4,
-    };
-    let h = height as usize;
-    let top_h = h.div_ceil(2) as u32;
-    let bot_h = (h / 2) as u32;
-    let mut scratch = vec![0u8; (top_h as usize) * row_bytes];
-    let mut combined: Vec<u8> = Vec::new();
-    compact_field_rows(pixels, &mut scratch, row_bytes, h, 0);
-    let top_res = compute_residuals(
-        family,
-        method,
-        width,
-        top_h,
-        &scratch[..(top_h as usize) * row_bytes],
-    )?;
-    combined.extend_from_slice(&top_res.body);
-    if bot_h > 0 {
-        scratch.resize((bot_h as usize) * row_bytes, 0);
-        compact_field_rows(pixels, &mut scratch, row_bytes, h, 1);
-        let bot_res = compute_residuals(
-            family,
-            method,
-            width,
-            bot_h,
-            &scratch[..(bot_h as usize) * row_bytes],
-        )?;
-        combined.extend_from_slice(&bot_res.body);
-    }
-    Ok(combined)
 }
 
 /// Sum `Σ length[symbol] × count[symbol]` over each slot's
@@ -548,27 +530,29 @@ pub fn encode_frame_auto(
     if candidates.is_empty() {
         return Err(Error::invalid("encode_frame_auto: no legal methods"));
     }
-    // Score each candidate; keep the winner. Tie-break: first in
-    // `candidates` order (so output is deterministic).
-    let mut best: Option<(Method, u64)> = None;
+    // Round-7: compute residuals ONCE per candidate (was: once per
+    // candidate inside `bit_cost_for_method` PLUS once again inside
+    // `encode_frame_with_mode` for the winner = N+1 traversals).
+    // The pre-computed residuals carry forward into the final
+    // `encode_with_precomputed` so the winner's body bytes don't get
+    // re-derived from `pixels`. Wire-identical to round 6.
+    //
+    // Tie-break: first in `candidates` order (so output is
+    // deterministic).
+    let mut best: Option<(Method, u64, PrecomputedFrame)> = None;
     for &m in &candidates {
-        // Skip methods that can't form a valid v1.x stream when the
-        // caller pinned V1xCompat — surface an error only if the
-        // chosen winner is then incompatible (we'd rather not silently
-        // pick a method that fails verify_body_in_table). The simplest
-        // correct behaviour is to score normally and let the final
-        // emit-pass error propagate; callers that pick V1xCompat are
-        // already accepting the v1.x compat constraint.
-        let cost = bit_cost_for_method(family, m, width, height, pixels)?;
+        let frame = compute_frame_residuals(family, m, width, height, pixels)?;
+        let (h1, h2, h3) = histogramise(family, m, &frame.combined_body);
+        let cost = bit_cost_from_histograms(&h1, &h2, &h3);
         match best {
-            None => best = Some((m, cost)),
-            Some((_, prev)) if cost < prev => best = Some((m, cost)),
+            None => best = Some((m, cost, frame)),
+            Some((_, prev_cost, _)) if cost < prev_cost => best = Some((m, cost, frame)),
             _ => {}
         }
     }
-    let (chosen, _) = best.expect("non-empty candidates → some winner");
-    let (strf, frame) = encode_frame_with_mode(family, chosen, width, height, pixels, mode)?;
-    Ok((strf, frame, chosen))
+    let (chosen, _, frame) = best.expect("non-empty candidates → some winner");
+    let (strf, bytes) = encode_with_precomputed(family, chosen, width, height, &frame, mode)?;
+    Ok((strf, bytes, chosen))
 }
 
 /// Convenience wrapper for tests: encode + parse the strf into a
@@ -977,7 +961,30 @@ fn histogramise(
 
 // ───────────────────────── v1.x compat helpers ─────────────────────────
 
+/// Cache for the per-family V1xCompat tables. The codebook is
+/// deterministic per family (spec/04 §4.1: YUY2 = (A, B, B); RGB =
+/// (A, A, A)), and each [`HuffTable`] carries a 128 KiB primary LUT
+/// — re-deriving + LUT-baking on every frame is pure waste. Round 7
+/// caches the three-tuple behind a `OnceLock` per family so the
+/// proprietary's V1xCompat path (commonly used by AviSynth + VirtualDub
+/// pipelines that need to interop with the original binary) costs the
+/// LUT-build once at process start rather than per encode call.
 fn build_v1x_tables(family: PixelFamily) -> Result<(HuffTable, HuffTable, HuffTable)> {
+    use std::sync::OnceLock;
+    static YUY2_TABLES: OnceLock<Result<(HuffTable, HuffTable, HuffTable)>> = OnceLock::new();
+    static RGB_TABLES: OnceLock<Result<(HuffTable, HuffTable, HuffTable)>> = OnceLock::new();
+    let cell = match family {
+        PixelFamily::Yuy2 => &YUY2_TABLES,
+        PixelFamily::Rgb24 | PixelFamily::Rgb32 => &RGB_TABLES,
+    };
+    let cached = cell.get_or_init(|| build_v1x_tables_uncached(family));
+    match cached {
+        Ok((s1, s2, s3)) => Ok((s1.clone(), s2.clone(), s3.clone())),
+        Err(e) => Err(Error::invalid(format!("v1.x cache build failed: {e}"))),
+    }
+}
+
+fn build_v1x_tables_uncached(family: PixelFamily) -> Result<(HuffTable, HuffTable, HuffTable)> {
     let mut cur: &[u8] = v1x_lengths_set_a();
     let lens_a = rle_decode_one_channel(&mut cur)?;
     let mut cur: &[u8] = v1x_lengths_set_b();
@@ -1060,32 +1067,16 @@ fn verify_body_in_table(
 
 // ───────────────────────── bit-emit pass ─────────────────────────
 
-struct EmitParams<'a> {
-    family: PixelFamily,
-    method: Method,
-    res: &'a Residuals,
-    slot1: &'a HuffTable,
-    slot2: &'a HuffTable,
-    slot3: &'a HuffTable,
-}
-
-fn emit_bitstream(p: &EmitParams) -> Result<Vec<u8>> {
-    emit_bitstream_parts(
-        p.family,
-        p.method,
-        &p.res.seed,
-        &p.res.body,
-        p.slot1,
-        p.slot2,
-        p.slot3,
-    )
-}
-
 /// Round-5 walking-stride entry: emit one field's seed + body
 /// without copying body bytes into a per-field `Residuals`. The
 /// interlaced encoder calls this twice on the combined-body Vec
 /// (once with body=[..top_body_len], once with body=[top_body_len..])
 /// to avoid the round-4 per-field body allocations at emit time.
+///
+/// Round-7 removed the `emit_bitstream` / `EmitParams` wrapper that
+/// previously fronted this routine — all callers now compute the
+/// seed/body parts via [`PrecomputedFrame`] and hand them through
+/// directly.
 #[allow(clippy::too_many_arguments)]
 fn emit_bitstream_parts(
     family: PixelFamily,
