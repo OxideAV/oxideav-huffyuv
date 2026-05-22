@@ -150,6 +150,81 @@ pub fn inverse_gradient_post(out: &mut [u8], row_bytes: usize, height: usize) {
     }
 }
 
+/// Forward gradient pre-pass: produce `intermediate[row N] = pixels[row N]
+/// - pixels[row N-1]` (mod 256) byte-by-byte, with row 0 copied verbatim.
+/// Encoder analogue of [`inverse_gradient_post`] (spec/03 §2.2 / §2.2.2 —
+/// "two-pass identity"). The encoder's published binary documents an
+/// identical 8-byte-wide MMX SIMD `psubb`-style per-row subtract
+/// (spec/03 §2.2.2 `@0x10001f10..@0x10001f9e`, the per-row
+/// gradient-residual phase that follows the LEFT-predict-row-0
+/// phase at `@0x10001eab..@0x10001eeb`).
+///
+/// Round 95: chunked u64 byte-modular subtract (SWAR — 8 bytes per
+/// instruction). The SWAR identity for byte-wise wrapping subtract is
+/// `a -ₘ b = (a | MASK_HI).wrapping_sub(b & MASK_LO) ^ ((a ^ !b) &
+/// MASK_HI)` where MASK_LO = `0x7F7F_…` and MASK_HI = `0x8080_…`.
+/// Walking through:
+///   - `(a | MASK_HI)` lifts each byte's bit-7 to 1 so the per-byte
+///     subtract `(a | 0x80) - (b & 0x7F)` never borrows across byte
+///     boundaries (the lifted bit-7 absorbs any per-byte borrow).
+///   - Each byte's high bit (bit 7) of the post-subtract result is
+///     `1 ^ (a_hi ^ b_hi) ^ (~b_hi & 1)` (per-byte XOR algebra), which
+///     simplifies to `a_hi ^ b_hi` — the correct mod-2 difference.
+///     XORing back `(a ^ !b) & MASK_HI` fixes the lifted bit-7.
+///
+/// Result: byte-wise wrapping subtract with no inter-byte borrow.
+///
+/// LLVM autovectorises the inner u64 loop into SSE2 `psubb` on x86_64
+/// and NEON `vsubq_u8` on aarch64. Bit-identical to a per-byte
+/// `wrapping_sub` loop (regression-guarded by `round95_swar_subtract_*`
+/// tests covering aligned-8, unaligned-tail, modular-wrap, and
+/// height-1 no-op cases).
+pub fn forward_gradient_subtract(src: &[u8], dst: &mut [u8], row_bytes: usize, height: usize) {
+    assert_eq!(
+        src.len(),
+        row_bytes * height,
+        "buffer size != row_bytes * height"
+    );
+    assert_eq!(dst.len(), src.len(), "dst length != src length");
+    if height == 0 || row_bytes == 0 {
+        return;
+    }
+    // Row 0 copies verbatim (LEFT-predict-row-0 phase — spec/03 §2.2.1).
+    dst[..row_bytes].copy_from_slice(&src[..row_bytes]);
+    if height < 2 {
+        return;
+    }
+    const MASK_LO: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const MASK_HI: u64 = 0x8080_8080_8080_8080;
+
+    for row in 1..height {
+        let above = (row - 1) * row_bytes;
+        let curr = row * row_bytes;
+        let mut col = 0usize;
+        // Process u64-aligned chunks first.
+        while col + 8 <= row_bytes {
+            let mut a_buf = [0u8; 8];
+            a_buf.copy_from_slice(&src[curr + col..curr + col + 8]);
+            let a = u64::from_le_bytes(a_buf);
+            let mut b_buf = [0u8; 8];
+            b_buf.copy_from_slice(&src[above + col..above + col + 8]);
+            let b = u64::from_le_bytes(b_buf);
+            // SWAR mod-256 subtract: `(a | HI) - (b & LO)` has no
+            // inter-byte borrow because the lifted bit-7 absorbs each
+            // per-byte borrow; we then XOR back the bit-7 fix-up.
+            let diff = (a | MASK_HI).wrapping_sub(b & MASK_LO);
+            let res = diff ^ ((a ^ !b) & MASK_HI);
+            dst[curr + col..curr + col + 8].copy_from_slice(&res.to_le_bytes());
+            col += 8;
+        }
+        // Tail bytes (< 8).
+        while col < row_bytes {
+            dst[curr + col] = src[curr + col].wrapping_sub(src[above + col]);
+            col += 1;
+        }
+    }
+}
+
 /// Apply the MEDIAN inverse on top of the already-LEFT-applied raster
 /// for YUY2 streams (spec/03 §2.3 + §2.3.2 — first 8 wire bytes of
 /// row 1 stay LEFT, rest of row 1 + every later row use median).
@@ -350,6 +425,99 @@ mod tests {
         assert_eq!(&bot[6..12], &pixels[18..24]); // row 3
         let merged = interleave_fields(&top, &bot, 6, 4);
         assert_eq!(merged, pixels);
+    }
+
+    /// Reference per-byte forward gradient subtract — the spec/03
+    /// §2.2.2 "LEFT-predict-row-0 + per-row residual" identity in its
+    /// most-readable form.
+    fn naive_forward_gradient(src: &[u8], row_bytes: usize, height: usize) -> Vec<u8> {
+        let mut out = vec![0u8; src.len()];
+        if height == 0 || row_bytes == 0 {
+            return out;
+        }
+        out[..row_bytes].copy_from_slice(&src[..row_bytes]);
+        for row in 1..height {
+            for col in 0..row_bytes {
+                let idx = row * row_bytes + col;
+                let above = src[(row - 1) * row_bytes + col];
+                out[idx] = src[idx].wrapping_sub(above);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn round95_swar_subtract_equals_naive_aligned_8() {
+        // 8-byte-aligned row width: every chunk hits the u64 fast
+        // path, tail loop runs zero times.
+        let src: Vec<u8> = (0..(8 * 5)).map(|x| ((x * 31) ^ 0x5A) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        forward_gradient_subtract(&src, &mut dst, 8, 5);
+        let expected = naive_forward_gradient(&src, 8, 5);
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn round95_swar_subtract_equals_naive_unaligned_tail() {
+        // Width 13 → one u64 chunk + 5-byte tail. Exercises both code
+        // paths in the inner loop.
+        let row_bytes = 13;
+        let height = 7;
+        let src: Vec<u8> = (0..(row_bytes * height))
+            .map(|x| ((x * 17 + 3) ^ 0xA5) as u8)
+            .collect();
+        let mut dst = vec![0u8; src.len()];
+        forward_gradient_subtract(&src, &mut dst, row_bytes, height);
+        let expected = naive_forward_gradient(&src, row_bytes, height);
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn round95_swar_subtract_handles_modular_wrap() {
+        // Synthesise pairs where every byte triggers wrap-around: row 0
+        // is 0x00..0x07, row 1 is 0x80..0x87 (so row 1 - row 0 stays
+        // 0x80..0x87 = no wrap, all bit-7 set), row 2 is 0x00..0x07
+        // (so row 2 - row 1 wraps: 0x00.wrapping_sub(0x80) = 0x80
+        // for every byte).
+        let mut src = vec![0u8; 24];
+        for col in 0..8 {
+            src[col] = col as u8;
+            src[8 + col] = 0x80 | col as u8;
+            src[16 + col] = col as u8;
+        }
+        let mut dst = vec![0u8; 24];
+        forward_gradient_subtract(&src, &mut dst, 8, 3);
+        let expected = naive_forward_gradient(&src, 8, 3);
+        assert_eq!(dst, expected);
+        // Row 2 every byte should be 0x80 (wrap point).
+        for col in 0..8 {
+            assert_eq!(dst[16 + col], 0x80);
+        }
+    }
+
+    #[test]
+    fn round95_swar_subtract_height_1_no_op() {
+        let src: Vec<u8> = (0..8).map(|x| x as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        forward_gradient_subtract(&src, &mut dst, 8, 1);
+        // Row 0 copies verbatim, no subtraction.
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn round95_swar_subtract_roundtrips_with_inverse() {
+        // forward_gradient_subtract followed by inverse_gradient_post
+        // is the identity on the post-row-0 region, modulo the LEFT
+        // pass that the encoder's full pipeline runs before/after. For
+        // this test we use the simplest variant: the gradient post-pass
+        // alone is its own bijection — `a -> a - above; then a + above`.
+        let src: Vec<u8> = (0..(16 * 4)).map(|x| ((x * 13) ^ 0xC3) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        forward_gradient_subtract(&src, &mut dst, 16, 4);
+        // Now invert: `dst + dst[above] = src` (after iterating bottom-up).
+        let mut roundtrip = dst.clone();
+        inverse_gradient_post(&mut roundtrip, 16, 4);
+        assert_eq!(roundtrip, src);
     }
 
     #[test]

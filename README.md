@@ -5,13 +5,15 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 91 — decoder slow-path overflow flattening + SWAR gradient
-post-pass.** Rounds 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4
-(interlace + lockstep), 5 (walking-stride encoder memory
-optimisation), 6 (predictor RDO + single-symbol fix),
-7 (auto-selector residual sharing + V1xCompat OnceLock cache),
-and 91 (flat overflow_entries Vec + chunked-u64 gradient inverse)
-all ship from the strict-isolation
+**Round 95 — encoder forward gradient SWAR + intermediate
+allocation elimination.** Rounds 1 (decoder), 2 (encoder), 3
+(decoder fast-LUT), 4 (interlace + lockstep), 5 (walking-stride
+encoder memory optimisation), 6 (predictor RDO + single-symbol
+fix), 7 (auto-selector residual sharing + V1xCompat OnceLock
+cache), 91 (flat overflow_entries Vec + SWAR gradient inverse),
+and 95 (SWAR gradient forward + drop redundant
+`pixels.to_vec()` / `working.clone()` allocations) all ship from
+the strict-isolation
 clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
 The previous (pre-orphan) implementation was retired alongside the
@@ -214,6 +216,43 @@ test-only `[dev-dependencies] oxideav-avi`.
   overflow-entries shape, the SWAR equivalence, and end-to-end
   YUY2/RGB24/RGB32 gradient round-trips at 320×16 to exercise
   the new u64 path on realistic row widths).
+
+## What works (Round 95)
+
+- **`predict::forward_gradient_subtract`** — encoder analogue of
+  round 91's `inverse_gradient_post`. Produces the
+  LEFT-predict-row-0 + per-row pixel-minus-pixel-above layout
+  documented at spec/03 §2.2.2 `@0x10001eab..@0x10001f9e` via a
+  chunked u64 SWAR `psubb`-style subtract
+  (`(a | 0x80…).wrapping_sub(b & 0x7F…) ^ ((a ^ !b) & 0x80…)`)
+  — byte-wise wrapping subtract with no inter-byte borrow, no
+  `unsafe`, no vendor intrinsics. LLVM autovectorises the inner
+  u64 loop into SSE2 `psubb` on x86_64 and NEON `vsubq_u8` on
+  aarch64.
+- **Drop the `intermediate` and `working` clones** on
+  non-gradient / non-decorrelating encoder paths. Round 6's
+  `yuy2_residuals` / `rgb24_residuals` / `rgb32_residuals` each
+  allocated a `row_bytes × height` `intermediate: Vec<u8>` per
+  frame — even when the predictor was Left / Median / PredictOld
+  (= a pure `pixels.to_vec()` clone of the input) — plus an
+  extra `working.clone()` on RGB methods that didn't need
+  decorrelation. Round 95 borrows `pixels` / `working` directly
+  through `Option<Vec<u8>>` + `as_deref().unwrap_or(...)` and
+  only allocates the intermediate when the gradient pre-pass
+  needs one. Saves up to 2 × row_bytes × h bytes per frame on
+  YUY2 Left / Median / PredictOld and 1 × row_bytes × h bytes on
+  RGB Left / LeftDecorr / GradientDecorr.
+- **Measured (release, M1 host, 500 iters)**:
+  YUY2 320×240 Median 1.10 ms/frame → 0.64 ms/frame
+  (≈ **1.7× speedup**); YUY2 1280×720 Left 7.65 ms/frame →
+  5.09 ms/frame (≈ **1.5× speedup**); RGB24 320×240 Left
+  1.00 ms/frame → 0.85 ms/frame (≈ 15%); RGB24 320×240
+  LeftDecorr 1.00 ms/frame → 0.86 ms/frame (≈ 13%); YUY2
+  320×240 gradient 0.52 ms/frame → 0.46 ms/frame (≈ 10%).
+- Wire-identical to round 91; lib test count: 110 → 115 (+5
+  `round95_swar_subtract_*` equivalence tests covering
+  aligned-8, unaligned-tail, modular-wrap, height-1 no-op, and
+  forward-then-inverse round-trip).
 
 ## Out of scope (deferred)
 

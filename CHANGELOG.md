@@ -8,6 +8,55 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-95: encoder forward gradient pre-pass + intermediate
+  allocation elimination.
+  - `predict::forward_gradient_subtract`: encoder analogue of
+    round-91's `inverse_gradient_post`, implementing the
+    LEFT-predict-row-0 + per-row gradient-residual subtract layout
+    documented at spec/03 §2.2.2 `@0x10001eab..@0x10001f9e` (the
+    encoder evidence for the two-phase forward gradient). Same
+    SWAR identity as round 91's add, generalised to subtract:
+    `(a | MASK_HI).wrapping_sub(b & MASK_LO) ^ ((a ^ !b) & MASK_HI)`
+    — byte-wise wrapping subtract with no inter-byte borrow, no
+    `unsafe`, no vendor intrinsics. LLVM autovectorises into SSE2
+    `psubb` / NEON `vsubq_u8`. Bit-identical to a per-byte
+    `wrapping_sub` loop — regression-guarded by 5 new tests
+    (aligned-8 stride, unaligned-tail row width, modular-wrap pump,
+    height-1 no-op, and forward-then-inverse round-trip).
+  - Encoder allocation elimination: the previous
+    `yuy2_residuals` / `rgb24_residuals` / `rgb32_residuals`
+    paths allocated an `intermediate: Vec<u8>` of size
+    `row_bytes × h` per frame even when the predictor was Left /
+    Median / PredictOld (a `pixels.to_vec()` clone with no
+    transform applied), and an additional `working.clone()` for
+    RGB methods when neither decorrelation nor gradient was active.
+    Round 95 borrows `pixels` / `working` directly via
+    `Option<Vec<u8>>` + `as_deref().unwrap_or(...)` and only
+    allocates the intermediate when the gradient pre-pass needs
+    one. Saves up to **2 × row_bytes × h** bytes per frame on
+    Left / Median / PredictOld YUY2 paths and **1 × row_bytes × h**
+    bytes on Left / LeftDecorr / GradientDecorr RGB paths.
+  - **Measured (release, M1 host, 500 iters)**:
+    - YUY2 320×240 Median: 1.10 ms/frame → 0.64 ms/frame
+      (**≈ 1.7× speedup**) — biggest win because Median had two
+      back-to-back full-frame Vec clones (`pixels.to_vec()` for
+      the non-gradient path + post-LEFT median-overlay pass).
+    - YUY2 1280×720 Left: 7.65 ms/frame → 5.09 ms/frame
+      (**≈ 1.5× speedup**).
+    - RGB24 320×240 Left: 1.00 ms/frame → 0.85 ms/frame (≈ 15%).
+    - RGB24 320×240 LeftDecorr: 1.00 ms/frame → 0.86 ms/frame
+      (≈ 13%).
+    - YUY2 320×240 gradient: 0.52 ms/frame → 0.46 ms/frame
+      (≈ 10%) — gradient gets less benefit because the
+      gradient intermediate is still required; only the
+      pre-existing copy-to-intermediate is now consolidated
+      into the forward-subtract helper's single pass.
+  - Wire-identical to round 91 — regression-guarded by every
+    pre-existing round-trip + AVI-lockstep test (115 lib tests +
+    8 lockstep tests all green) plus the 5 new
+    `round95_swar_subtract_*` tests in `predict.rs`. Lib test
+    count: 110 → 115.
+
 - Round-91: decoder slow-path flat overflow-entries table + SWAR
   gradient post-pass.
   - `tables::HuffTable::overflow_entries`: a flat `Vec<OverflowEntry>`

@@ -21,7 +21,9 @@
 use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
 use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
-use crate::predict::{gradient_predictor, is_interlaced_height, median3};
+use crate::predict::{
+    forward_gradient_subtract, gradient_predictor, is_interlaced_height, median3,
+};
 use crate::tables::{
     classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
     rle_decode_three_channels, rle_encode_three_channels, v1x_codes_set_a, v1x_codes_set_b,
@@ -675,30 +677,27 @@ fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Res
     if w % 2 != 0 {
         return Err(Error::invalid("encoder: YUY2 width must be even"));
     }
-    // For Gradient: build intermediate = pixels - pixels_above (row ≥ 1).
-    let intermediate: Vec<u8> = if method.predictor() == Predictor::Gradient {
+    // Round 95: avoid the `pixels.to_vec()` clone when no gradient
+    // pre-pass is needed by reading directly from `pixels` for the
+    // per-channel-stride subtract. For Gradient we still need the
+    // intermediate Vec (the per-channel subtract chain reads earlier
+    // intermediate bytes; an in-place rewrite would corrupt later
+    // reads). The intermediate is now built by `forward_gradient_subtract`
+    // (spec/03 §2.2.2 `@0x10001eab..@0x10001f9e`).
+    let intermediate: Option<Vec<u8>> = if method.predictor() == Predictor::Gradient {
         let mut iv = vec![0u8; row_bytes * h];
-        iv[..row_bytes].copy_from_slice(&pixels[..row_bytes]);
-        for row in 1..h {
-            for col in 0..row_bytes {
-                let idx = row * row_bytes + col;
-                let above = pixels[(row - 1) * row_bytes + col];
-                iv[idx] = pixels[idx].wrapping_sub(above);
-            }
-        }
-        iv
+        forward_gradient_subtract(pixels, &mut iv, row_bytes, h);
+        Some(iv)
     } else {
-        pixels.to_vec()
+        None
     };
+    let pred_input: &[u8] = intermediate.as_deref().unwrap_or(pixels);
     let mut residuals = vec![0u8; row_bytes * h];
-    if intermediate.len() >= 4 {
-        residuals[..4].copy_from_slice(&intermediate[..4]);
-    } else {
-        residuals.copy_from_slice(&intermediate);
-    }
-    for i in 4..intermediate.len() {
+    let copy_n = 4.min(pred_input.len());
+    residuals[..copy_n].copy_from_slice(&pred_input[..copy_n]);
+    for i in 4..pred_input.len() {
         let stride = if i & 1 == 0 { 2 } else { 4 };
-        residuals[i] = intermediate[i].wrapping_sub(intermediate[i - stride]);
+        residuals[i] = pred_input[i].wrapping_sub(pred_input[i - stride]);
     }
     if method.predictor() == Predictor::Median {
         // Replace LEFT residuals with MEDIAN residuals for row 1 byte
@@ -740,7 +739,12 @@ fn rgb24_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
         )));
     }
     let n_pixels = w * h;
-    let working: Vec<u8> = if method.decorrelate() {
+    // Round 95: skip the `pixels.to_vec()` clone when no decorrelation
+    // is in play — `working_or_pixels` borrows pixels directly. When
+    // decorrelation is active we still need `working_owned` (the
+    // decorrelation overwrites 2 of every 3 bytes — bit-modifying the
+    // caller's slice isn't allowed).
+    let working_owned: Option<Vec<u8>> = if method.decorrelate() {
         let mut v = vec![0u8; row_bytes * h];
         for px in 0..n_pixels {
             let off = px * 3;
@@ -751,30 +755,29 @@ fn rgb24_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
             v[off + 1] = g;
             v[off + 2] = r.wrapping_sub(g);
         }
-        v
+        Some(v)
     } else {
-        pixels.to_vec()
+        None
     };
-    let intermediate: Vec<u8> = if method.predictor() == Predictor::Gradient {
+    let working: &[u8] = working_owned.as_deref().unwrap_or(pixels);
+    // Round 95: when no gradient pre-pass is needed, `pred_input`
+    // borrows `working` directly — saves a `working.clone()` (=
+    // `row_bytes * h` bytes per frame). spec/03 §2.2.2 forward
+    // gradient pre-pass otherwise.
+    let intermediate: Option<Vec<u8>> = if method.predictor() == Predictor::Gradient {
         let mut iv = vec![0u8; row_bytes * h];
-        iv[..row_bytes].copy_from_slice(&working[..row_bytes]);
-        for row in 1..h {
-            for col in 0..row_bytes {
-                let idx = row * row_bytes + col;
-                let above = working[(row - 1) * row_bytes + col];
-                iv[idx] = working[idx].wrapping_sub(above);
-            }
-        }
-        iv
+        forward_gradient_subtract(working, &mut iv, row_bytes, h);
+        Some(iv)
     } else {
-        working.clone()
+        None
     };
+    let pred_input: &[u8] = intermediate.as_deref().unwrap_or(working);
     let mut residuals = vec![0u8; row_bytes * h];
     for ch in 0..3usize {
-        residuals[ch] = intermediate[ch];
+        residuals[ch] = pred_input[ch];
         let mut idx = ch + 3;
-        while idx < intermediate.len() {
-            residuals[idx] = intermediate[idx].wrapping_sub(intermediate[idx - 3]);
+        while idx < pred_input.len() {
+            residuals[idx] = pred_input[idx].wrapping_sub(pred_input[idx - 3]);
             idx += 3;
         }
     }
@@ -817,7 +820,9 @@ fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
         )));
     }
     let n_pixels = w * h;
-    let working: Vec<u8> = if method.decorrelate() {
+    // Round 95: skip the `pixels.to_vec()` clone when no decorrelation
+    // is in play.
+    let working_owned: Option<Vec<u8>> = if method.decorrelate() {
         let mut v = vec![0u8; row_bytes * h];
         for px in 0..n_pixels {
             let off = px * 4;
@@ -830,30 +835,27 @@ fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
             v[off + 2] = r.wrapping_sub(g);
             v[off + 3] = a; // alpha NOT decorrelated.
         }
-        v
+        Some(v)
     } else {
-        pixels.to_vec()
+        None
     };
-    let intermediate: Vec<u8> = if method.predictor() == Predictor::Gradient {
+    let working: &[u8] = working_owned.as_deref().unwrap_or(pixels);
+    // Round 95: skip the `working.clone()` when no gradient pre-pass is
+    // needed. spec/03 §2.2.2 forward gradient pre-pass otherwise.
+    let intermediate: Option<Vec<u8>> = if method.predictor() == Predictor::Gradient {
         let mut iv = vec![0u8; row_bytes * h];
-        iv[..row_bytes].copy_from_slice(&working[..row_bytes]);
-        for row in 1..h {
-            for col in 0..row_bytes {
-                let idx = row * row_bytes + col;
-                let above = working[(row - 1) * row_bytes + col];
-                iv[idx] = working[idx].wrapping_sub(above);
-            }
-        }
-        iv
+        forward_gradient_subtract(working, &mut iv, row_bytes, h);
+        Some(iv)
     } else {
-        working.clone()
+        None
     };
+    let pred_input: &[u8] = intermediate.as_deref().unwrap_or(working);
     let mut residuals = vec![0u8; row_bytes * h];
     for ch in 0..4usize {
-        residuals[ch] = intermediate[ch];
+        residuals[ch] = pred_input[ch];
         let mut idx = ch + 4;
-        while idx < intermediate.len() {
-            residuals[idx] = intermediate[idx].wrapping_sub(intermediate[idx - 4]);
+        while idx < pred_input.len() {
+            residuals[idx] = pred_input[idx].wrapping_sub(pred_input[idx - 4]);
             idx += 4;
         }
     }
