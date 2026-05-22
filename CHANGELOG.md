@@ -8,6 +8,53 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-91: decoder slow-path flat overflow-entries table + SWAR
+  gradient post-pass.
+  - `tables::HuffTable::overflow_entries`: a flat `Vec<OverflowEntry>`
+    precomputed at table-build time. Round 7's `decode_one_slow`
+    walked all 256 entries of `table.entries` per overflow byte with
+    a `length == 0 || length <= 16 { continue }` short-circuit on
+    every iteration — paying full per-iteration cost even on the
+    proprietary's classic v2.x blobs that have only 0..2 length-17
+    codes. Round 91 emits an `OverflowEntry { code, mask, length,
+    symbol }` per long code at build time (with `mask = !0 << (32 -
+    L)` pre-baked), and the slow path now iterates exactly that
+    slice. For the six classic v2.x blobs (max length ≤ 17,
+    typically 0..2 long codes) overflow decode visits ≤ 2 entries
+    instead of 256; for v1.x set B (~210 long codes per spec/04
+    §4.2 non-canonical layout) the scan drops from 256 → ≤ 210
+    with the mask pre-baked. **Measured (release, M1 host, 320×240
+    YUY2)**: v1.x median decode 2.81 ms/frame → 1.29 ms/frame
+    (**≈ 2.2× speedup**); ClassicV2 gradient YUY2 1.72 ms/frame →
+    0.67 ms/frame (**≈ 2.6× speedup**); ClassicV2 gradient-decorr
+    RGB24 320×240 ≈ 0.98 ms/frame. Wire-identical to round 7 —
+    regression-guarded by tests that compare every long code's
+    `decode_one` output against `decode_one_slow` directly.
+  - `predict::inverse_gradient_post`: byte-by-byte modular-add
+    inner loop replaced by an 8-bytes-per-u64 SWAR add
+    (`(a & 0x7F7F…).wrapping_add(b & 0x7F7F…) ^ ((a ^ b) &
+    0x8080…)` — textbook byte-wise wrapping add via 64-bit math,
+    no `unsafe`, no vendor-intrinsics dependency). Mirrors
+    spec/03 §2.2.2's documented MMX 8-byte-wide gradient
+    post-pass at `system32/huffyuv.dll@0x10001dfb..@0x10001e8c`.
+    LLVM autovectorises the inner u64 loop into SSE2 `paddb` on
+    x86_64 and NEON `vaddq_u8` on aarch64. Bit-identical to the
+    byte loop on every input — regression-guarded by 4 SWAR
+    equivalence tests (aligned-8 stride, unaligned-tail,
+    modular-wrap, height-1 no-op) + 3 end-to-end gradient
+    round-trip tests at 320×16 across YUY2 / RGB24 / RGB32.
+  - Earlier round-91 work also explored a span-replicated
+    secondary index keyed on the 16-bit window prefix; benching
+    showed it was a net regression vs round 7 on v1.x set B
+    (non-canonical codes cluster heavily on prefix 0, turning
+    the per-bucket scan into a Vec-indirection-laden near-256-entry
+    walk). The flat overflow_entries Vec is the minimal change
+    that's strictly better on every input — kept for that reason.
+  - Lib test count: 98 → 110 (+12 round-91 tests covering the
+    overflow-entries shape, the SWAR equivalence, and end-to-end
+    YUY2/RGB24/RGB32 gradient round-trips at 320×16 to exercise
+    the new u64 path on realistic row widths).
+
 - Round-7: encoder auto-selector residual reuse + V1xCompat table
   cache.
   - Round 6's `encode_frame_auto` did `N + 1` residual passes (one

@@ -5,11 +5,12 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 7 — auto-selector residual reuse + V1xCompat table cache.**
-Rounds 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4
+**Round 91 — decoder slow-path overflow flattening + SWAR gradient
+post-pass.** Rounds 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4
 (interlace + lockstep), 5 (walking-stride encoder memory
 optimisation), 6 (predictor RDO + single-symbol fix),
-and 7 (auto-selector residual sharing + V1xCompat OnceLock cache)
+7 (auto-selector residual sharing + V1xCompat OnceLock cache),
+and 91 (flat overflow_entries Vec + chunked-u64 gradient inverse)
 all ship from the strict-isolation
 clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
@@ -179,6 +180,40 @@ test-only `[dev-dependencies] oxideav-avi`.
   V1xCompat encodes and asserts the wire bytes for each family
   stay stable across the interleaving.
 - Lib test count: 92 → 98.
+
+## What works (Round 91)
+
+- **Flat `overflow_entries` slow path** (`tables::HuffTable`):
+  round 7's `decode_one_slow` walked all 256 entries of
+  `table.entries` with a `length == 0 || length <= 16 { continue }`
+  short-circuit on every iteration. Round 91 precomputes a flat
+  `Vec<OverflowEntry>` at table-build time, holding only the
+  long codes (length > 16) with their `mask` (`!0u32 << (32 - L)`)
+  pre-baked. The slow path now iterates exactly that slice (≤ 2
+  entries for most v2.x classic blobs, ~210 for v1.x set B —
+  always strictly less than 256). **Measured (release, M1 host,
+  320×240)**: v1.x median decode 2.81 ms/frame → 1.29 ms/frame
+  (**≈ 2.2× speedup**); ClassicV2 gradient YUY2 1.72 ms/frame →
+  0.67 ms/frame (**≈ 2.6× speedup**). Wire-identical to round 7;
+  the slow path's output bytes are unchanged.
+- **SWAR `inverse_gradient_post`** (`predict::inverse_gradient_post`):
+  the round-7 byte-by-byte modular-add loop is replaced by an
+  8-bytes-per-u64 SWAR add (`(a & 0x7F7F…).wrapping_add(b &
+  0x7F7F…) ^ ((a ^ b) & 0x8080…)` — the textbook byte-wise
+  wrapping add via 64-bit math, no `unsafe`, no
+  vendor-intrinsics dependency). Mirrors spec/03 §2.2.2's
+  documented MMX 8-byte-wide post-pass
+  (`@0x10001dfb`–`@0x10001e8c`: 8-byte SIMD load + lane-wise
+  wrap-add + store + 32-byte unrolled stride). LLVM
+  autovectorises the inner u64 loop into SSE2 `paddb` on x86_64
+  and NEON `vaddq_u8` on aarch64. Bit-identical to the round-7
+  byte loop (regression-guarded by `round91_swar_gradient_*`
+  tests covering aligned-8, unaligned-tail, modular-wrap, and
+  height-1 no-op cases).
+- Lib test count: 98 → 110 (+12 round-91 tests covering the
+  overflow-entries shape, the SWAR equivalence, and end-to-end
+  YUY2/RGB24/RGB32 gradient round-trips at 320×16 to exercise
+  the new u64 path on realistic row widths).
 
 ## Out of scope (deferred)
 

@@ -1458,3 +1458,275 @@ fn round7_v1x_cache_returns_stable_wire_bytes() {
     .unwrap();
     assert_eq!(frame1, frame3);
 }
+
+// ───────── round-91: flat overflow-entries slow path + SWAR gradient ─────────
+//
+// Round 91 lands two pure-performance improvements that must be
+// bit-identical to round 7:
+//
+//   (a) `tables::HuffTable::overflow_entries` — a flat slice of
+//       only the codes with length > 16, with `mask` precomputed
+//       at build time. `decode_one_slow` walks this dense list
+//       (typically ≤ 6 entries for the six classic v2.x blobs;
+//       up to ~210 for v1.x set B) instead of the round-7
+//       256-entry scan over `table.entries` that paid a
+//       `length == 0 || length <= 16 { continue }` cost on
+//       every iteration.
+//   (b) `predict::inverse_gradient_post` — SWAR per-byte modular
+//       add walking 8 bytes per u64 step. Mirrors spec/03 §2.2.2's
+//       documented MMX 8-byte-wide post-pass.
+//
+// Earlier round-91 work also explored a span-replicated
+// secondary index keyed on the 16-bit window prefix; benching
+// showed that approach was a net regression vs round-7 on v1.x
+// set B (non-canonical codes cluster heavily on prefix 0,
+// turning the per-bucket scan into a Vec-indirection-laden
+// near-256-entry walk). The flat overflow_entries Vec is the
+// minimal change that's strictly better on every input.
+//
+// The tests below verify both paths against the round-7 baseline
+// behaviour: every long code in v1.x set B must decode through
+// the new slow path identically, and every (family, method)
+// gradient encode must round-trip pixel-exact through the SWAR
+// post-pass.
+
+#[test]
+fn round91_overflow_entries_decode_matches_round7_slow_path_v1x_set_b() {
+    use crate::tables::{
+        rle_decode_one_channel, v1x_codes_set_b, v1x_lengths_set_b, v1x_table_from_pair,
+    };
+    let mut cur: &[u8] = v1x_lengths_set_b();
+    let lens_b = rle_decode_one_channel(&mut cur).unwrap();
+    let codes_b = v1x_codes_set_b();
+    let mut codes_arr = [0u8; 256];
+    codes_arr.copy_from_slice(codes_b);
+    let table = v1x_table_from_pair(&lens_b, &codes_arr).unwrap();
+    // For every long code, the round-91 flat-overflow slow path
+    // (`decode_one_slow`) and the high-level `decode_one` (which
+    // dispatches via the primary LUT to the same slow path) must
+    // agree on (symbol, length).
+    let mut covered = 0;
+    for (sym, e) in table.entries.iter().enumerate() {
+        if e.length <= 16 || e.length == 0 {
+            continue;
+        }
+        let window = e.code;
+        let via_decode_one = crate::tables::decode_one(&table, window).unwrap();
+        let via_slow = crate::tables::decode_one_slow(&table, window).unwrap();
+        assert_eq!(
+            via_decode_one, via_slow,
+            "sym {sym} decode_one {via_decode_one:?} ≠ slow {via_slow:?}"
+        );
+        assert_eq!(via_decode_one.0 as usize, sym);
+        assert_eq!(via_decode_one.1, e.length);
+        covered += 1;
+    }
+    // v1.x set B is documented as having codes up to length 26
+    // (spec/03 §4.1 evidence row); at least a handful of overflow
+    // codes must have been covered for this test to be meaningful.
+    assert!(
+        covered >= 4,
+        "expected ≥ 4 overflow codes in v1.x set B; got {covered}"
+    );
+}
+
+#[test]
+fn round91_overflow_entries_match_count_of_long_codes() {
+    // Sanity: `build_overflow_entries` emits exactly one entry per
+    // code with length > 16. Round-91 dropped the span-replicated
+    // secondary-index design (a net regression vs round-7 at v1.x
+    // set B's ~210 long codes — the indirection cost beat the
+    // narrowed scan count). The flat overflow_entries Vec is now
+    // a pure short-circuit-elimination win: the slow loop walks
+    // ≤ 210 entries instead of 256, with `mask` precomputed once
+    // at build time.
+    use crate::tables::{
+        rle_decode_one_channel, v1x_codes_set_b, v1x_lengths_set_b, v1x_table_from_pair,
+    };
+    let mut cur: &[u8] = v1x_lengths_set_b();
+    let lens_b = rle_decode_one_channel(&mut cur).unwrap();
+    let codes_b = v1x_codes_set_b();
+    let mut codes_arr = [0u8; 256];
+    codes_arr.copy_from_slice(codes_b);
+    let table = v1x_table_from_pair(&lens_b, &codes_arr).unwrap();
+    let table_len = table.overflow_entries.len();
+    let expected: usize = table.entries.iter().filter(|e| e.length > 16).count();
+    assert_eq!(
+        table_len, expected,
+        "overflow_entries.len() {table_len} ≠ long-code count {expected}"
+    );
+}
+
+#[test]
+fn round91_overflow_entries_bounded_below_256() {
+    // The slow path now walks at most `overflow_entries.len()`
+    // entries — strictly less than the round-7 256-entry scan
+    // over `table.entries`. This invariant is what makes the
+    // round-91 slow path a pure speedup.
+    use crate::tables::{
+        rle_decode_one_channel, v1x_codes_set_b, v1x_lengths_set_b, v1x_table_from_pair,
+    };
+    let mut cur: &[u8] = v1x_lengths_set_b();
+    let lens_b = rle_decode_one_channel(&mut cur).unwrap();
+    let codes_b = v1x_codes_set_b();
+    let mut codes_arr = [0u8; 256];
+    codes_arr.copy_from_slice(codes_b);
+    let table = v1x_table_from_pair(&lens_b, &codes_arr).unwrap();
+    assert!(
+        table.overflow_entries.len() < 256,
+        "overflow_entries.len() {} ≥ 256 (would not beat round-7 baseline)",
+        table.overflow_entries.len()
+    );
+    assert!(
+        !table.overflow_entries.is_empty(),
+        "v1.x set B should have at least one long-code overflow entry"
+    );
+}
+
+#[test]
+fn round91_classic_v2_overflow_entries_only_long_codes() {
+    // Round-91 invariant: every entry in `overflow_entries` has
+    // `length > 16`. (No leakage from the ≤ 16-bit codes that the
+    // primary LUT serves directly.) The classic-v2 YUV-LEFT
+    // blob's slot tables top out at length 17 (spec/04 §3
+    // Extractor evidence), so this should hold for all three
+    // slots without any short-code contamination.
+    use crate::tables::{rle_decode_three_channels, HuffTable};
+    let blob = crate::tables::classic_blob_bytes(PixelFamily::Yuy2, Method::Left);
+    let lengths = rle_decode_three_channels(blob).unwrap();
+    for slot in lengths.iter() {
+        let table = HuffTable::build_from_lengths(slot).unwrap();
+        for e in table.overflow_entries.iter() {
+            assert!(
+                e.length > 16,
+                "overflow_entries contains length-{} entry (≤ 16 = primary LUT)",
+                e.length
+            );
+        }
+        let expected: usize = table.entries.iter().filter(|e| e.length > 16).count();
+        assert_eq!(table.overflow_entries.len(), expected);
+    }
+}
+
+#[test]
+fn round91_v1x_yuy2_median_8x4_uses_overflow_path() {
+    // Force overflow traffic: YUY2 + Median + V1xCompat uses set B
+    // for U/V slots, max length 26 — the per-byte decode will hit
+    // overflow rows at every U/V byte whose code ≥ 17 bits. End-to-end
+    // round-trip must still match the source pixels exactly.
+    let pixels = synth_yuy2(8, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Yuy2,
+        Method::Median,
+        8,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+/// Reference (round-7) gradient post-pass: byte-by-byte add. Used by
+/// the SWAR equivalence test below to verify the chunked u64 path
+/// produces identical bytes.
+fn reference_inverse_gradient_post(out: &mut [u8], row_bytes: usize, height: usize) {
+    if height < 2 || row_bytes == 0 {
+        return;
+    }
+    for row in 1..height {
+        let above = (row - 1) * row_bytes;
+        let curr = row * row_bytes;
+        for col in 0..row_bytes {
+            out[curr + col] = out[curr + col].wrapping_add(out[above + col]);
+        }
+    }
+}
+
+#[test]
+fn round91_swar_gradient_matches_byte_loop_aligned_8() {
+    // row_bytes = 16 (multiple of 8), height = 4, deterministic data.
+    let mut a: Vec<u8> = (0u32..64).map(|i| ((i * 37) & 0xFF) as u8).collect();
+    let mut b = a.clone();
+    crate::predict::inverse_gradient_post(&mut a, 16, 4);
+    reference_inverse_gradient_post(&mut b, 16, 4);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn round91_swar_gradient_matches_byte_loop_unaligned_tail() {
+    // row_bytes = 11 (NOT a multiple of 8) — the SWAR path takes one
+    // u64-step (cols 0..8) and three byte-steps (8..11) per row.
+    let mut a: Vec<u8> = (0u32..55).map(|i| ((i * 53) & 0xFF) as u8).collect();
+    let mut b = a.clone();
+    crate::predict::inverse_gradient_post(&mut a, 11, 5);
+    reference_inverse_gradient_post(&mut b, 11, 5);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn round91_swar_gradient_matches_byte_loop_height_1_noop() {
+    // height < 2: no add pass happens.
+    let mut a: Vec<u8> = vec![42; 16];
+    let mut b = a.clone();
+    crate::predict::inverse_gradient_post(&mut a, 16, 1);
+    reference_inverse_gradient_post(&mut b, 16, 1);
+    assert_eq!(a, b);
+    // Also row_bytes = 0 trips the early return.
+    let mut a2: Vec<u8> = vec![];
+    let mut b2 = a2.clone();
+    crate::predict::inverse_gradient_post(&mut a2, 0, 4);
+    reference_inverse_gradient_post(&mut b2, 0, 4);
+    assert_eq!(a2, b2);
+}
+
+#[test]
+fn round91_swar_gradient_handles_modular_wrap() {
+    // 8 bytes whose pairwise additions wrap past 255 — exercises the
+    // mod-256 SWAR identity end-to-end. Each pair (above, curr)
+    // chosen so curr + above ≥ 0x100 to force a per-byte wrap.
+    let above = [0xC0u8, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7];
+    let curr = [0x50u8, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57];
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&above);
+    a.extend_from_slice(&curr);
+    let mut b = a.clone();
+    crate::predict::inverse_gradient_post(&mut a, 8, 2);
+    reference_inverse_gradient_post(&mut b, 8, 2);
+    assert_eq!(a, b, "SWAR add must mod-256 wrap per-byte");
+}
+
+#[test]
+fn round91_swar_gradient_end_to_end_yuy2_gradient_320x16() {
+    // End-to-end: encode a 320×16 YUY2 frame with Gradient predictor,
+    // decode, verify pixel-exact equality. The decode path's gradient
+    // post-pass now uses the SWAR path; any byte-wise drift from the
+    // round-7 byte loop would corrupt the output.
+    let pixels = synth_yuy2(320, 16);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Yuy2, Method::Gradient, 320, 16, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round91_swar_gradient_end_to_end_rgb24_gradient_decorr_320x16() {
+    // End-to-end with RGB24 GradientDecorr — the gradient post-pass
+    // runs on 24-bit-per-pixel rows (row_bytes = 960) so the SWAR
+    // chunking covers cleanly. Decorrelation inverse runs after.
+    let pixels = synth_rgb24(320, 16);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb24, Method::GradientDecorr, 320, 16, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round91_swar_gradient_end_to_end_rgb32_gradient_decorr_320x16() {
+    let pixels = synth_rgb32(320, 16);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb32, Method::GradientDecorr, 320, 16, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
