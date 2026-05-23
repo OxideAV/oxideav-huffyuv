@@ -1730,3 +1730,124 @@ fn round91_swar_gradient_end_to_end_rgb32_gradient_decorr_320x16() {
     let out = decode_frame(&cfg, &frame).unwrap();
     assert_eq!(out.pixels, pixels);
 }
+
+// ───────── Round-100: fused LEFT + decorrelation residual path ─────────
+//
+// spec/03 §2.4.1: RGB-with-decorrelation fuses the decorrelation
+// transform into the LEFT residual at the per-byte computation, with
+// no intermediate decorrelated buffer. The encoder's LeftDecorr path
+// now reads `pixels` directly via `forward_left_decorr_residuals`,
+// skipping the round-95 `working_owned` full-frame allocation. These
+// tests guard the fused path's wire correctness across families,
+// extradata modes, larger rasters, the interlaced trigger, and a
+// strongly chroma-correlated synthetic where decorrelation is
+// non-trivial.
+
+/// Strongly chroma-correlated RGB raster: B and R track G closely, so
+/// the decorrelated channels (B−G, R−G) collapse toward small values.
+/// Any drift in the fused decorrelation arithmetic would corrupt the
+/// reconstructed pixels.
+fn synth_rgb24_chroma_correlated(width: usize, height: usize) -> Vec<u8> {
+    let mut v = vec![0u8; width * 3 * height];
+    for row in 0..height {
+        for col in 0..width {
+            let off = (row * width + col) * 3;
+            let g = ((row * 9 + col * 17) & 0xFF) as u8;
+            v[off] = g.wrapping_add(((col * 2) & 0x0F) as u8); // B ≈ G
+            v[off + 1] = g; // G
+            v[off + 2] = g.wrapping_sub(((row + 3) & 0x0F) as u8); // R ≈ G
+        }
+    }
+    v
+}
+
+#[test]
+fn round100_fused_left_decorr_rgb24_classic_v2_64x16() {
+    let pixels = synth_rgb24(64, 16);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb24, Method::LeftDecorr, 64, 16, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round100_fused_left_decorr_rgb32_classic_v2_64x16() {
+    let pixels = synth_rgb32(64, 16);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb32, Method::LeftDecorr, 64, 16, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round100_fused_left_decorr_rgb24_custom_v2_chroma_correlated() {
+    let pixels = synth_rgb24_chroma_correlated(32, 24);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb24,
+        Method::LeftDecorr,
+        32,
+        24,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round100_fused_left_decorr_rgb24_v1x_compat() {
+    let pixels = synth_rgb24(16, 8);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb24,
+        Method::LeftDecorr,
+        16,
+        8,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+    assert_eq!(cfg.method, Method::LeftDecorr);
+}
+
+#[test]
+fn round100_fused_left_decorr_rgb32_interlaced_8x300() {
+    // Height 300 > 288 → interlaced field-stride=2 path. The fused
+    // decorrelation must produce wire-correct per-field residuals.
+    let pixels = synth_rgb32(8, 300);
+    let (cfg, frame) =
+        encode_for_test(PixelFamily::Rgb32, Method::LeftDecorr, 8, 300, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round100_fused_left_decorr_alpha_varies_per_row_rgb32() {
+    // Alpha varies row-by-row (spec/03 §2.4 Validator fixture shape):
+    // alpha is LEFT-predicted but NOT decorrelated. A drift that
+    // decorrelated alpha (subtracting G) would corrupt reconstruction.
+    let w = 16usize;
+    let h = 16usize;
+    let mut pixels = vec![0u8; w * 4 * h];
+    for row in 0..h {
+        for col in 0..w {
+            let off = (row * w + col) * 4;
+            pixels[off] = ((col * 3) & 0xFF) as u8; // B
+            pixels[off + 1] = ((row * 5 + col) & 0xFF) as u8; // G
+            pixels[off + 2] = ((row * 7) & 0xFF) as u8; // R
+            pixels[off + 3] = ((row * 16) & 0xFF) as u8; // A = row*16
+        }
+    }
+    let (cfg, frame) = encode_for_test(
+        PixelFamily::Rgb32,
+        Method::LeftDecorr,
+        w as u32,
+        h as u32,
+        &pixels,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}

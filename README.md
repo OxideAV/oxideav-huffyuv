@@ -6,14 +6,16 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 ## Status
 
 **Round 95 — encoder forward gradient SWAR + intermediate
-allocation elimination.** Rounds 1 (decoder), 2 (encoder), 3
-(decoder fast-LUT), 4 (interlace + lockstep), 5 (walking-stride
-encoder memory optimisation), 6 (predictor RDO + single-symbol
-fix), 7 (auto-selector residual sharing + V1xCompat OnceLock
-cache), 91 (flat overflow_entries Vec + SWAR gradient inverse),
-and 95 (SWAR gradient forward + drop redundant
-`pixels.to_vec()` / `working.clone()` allocations) all ship from
-the strict-isolation
+allocation elimination; round 100 adds the fused
+LEFT+decorrelation residual path.** Rounds 1 (decoder), 2
+(encoder), 3 (decoder fast-LUT), 4 (interlace + lockstep), 5
+(walking-stride encoder memory optimisation), 6 (predictor RDO +
+single-symbol fix), 7 (auto-selector residual sharing + V1xCompat
+OnceLock cache), 91 (flat overflow_entries Vec + SWAR gradient
+inverse), 95 (SWAR gradient forward + drop redundant
+`pixels.to_vec()` / `working.clone()` allocations), and 100
+(fused LEFT+decorrelation residual — no intermediate decorrelated
+buffer) all ship from the strict-isolation
 clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
 The previous (pre-orphan) implementation was retired alongside the
@@ -253,6 +255,43 @@ test-only `[dev-dependencies] oxideav-avi`.
   `round95_swar_subtract_*` equivalence tests covering
   aligned-8, unaligned-tail, modular-wrap, height-1 no-op, and
   forward-then-inverse round-trip).
+
+## What works (Round 100)
+
+- **`predict::forward_left_decorr_residuals`** — fused
+  LEFT+decorrelation encoder residual path per spec/03 §2.4.1
+  ("the decorrelation transform is fused with the predictor at
+  the residual computation, not applied as a separate pre-pass …
+  there is no intermediate decorrelated buffer"; encoder evidence
+  `@0x1000198e..@0x10001996`, the four-instruction fused chain
+  `(cur.B − cur.G) − (prev.B − prev.G)`). Computes the
+  decorrelated-LEFT residuals (`G` identity, `B−G`, `R−G`, plus
+  alpha LEFT-but-NOT-decorrelated per the §2.4 Validator note)
+  directly from the caller's un-transformed `pixels` in a single
+  pass, then the body builder reads them in wire order.
+- **Allocation elimination on the LeftDecorr path.** Round 95's
+  `rgb24_residuals` / `rgb32_residuals` still materialised a
+  full-frame `working_owned: Vec<u8>` (the decorrelated buffer,
+  `row_bytes × h` bytes per frame) for *every* decorrelating
+  method, then ran a second per-channel LEFT-subtract pass over
+  it. Round 100 routes the **LeftDecorr** method (`0x40`,
+  decorrelate + no gradient) through the fused helper, skipping
+  the `working_owned` allocation entirely. The **GradientDecorr**
+  method (`0x41`) still materialises `working` because its
+  gradient pre-pass reads the decorrelated buffer as input — that
+  path is unchanged.
+- Wire-identical to round 95 — the fused residuals are
+  byte-for-byte equal to the round-95 two-pass
+  "materialise-then-subtract" output (regression-guarded by
+  `round100_fused_decorr_matches_two_pass_rgb24/rgb32`), and
+  every pre-existing LeftDecorr round-trip + the
+  `lockstep_rgb24_left_decorr_classic` AVI-lockstep test stays
+  green. Lib test count: 115 → 126 (+5 fused-equivalence /
+  modular-wrap / alpha / inverse-round-trip unit tests in
+  `predict.rs`, +6 end-to-end LeftDecorr round-trips in
+  `roundtrip_tests.rs` across RGB24/RGB32 × ClassicV2 / CustomV2
+  / V1xCompat, an interlaced-height-300 LeftDecorr frame, and a
+  per-row-varying-alpha RGB32 frame).
 
 ## Out of scope (deferred)
 

@@ -8,6 +8,44 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-100: fused LEFT+decorrelation encoder residual path.
+  - `predict::forward_left_decorr_residuals`: computes the
+    decorrelated-LEFT residuals (`G` identity, `B−G`, `R−G`, and —
+    for RGB32 — alpha LEFT-predicted but NOT decorrelated per the
+    spec/03 §2.4 Validator note) directly from the caller's
+    un-transformed `pixels` in a single fused pass, per spec/03
+    §2.4.1 ("the decorrelation transform is fused with the
+    predictor at the residual computation, not applied as a
+    separate pre-pass … there is no intermediate decorrelated
+    buffer"). Mirrors the encoder's documented four-instruction
+    fused chain `(cur.B − cur.G) − (prev.B − prev.G)` at
+    `system32/huffyuv.dll@0x1000198e..@0x10001996`.
+  - Encoder allocation elimination: round-95's `rgb24_residuals` /
+    `rgb32_residuals` materialised a full-frame
+    `working_owned: Vec<u8>` (the decorrelated buffer, `row_bytes ×
+    h` bytes/frame) for *every* decorrelating method and then ran a
+    second per-channel LEFT-subtract pass over it. Round 100 routes
+    the **LeftDecorr** method (`0x40` = decorrelate + no gradient)
+    through the fused helper, skipping the `working_owned`
+    allocation entirely. The **GradientDecorr** method (`0x41`)
+    still materialises `working` because its gradient pre-pass
+    reads the decorrelated buffer as its input — that path is
+    unchanged.
+  - Wire-identical to round 95: the fused residuals are
+    byte-for-byte equal to the round-95 two-pass
+    "materialise-then-subtract" output. Regression-guarded by 5 new
+    unit tests in `predict.rs`
+    (`round100_fused_decorr_matches_two_pass_rgb24` / `_rgb32`,
+    `round100_fused_decorr_modular_wrap`,
+    `round100_fused_decorr_alpha_left_predicted_not_decorrelated`,
+    `round100_fused_decorr_roundtrips_via_inverse_rgb24`) plus 6
+    end-to-end LeftDecorr round-trips in `roundtrip_tests.rs`
+    (RGB24/RGB32 × ClassicV2 / CustomV2 / V1xCompat, an
+    interlaced-height-300 frame, and a per-row-varying-alpha RGB32
+    frame), and by the pre-existing
+    `lockstep_rgb24_left_decorr_classic` AVI-lockstep test. Lib
+    test count: 115 → 126.
+
 - Round-95: encoder forward gradient pre-pass + intermediate
   allocation elimination.
   - `predict::forward_gradient_subtract`: encoder analogue of

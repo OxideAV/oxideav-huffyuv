@@ -303,6 +303,83 @@ pub fn inverse_rgb_decorr_bgra(out: &mut [u8]) {
     }
 }
 
+/// Fused forward LEFT + decorrelation residual computation for an
+/// `n_channels`-stride RGB(A) buffer (n = 3 for RGB24, 4 for RGB32).
+///
+/// spec/03 §2.4.1: the proprietary's RGB-with-decorrelation encoder
+/// **fuses** the decorrelation transform into the LEFT residual,
+/// computing `channel_decorr[i] - channel_decorr[i-stride]` per byte
+/// **without ever materialising a (B−G) / (R−G) buffer** (encoder
+/// evidence `@0x1000198e..@0x10001996`: a four-instruction chain
+/// loading `cur.B`, subtracting `prev.B`, subtracting `cur.G`, adding
+/// `prev.G` — the algebraic identity
+/// `(cur.B − cur.G) − (prev.B − prev.G)`). This helper reproduces
+/// that fused single-step form, reading the un-transformed `pixels`
+/// directly and writing decorrelated-LEFT residuals into `dst` in the
+/// caller's BGR(A) layout.
+///
+/// Per-channel within each pixel (byte offset relative to the pixel
+/// start), where G is at +1, B at +0, R at +2, A at +3:
+///
+/// - **G** (offset +1, identity / not decorrelated): residual =
+///   `G[i] − G[i−stride]`; seed pixel keeps `G[0]`.
+/// - **B** (offset +0, decorrelated): residual =
+///   `(B[i] − G[i]) − (B[i−stride] − G[i−stride])`; seed = `B[0] − G[0]`.
+/// - **R** (offset +2, decorrelated): residual =
+///   `(R[i] − G[i]) − (R[i−stride] − G[i−stride])`; seed = `R[0] − G[0]`.
+/// - **A** (offset +3, RGB32 only, NOT decorrelated per §2.4's
+///   Validator note): residual = `A[i] − A[i−stride]`; seed = `A[0]`.
+///
+/// `dst` must be the same length as `pixels` and a multiple of
+/// `n_channels`. Bit-identical to the round-95 "materialise `working`
+/// then per-channel LEFT-subtract" two-pass path — regression-guarded
+/// by `round100_fused_decorr_*` tests — but skips the full-frame
+/// `working_owned: Vec<u8>` allocation (= `pixels.len()` bytes per
+/// frame) on the LeftDecorr encode path.
+pub fn forward_left_decorr_residuals(pixels: &[u8], dst: &mut [u8], n_channels: usize) {
+    assert_eq!(pixels.len(), dst.len(), "dst length != pixels length");
+    debug_assert!(
+        n_channels == 3 || n_channels == 4,
+        "decorrelation only defined for RGB24 (3) / RGB32 (4)"
+    );
+    if pixels.len() < n_channels {
+        // Degenerate: a buffer smaller than one pixel — copy verbatim
+        // (matches the materialise-then-subtract path on such input).
+        dst.copy_from_slice(pixels);
+        return;
+    }
+    // Seed pixel (decorrelated, no LEFT prediction).
+    let g0 = pixels[1];
+    dst[0] = pixels[0].wrapping_sub(g0); // B − G
+    dst[1] = g0; // G (identity)
+    dst[2] = pixels[2].wrapping_sub(g0); // R − G
+    if n_channels == 4 {
+        dst[3] = pixels[3]; // A (not decorrelated)
+    }
+    // Subsequent pixels: fused decorrelated-LEFT residual.
+    let mut off = n_channels;
+    while off + n_channels <= pixels.len() {
+        let prev = off - n_channels;
+        let g = pixels[off + 1];
+        let g_prev = pixels[prev + 1];
+        // G channel: plain LEFT (not decorrelated).
+        dst[off + 1] = g.wrapping_sub(g_prev);
+        // B channel: (B − G) − (prevB − prevG).
+        let b_decorr = pixels[off].wrapping_sub(g);
+        let b_decorr_prev = pixels[prev].wrapping_sub(g_prev);
+        dst[off] = b_decorr.wrapping_sub(b_decorr_prev);
+        // R channel: (R − G) − (prevR − prevG).
+        let r_decorr = pixels[off + 2].wrapping_sub(g);
+        let r_decorr_prev = pixels[prev + 2].wrapping_sub(g_prev);
+        dst[off + 2] = r_decorr.wrapping_sub(r_decorr_prev);
+        if n_channels == 4 {
+            // Alpha: plain LEFT (NOT decorrelated, spec/03 §2.4).
+            dst[off + 3] = pixels[off + 3].wrapping_sub(pixels[prev + 3]);
+        }
+        off += n_channels;
+    }
+}
+
 /// Spec/02 §2 / spec/05 (planned): the codec engages its
 /// field-stride=2 interlaced path when `biHeight > 288`. The
 /// threshold is the i386 build's compiled-in constant `0x120` (= 288)
@@ -529,5 +606,115 @@ mod tests {
         assert_eq!(bot.len(), 8);
         let merged = interleave_fields(&top, &bot, 4, 5);
         assert_eq!(merged, pixels);
+    }
+
+    /// Reference round-95 "two-pass" decorrelated-LEFT residual: first
+    /// materialise the full decorrelated buffer (`B−G`, `G`, `R−G`,
+    /// `A`), then per-channel LEFT-subtract over stride `n`. The fused
+    /// `forward_left_decorr_residuals` must match this byte-for-byte.
+    fn naive_two_pass_decorr_left(pixels: &[u8], n: usize) -> Vec<u8> {
+        let n_pixels = pixels.len() / n;
+        let mut working = vec![0u8; pixels.len()];
+        for px in 0..n_pixels {
+            let off = px * n;
+            let g = pixels[off + 1];
+            working[off] = pixels[off].wrapping_sub(g); // B − G
+            working[off + 1] = g;
+            working[off + 2] = pixels[off + 2].wrapping_sub(g); // R − G
+            if n == 4 {
+                working[off + 3] = pixels[off + 3]; // A (not decorrelated)
+            }
+        }
+        let mut residuals = vec![0u8; pixels.len()];
+        for ch in 0..n {
+            residuals[ch] = working[ch];
+            let mut idx = ch + n;
+            while idx < working.len() {
+                residuals[idx] = working[idx].wrapping_sub(working[idx - n]);
+                idx += n;
+            }
+        }
+        residuals
+    }
+
+    #[test]
+    fn round100_fused_decorr_matches_two_pass_rgb24() {
+        // Pseudo-random RGB24 raster, 5×3 = 15 px.
+        let n_pixels = 15usize;
+        let pixels: Vec<u8> = (0..(n_pixels * 3))
+            .map(|x| ((x * 37 + 11) ^ 0x6C) as u8)
+            .collect();
+        let mut fused = vec![0u8; pixels.len()];
+        forward_left_decorr_residuals(&pixels, &mut fused, 3);
+        let reference = naive_two_pass_decorr_left(&pixels, 3);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round100_fused_decorr_matches_two_pass_rgb32() {
+        let n_pixels = 17usize;
+        let pixels: Vec<u8> = (0..(n_pixels * 4))
+            .map(|x| ((x * 53 + 7) ^ 0x39) as u8)
+            .collect();
+        let mut fused = vec![0u8; pixels.len()];
+        forward_left_decorr_residuals(&pixels, &mut fused, 4);
+        let reference = naive_two_pass_decorr_left(&pixels, 4);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round100_fused_decorr_modular_wrap() {
+        // Channels chosen so B − G and R − G both wrap mod 256, and the
+        // LEFT subtract across pixels wraps too.
+        // px0: B=0x10 G=0x80 R=0x05  → B−G=0x90, R−G=0x85
+        // px1: B=0x00 G=0x10 R=0xF0  → B−G=0xF0, R−G=0xE0
+        let pixels: Vec<u8> = vec![0x10, 0x80, 0x05, 0x00, 0x10, 0xF0];
+        let mut fused = vec![0u8; pixels.len()];
+        forward_left_decorr_residuals(&pixels, &mut fused, 3);
+        let reference = naive_two_pass_decorr_left(&pixels, 3);
+        assert_eq!(fused, reference);
+        // Seed pixel = decorrelated px0 directly.
+        assert_eq!(fused[0], 0x10u8.wrapping_sub(0x80)); // B−G
+        assert_eq!(fused[1], 0x80); // G
+        assert_eq!(fused[2], 0x05u8.wrapping_sub(0x80)); // R−G
+    }
+
+    #[test]
+    fn round100_fused_decorr_alpha_left_predicted_not_decorrelated() {
+        // RGB32: alpha must be LEFT-predicted but NOT decorrelated
+        // (spec/03 §2.4 Validator note). px0 A=0x40, px1 A=0x55 →
+        // alpha residual at px1 = 0x55 − 0x40 = 0x15; seed alpha = 0x40.
+        let pixels: Vec<u8> = vec![
+            0x11, 0x22, 0x33, 0x40, // px0 BGRA
+            0x44, 0x55, 0x66, 0x55, // px1 BGRA
+        ];
+        let mut fused = vec![0u8; pixels.len()];
+        forward_left_decorr_residuals(&pixels, &mut fused, 4);
+        assert_eq!(fused[3], 0x40); // seed alpha verbatim
+        assert_eq!(fused[7], 0x55u8.wrapping_sub(0x40)); // px1 alpha LEFT
+                                                         // Cross-check the whole buffer against the two-pass reference.
+        let reference = naive_two_pass_decorr_left(&pixels, 4);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round100_fused_decorr_roundtrips_via_inverse_rgb24() {
+        // Fused forward residuals → per-channel LEFT inverse → inverse
+        // decorrelation must reconstruct the original pixels exactly.
+        let n_pixels = 9usize;
+        let pixels: Vec<u8> = (0..(n_pixels * 3))
+            .map(|x| ((x * 29 + 5) ^ 0xB7) as u8)
+            .collect();
+        let mut residuals = vec![0u8; pixels.len()];
+        forward_left_decorr_residuals(&pixels, &mut residuals, 3);
+        // Inverse per-channel LEFT (stride 3): residual + value n back.
+        let mut recon = residuals.clone();
+        for i in 3..recon.len() {
+            recon[i] = recon[i].wrapping_add(recon[i - 3]);
+        }
+        // recon now holds the decorrelated buffer (B−G, G, R−G); invert
+        // decorrelation in place.
+        inverse_rgb_decorr_bgr(&mut recon);
+        assert_eq!(recon, pixels);
     }
 }
