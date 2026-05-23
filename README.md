@@ -5,17 +5,18 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 95 — encoder forward gradient SWAR + intermediate
-allocation elimination; round 100 adds the fused
-LEFT+decorrelation residual path.** Rounds 1 (decoder), 2
-(encoder), 3 (decoder fast-LUT), 4 (interlace + lockstep), 5
-(walking-stride encoder memory optimisation), 6 (predictor RDO +
-single-symbol fix), 7 (auto-selector residual sharing + V1xCompat
-OnceLock cache), 91 (flat overflow_entries Vec + SWAR gradient
-inverse), 95 (SWAR gradient forward + drop redundant
-`pixels.to_vec()` / `working.clone()` allocations), and 100
+**Round 103 — fused decorrelation+gradient encoder residual
+path; round 100 added the fused LEFT+decorrelation path.** Rounds
+1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4 (interlace +
+lockstep), 5 (walking-stride encoder memory optimisation), 6
+(predictor RDO + single-symbol fix), 7 (auto-selector residual
+sharing + V1xCompat OnceLock cache), 91 (flat overflow_entries
+Vec + SWAR gradient inverse), 95 (SWAR gradient forward + drop
+redundant `pixels.to_vec()` / `working.clone()` allocations), 100
 (fused LEFT+decorrelation residual — no intermediate decorrelated
-buffer) all ship from the strict-isolation
+buffer), and 103 (fused decorrelation+gradient residual — drops
+the last decorrelated-buffer allocation, on the GradientDecorr
+path) all ship from the strict-isolation
 clean-room workspace at
 [`docs/video/huffyuv/`](https://github.com/OxideAV/docs/tree/master/video/huffyuv).
 The previous (pre-orphan) implementation was retired alongside the
@@ -292,6 +293,46 @@ test-only `[dev-dependencies] oxideav-avi`.
   `roundtrip_tests.rs` across RGB24/RGB32 × ClassicV2 / CustomV2
   / V1xCompat, an interlaced-height-300 LeftDecorr frame, and a
   per-row-varying-alpha RGB32 frame).
+
+## What works (Round 103)
+
+- **`predict::forward_decorr_gradient_subtract`** — fused
+  decorrelation+gradient encoder pre-pass for method `0x41`
+  (GradientDecorr), the §2.4.2 counterpart to round 100's
+  LeftDecorr fusion. Per spec/03 §2.4.2 the gradient+decorrelation
+  residual is `c_dec[i] − gradient(c_dec[i−1], c_dec_above[i],
+  c_dec_above_left[i])` per decorrelated channel, which §2.2.2
+  decomposes into a LEFT-pass over the row-above differences plus
+  the per-channel LEFT-subtract series. The §2.2.2 gradient
+  pre-pass reads only **decorrelated** channel values, so this
+  helper folds the per-pixel decorrelation (`B−G`, `G` identity,
+  `R−G`, and — RGB32 — alpha identity / NOT decorrelated per the
+  §2.4 Validator note) straight into the same-column gradient
+  subtract, reading un-transformed `pixels` directly. Row 0 is the
+  decorrelated values verbatim (the §2.2.1 first-row LEFT
+  exemption); rows ≥ 1 are the same-column decorrelated subtract.
+- **Last decorrelated-buffer allocation eliminated.** Round 100
+  fused LeftDecorr (`0x40`) but GradientDecorr (`0x41`) still
+  materialised the full-frame `working_owned: Vec<u8>`
+  (`row_bytes × h` bytes/frame) because its gradient pre-pass read
+  the decorrelated buffer as input. Round 103 routes GradientDecorr
+  through the fused helper, skipping that allocation. With both
+  decorrelation paths now fused, `rgb24_residuals` /
+  `rgb32_residuals` never allocate a decorrelated buffer anymore —
+  only the gradient `intermediate` (which Gradient / GradientDecorr
+  already required).
+- Wire-identical to round 100 — the fused gradient pre-pass output
+  is byte-for-byte equal to the round-95/100 two-pass
+  "materialise the decorrelated buffer, then forward-gradient
+  subtract" output (regression-guarded by
+  `round103_fused_decorr_gradient_matches_two_pass_rgb24/rgb32`),
+  and every pre-existing GradientDecorr round-trip + the
+  AVI-lockstep tests stay green. Lib test count: 126 → 135 (+5
+  fused-equivalence / modular-wrap / alpha-identity / height-1
+  unit tests in `predict.rs`, +4 end-to-end GradientDecorr
+  round-trips in `roundtrip_tests.rs`: RGB24 7×5 CustomV2
+  non-aligned width, RGB32 6×4 V1xCompat, a per-row-varying-alpha
+  RGB32 frame, and an RGB24 interlaced-height-300 frame).
 
 ## Out of scope (deferred)
 

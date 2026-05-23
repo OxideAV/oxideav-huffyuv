@@ -22,8 +22,8 @@ use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
 use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
 use crate::predict::{
-    forward_gradient_subtract, forward_left_decorr_residuals, gradient_predictor,
-    is_interlaced_height, median3,
+    forward_decorr_gradient_subtract, forward_gradient_subtract, forward_left_decorr_residuals,
+    gradient_predictor, is_interlaced_height, median3,
 };
 use crate::tables::{
     classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
@@ -746,42 +746,56 @@ fn rgb24_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
     // predictor at the residual computation, not applied as a separate
     // pre-pass ... there is no intermediate decorrelated buffer"). This
     // skips the round-95 `working_owned: Vec<u8>` full-frame allocation
-    // (= row_bytes × h bytes per frame) entirely. The GradientDecorr
-    // path still materialises `working` because the gradient pre-pass
-    // reads the decorrelated buffer as its input.
+    // (= row_bytes × h bytes per frame) entirely.
     let fused_left_decorr = method.decorrelate() && method.predictor() == Predictor::Left;
+    // Round 103: for the GradientDecorr path (decorrelate + gradient),
+    // fuse the decorrelation into the forward-gradient subtract per
+    // spec/03 §2.4.2 (gradient applied to each decorrelated channel;
+    // the §2.2.2 gradient pre-pass reads only decorrelated values).
+    // `forward_decorr_gradient_subtract` produces the gradient
+    // pre-pass output straight from un-transformed `pixels`, so the
+    // round-95 `working_owned` decorrelated buffer is no longer needed
+    // on this path either. The per-channel LEFT-subtract pass that
+    // follows is identical; only the seed sourcing differs (the
+    // decorrelated first pixel must be read from `pixels`, not the
+    // now-absent `working`).
+    let fused_decorr_gradient = method.decorrelate() && method.predictor() == Predictor::Gradient;
     // Round 95: skip the `pixels.to_vec()` clone when no decorrelation
-    // is in play — `working` borrows pixels directly. When
-    // GradientDecorr is active we still need `working_owned` (the
-    // decorrelation overwrites 2 of every 3 bytes — bit-modifying the
-    // caller's slice isn't allowed, and the gradient pre-pass needs the
-    // decorrelated buffer).
-    let working_owned: Option<Vec<u8>> = if method.decorrelate() && !fused_left_decorr {
-        let mut v = vec![0u8; row_bytes * h];
-        for px in 0..n_pixels {
-            let off = px * 3;
-            let b = pixels[off];
-            let g = pixels[off + 1];
-            let r = pixels[off + 2];
-            v[off] = b.wrapping_sub(g);
-            v[off + 1] = g;
-            v[off + 2] = r.wrapping_sub(g);
-        }
-        Some(v)
-    } else {
-        None
-    };
+    // is in play — `working` borrows pixels directly. With both
+    // decorrelation paths fused (round 100 LeftDecorr + round 103
+    // GradientDecorr) `working_owned` is never allocated anymore.
+    let working_owned: Option<Vec<u8>> =
+        if method.decorrelate() && !fused_left_decorr && !fused_decorr_gradient {
+            let mut v = vec![0u8; row_bytes * h];
+            for px in 0..n_pixels {
+                let off = px * 3;
+                let b = pixels[off];
+                let g = pixels[off + 1];
+                let r = pixels[off + 2];
+                v[off] = b.wrapping_sub(g);
+                v[off + 1] = g;
+                v[off + 2] = r.wrapping_sub(g);
+            }
+            Some(v)
+        } else {
+            None
+        };
     let working: &[u8] = working_owned.as_deref().unwrap_or(pixels);
     let mut residuals = vec![0u8; row_bytes * h];
     if fused_left_decorr {
         // Fused decorrelated-LEFT residuals straight from `pixels`.
         forward_left_decorr_residuals(pixels, &mut residuals, 3);
     } else {
-        // Round 95: when no gradient pre-pass is needed, `pred_input`
-        // borrows `working` directly — saves a `working.clone()` (=
-        // `row_bytes * h` bytes per frame). spec/03 §2.2.2 forward
-        // gradient pre-pass otherwise.
-        let intermediate: Option<Vec<u8>> = if method.predictor() == Predictor::Gradient {
+        // The gradient pre-pass output. For GradientDecorr the fused
+        // helper folds decorrelation in (round 103); for plain
+        // Gradient it's the same-column row subtract over `working`;
+        // for non-gradient methods `pred_input` borrows `working`
+        // directly (round 95 — no `working.clone()`).
+        let intermediate: Option<Vec<u8>> = if fused_decorr_gradient {
+            let mut iv = vec![0u8; row_bytes * h];
+            forward_decorr_gradient_subtract(pixels, &mut iv, 3, row_bytes, h);
+            Some(iv)
+        } else if method.predictor() == Predictor::Gradient {
             let mut iv = vec![0u8; row_bytes * h];
             forward_gradient_subtract(working, &mut iv, row_bytes, h);
             Some(iv)
@@ -799,14 +813,21 @@ fn rgb24_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
         }
     }
     // Wire seed: `00 B G R` (the decoder writes pad as 0; first
-    // pixel goes into bytes 1..4). For the fused path the decorrelated
-    // seed is already in `residuals[0..3]`; otherwise it's `working`'s
-    // first (decorrelated-or-plain) pixel.
+    // pixel goes into bytes 1..4). For the fused LeftDecorr path the
+    // decorrelated seed is already in `residuals[0..3]`; for the fused
+    // GradientDecorr path it's the decorrelated first pixel computed
+    // from `pixels` (B−G, G, R−G); otherwise it's `working`'s first
+    // (decorrelated-or-plain) pixel.
     let mut seed = [0u8; 4];
     if fused_left_decorr {
         seed[1] = residuals[0];
         seed[2] = residuals[1];
         seed[3] = residuals[2];
+    } else if fused_decorr_gradient {
+        let g0 = pixels[1];
+        seed[1] = pixels[0].wrapping_sub(g0); // B − G
+        seed[2] = g0; // G
+        seed[3] = pixels[2].wrapping_sub(g0); // R − G
     } else {
         seed[1] = working[0];
         seed[2] = working[1];
@@ -850,28 +871,38 @@ fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
     // buffer), skipping the round-95 `working_owned` full-frame
     // allocation. Alpha is NOT decorrelated (spec/03 §2.4 Validator
     // note); the fused helper LEFT-predicts it like the colour
-    // channels. GradientDecorr still materialises `working` for the
-    // gradient pre-pass.
+    // channels.
     let fused_left_decorr = method.decorrelate() && method.predictor() == Predictor::Left;
+    // Round 103: fuse decorrelation into the forward-gradient subtract
+    // for the GradientDecorr path (spec/03 §2.4.2 — gradient applied to
+    // each decorrelated channel). `forward_decorr_gradient_subtract`
+    // folds the per-pixel decorrelation (B−G / G / R−G; alpha identity)
+    // into the §2.2.2 same-column gradient subtract, reading
+    // un-transformed `pixels` directly, so `working_owned` is no longer
+    // allocated on this path. Alpha is identity in both the decorr and
+    // gradient steps (NOT decorrelated, spec/03 §2.4 Validator note).
+    let fused_decorr_gradient = method.decorrelate() && method.predictor() == Predictor::Gradient;
     // Round 95: skip the `pixels.to_vec()` clone when no decorrelation
-    // is in play.
-    let working_owned: Option<Vec<u8>> = if method.decorrelate() && !fused_left_decorr {
-        let mut v = vec![0u8; row_bytes * h];
-        for px in 0..n_pixels {
-            let off = px * 4;
-            let b = pixels[off];
-            let g = pixels[off + 1];
-            let r = pixels[off + 2];
-            let a = pixels[off + 3];
-            v[off] = b.wrapping_sub(g);
-            v[off + 1] = g;
-            v[off + 2] = r.wrapping_sub(g);
-            v[off + 3] = a; // alpha NOT decorrelated.
-        }
-        Some(v)
-    } else {
-        None
-    };
+    // is in play. With both decorr paths fused (round 100 + round 103)
+    // `working_owned` is never allocated anymore.
+    let working_owned: Option<Vec<u8>> =
+        if method.decorrelate() && !fused_left_decorr && !fused_decorr_gradient {
+            let mut v = vec![0u8; row_bytes * h];
+            for px in 0..n_pixels {
+                let off = px * 4;
+                let b = pixels[off];
+                let g = pixels[off + 1];
+                let r = pixels[off + 2];
+                let a = pixels[off + 3];
+                v[off] = b.wrapping_sub(g);
+                v[off + 1] = g;
+                v[off + 2] = r.wrapping_sub(g);
+                v[off + 3] = a; // alpha NOT decorrelated.
+            }
+            Some(v)
+        } else {
+            None
+        };
     let working: &[u8] = working_owned.as_deref().unwrap_or(pixels);
     let mut residuals = vec![0u8; row_bytes * h];
     let seed = if fused_left_decorr {
@@ -882,9 +913,16 @@ fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
         s.copy_from_slice(&residuals[..4]);
         s
     } else {
-        // Round 95: skip the `working.clone()` when no gradient pre-pass
-        // is needed. spec/03 §2.2.2 forward gradient pre-pass otherwise.
-        let intermediate: Option<Vec<u8>> = if method.predictor() == Predictor::Gradient {
+        // The gradient pre-pass output. For GradientDecorr the fused
+        // helper folds decorrelation in (round 103); for plain Gradient
+        // it's the same-column row subtract over `working`; for
+        // non-gradient methods `pred_input` borrows `working` directly
+        // (round 95 — no `working.clone()`).
+        let intermediate: Option<Vec<u8>> = if fused_decorr_gradient {
+            let mut iv = vec![0u8; row_bytes * h];
+            forward_decorr_gradient_subtract(pixels, &mut iv, 4, row_bytes, h);
+            Some(iv)
+        } else if method.predictor() == Predictor::Gradient {
             let mut iv = vec![0u8; row_bytes * h];
             forward_gradient_subtract(working, &mut iv, row_bytes, h);
             Some(iv)
@@ -900,9 +938,22 @@ fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
                 idx += 4;
             }
         }
-        let mut s = [0u8; 4];
-        s.copy_from_slice(&working[..4]);
-        s
+        // Seed = decorrelated-or-plain first pixel. For the fused
+        // GradientDecorr path compute it from `pixels` (B−G, G, R−G, A
+        // — alpha identity); otherwise read `working`'s first pixel.
+        if fused_decorr_gradient {
+            let g0 = pixels[1];
+            [
+                pixels[0].wrapping_sub(g0), // B − G
+                g0,                         // G
+                pixels[2].wrapping_sub(g0), // R − G
+                pixels[3],                  // A (identity)
+            ]
+        } else {
+            let mut s = [0u8; 4];
+            s.copy_from_slice(&working[..4]);
+            s
+        }
     };
     let mut body = Vec::with_capacity((n_pixels - 1) * 4);
     for px in 1..n_pixels {

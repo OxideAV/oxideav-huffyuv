@@ -380,6 +380,126 @@ pub fn forward_left_decorr_residuals(pixels: &[u8], dst: &mut [u8], n_channels: 
     }
 }
 
+/// Fused forward decorrelation + gradient pre-pass for an
+/// `n_channels`-stride RGB(A) buffer (n = 3 for RGB24, 4 for RGB32),
+/// the encoder analogue of the GradientDecorr (method `0x41`) path.
+///
+/// spec/03 §2.4.2: gradient+decorrelation produces, for each
+/// decorrelated channel `c_dec`, residuals
+/// `c_dec[i] - gradient(c_dec[i-1], c_dec_above[i], c_dec_above_left[i])`,
+/// which §2.2.2 decomposes into a LEFT-pass over the row-above
+/// differences (`c_dec[i] - c_dec_above[i]`) plus the
+/// per-channel LEFT-subtract series. The full encoder chain is
+/// therefore **decorrelate → forward-gradient-subtract →
+/// per-channel-LEFT-subtract**. The middle step (a per-row,
+/// same-column subtract — spec/03 §2.2.2 `@0x10001f10..@0x10001f9e`)
+/// reads only the **decorrelated** channel values; this helper fuses
+/// the decorrelation into that gradient subtract so the caller never
+/// materialises a full-frame decorrelated buffer.
+///
+/// Output (the gradient pre-pass result, in the caller's BGR(A)
+/// channel layout, ready for the per-channel LEFT-subtract pass):
+///
+/// - **Row 0** (the §2.2.1 first-row LEFT exemption): the
+///   decorrelated channel value verbatim — `B−G` at +0, `G` at +1,
+///   `R−G` at +2, and (RGB32) `A` at +3.
+/// - **Rows N ≥ 1**, per byte: `decorr(pixels)[i] −
+///   decorr(pixels)[i − row_bytes]`, where `decorr` is the per-pixel
+///   transform (`B−G`, `G` identity, `R−G`, `A` identity). Because the
+///   gradient subtract is same-column and decorrelation is per-pixel,
+///   the row-above sample at column `i` belongs to the same channel as
+///   column `i`, so the fused difference is exact.
+///
+/// `dst` must equal `pixels` in length and be a multiple of
+/// `row_bytes`, which must itself be a multiple of `n_channels`.
+/// Bit-identical to the round-95/100 two-pass
+/// "materialise the decorrelated `working` buffer, then
+/// `forward_gradient_subtract` over it" path — regression-guarded by
+/// `round103_fused_decorr_gradient_*` tests — but skips the
+/// full-frame `working_owned: Vec<u8>` allocation (= `pixels.len()`
+/// bytes per frame) on the GradientDecorr encode path.
+pub fn forward_decorr_gradient_subtract(
+    pixels: &[u8],
+    dst: &mut [u8],
+    n_channels: usize,
+    row_bytes: usize,
+    height: usize,
+) {
+    assert_eq!(pixels.len(), dst.len(), "dst length != pixels length");
+    assert_eq!(
+        pixels.len(),
+        row_bytes * height,
+        "buffer size != row_bytes * height"
+    );
+    debug_assert!(
+        n_channels == 3 || n_channels == 4,
+        "decorrelation only defined for RGB24 (3) / RGB32 (4)"
+    );
+    debug_assert_eq!(
+        row_bytes % n_channels,
+        0,
+        "row_bytes must be a whole number of pixels"
+    );
+    if height == 0 || row_bytes == 0 {
+        return;
+    }
+    // Per-pixel decorrelation applied to one row of `pixels`, written
+    // into the same-position bytes of `dst`. G (offset +1) and A
+    // (offset +3, RGB32) are identity; B (+0) and R (+2) are minus-G.
+    let decorr_row = |src_row: &[u8], out_row: &mut [u8]| {
+        let mut off = 0;
+        while off + n_channels <= src_row.len() {
+            let g = src_row[off + 1];
+            out_row[off] = src_row[off].wrapping_sub(g); // B − G
+            out_row[off + 1] = g; // G (identity)
+            out_row[off + 2] = src_row[off + 2].wrapping_sub(g); // R − G
+            if n_channels == 4 {
+                out_row[off + 3] = src_row[off + 3]; // A (identity)
+            }
+            off += n_channels;
+        }
+    };
+
+    // Row 0: decorrelated values verbatim (LEFT-predict-row-0 phase,
+    // spec/03 §2.2.1). `split_first_mut` keeps the borrow checker happy
+    // when later rows read the decorrelated row above from `dst`.
+    {
+        let (row0_dst, _) = dst.split_at_mut(row_bytes);
+        decorr_row(&pixels[..row_bytes], row0_dst);
+    }
+    if height < 2 {
+        return;
+    }
+    // Rows ≥ 1: `dst[curr] = decorr(curr) − decorr(above)`. We
+    // recompute `decorr(above)` from `pixels` (the same per-pixel
+    // transform) rather than reading it back from `dst`, keeping the
+    // arithmetic strictly value-based and borrow-free.
+    for row in 1..height {
+        let above = (row - 1) * row_bytes;
+        let curr = row * row_bytes;
+        let mut col = 0usize;
+        while col + n_channels <= row_bytes {
+            let g_c = pixels[curr + col + 1];
+            let g_a = pixels[above + col + 1];
+            // G channel: gradient subtract of identity values.
+            dst[curr + col + 1] = g_c.wrapping_sub(g_a);
+            // B channel: (B−G)_curr − (B−G)_above.
+            let bc = pixels[curr + col].wrapping_sub(g_c);
+            let ba = pixels[above + col].wrapping_sub(g_a);
+            dst[curr + col] = bc.wrapping_sub(ba);
+            // R channel: (R−G)_curr − (R−G)_above.
+            let rc = pixels[curr + col + 2].wrapping_sub(g_c);
+            let ra = pixels[above + col + 2].wrapping_sub(g_a);
+            dst[curr + col + 2] = rc.wrapping_sub(ra);
+            if n_channels == 4 {
+                // A channel: identity, plain gradient subtract.
+                dst[curr + col + 3] = pixels[curr + col + 3].wrapping_sub(pixels[above + col + 3]);
+            }
+            col += n_channels;
+        }
+    }
+}
+
 /// Spec/02 §2 / spec/05 (planned): the codec engages its
 /// field-stride=2 interlaced path when `biHeight > 288`. The
 /// threshold is the i386 build's compiled-in constant `0x120` (= 288)
@@ -694,6 +814,124 @@ mod tests {
         assert_eq!(fused[7], 0x55u8.wrapping_sub(0x40)); // px1 alpha LEFT
                                                          // Cross-check the whole buffer against the two-pass reference.
         let reference = naive_two_pass_decorr_left(&pixels, 4);
+        assert_eq!(fused, reference);
+    }
+
+    /// Reference round-95/100 "two-pass" decorrelated-gradient
+    /// pre-pass: first materialise the full decorrelated buffer
+    /// (`B−G`, `G`, `R−G`, `A`), then run `forward_gradient_subtract`
+    /// over it. The fused `forward_decorr_gradient_subtract` must match
+    /// this byte-for-byte. This is exactly the GradientDecorr gradient
+    /// pre-pass output that feeds the per-channel LEFT-subtract pass.
+    fn naive_two_pass_decorr_gradient(
+        pixels: &[u8],
+        n: usize,
+        row_bytes: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        let n_pixels = pixels.len() / n;
+        let mut working = vec![0u8; pixels.len()];
+        for px in 0..n_pixels {
+            let off = px * n;
+            let g = pixels[off + 1];
+            working[off] = pixels[off].wrapping_sub(g); // B − G
+            working[off + 1] = g;
+            working[off + 2] = pixels[off + 2].wrapping_sub(g); // R − G
+            if n == 4 {
+                working[off + 3] = pixels[off + 3]; // A (not decorrelated)
+            }
+        }
+        let mut dst = vec![0u8; pixels.len()];
+        forward_gradient_subtract(&working, &mut dst, row_bytes, height);
+        dst
+    }
+
+    #[test]
+    fn round103_fused_decorr_gradient_matches_two_pass_rgb24() {
+        // 7×5 RGB24 raster (width 7 → row_bytes 21, no u64 alignment).
+        let (w, h, n) = (7usize, 5usize, 3usize);
+        let row_bytes = w * n;
+        let pixels: Vec<u8> = (0..(row_bytes * h))
+            .map(|x| ((x * 41 + 13) ^ 0x5C) as u8)
+            .collect();
+        let mut fused = vec![0u8; pixels.len()];
+        forward_decorr_gradient_subtract(&pixels, &mut fused, n, row_bytes, h);
+        let reference = naive_two_pass_decorr_gradient(&pixels, n, row_bytes, h);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round103_fused_decorr_gradient_matches_two_pass_rgb32() {
+        // 6×4 RGB32 raster (width 6 → row_bytes 24, u64-aligned).
+        let (w, h, n) = (6usize, 4usize, 4usize);
+        let row_bytes = w * n;
+        let pixels: Vec<u8> = (0..(row_bytes * h))
+            .map(|x| ((x * 59 + 7) ^ 0x33) as u8)
+            .collect();
+        let mut fused = vec![0u8; pixels.len()];
+        forward_decorr_gradient_subtract(&pixels, &mut fused, n, row_bytes, h);
+        let reference = naive_two_pass_decorr_gradient(&pixels, n, row_bytes, h);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round103_fused_decorr_gradient_modular_wrap() {
+        // Channels chosen so B−G / R−G wrap on decorrelation AND the
+        // row-above gradient subtract wraps.
+        // row0 px: B=0x10 G=0x80 R=0x05 → B−G=0x90, R−G=0x85
+        // row1 px: B=0x00 G=0x10 R=0xF0 → B−G=0xF0, R−G=0xE0
+        // gradient row1 = decorr(row1) − decorr(row0):
+        //   G: 0x10−0x80=0x90; B−G: 0xF0−0x90=0x60; R−G: 0xE0−0x85=0x5B
+        let pixels: Vec<u8> = vec![0x10, 0x80, 0x05, 0x00, 0x10, 0xF0];
+        let row_bytes = 3;
+        let mut fused = vec![0u8; pixels.len()];
+        forward_decorr_gradient_subtract(&pixels, &mut fused, 3, row_bytes, 2);
+        let reference = naive_two_pass_decorr_gradient(&pixels, 3, row_bytes, 2);
+        assert_eq!(fused, reference);
+        // Row 0 is the decorrelated values verbatim.
+        assert_eq!(fused[0], 0x10u8.wrapping_sub(0x80)); // B−G
+        assert_eq!(fused[1], 0x80); // G
+        assert_eq!(fused[2], 0x05u8.wrapping_sub(0x80)); // R−G
+                                                         // Row 1 gradient-subtracted decorrelated values.
+        assert_eq!(fused[3], 0xF0u8.wrapping_sub(0x90)); // B−G subtract
+        assert_eq!(fused[4], 0x10u8.wrapping_sub(0x80)); // G subtract
+        assert_eq!(fused[5], 0xE0u8.wrapping_sub(0x85)); // R−G subtract
+    }
+
+    #[test]
+    fn round103_fused_decorr_gradient_alpha_identity_not_decorrelated() {
+        // RGB32: alpha must be identity in BOTH the decorrelation and
+        // the gradient subtract (plain row-above subtract of raw alpha,
+        // spec/03 §2.4 Validator note). row0 A=0x40, row1 A=0x90 →
+        // alpha gradient = 0x90 − 0x40 = 0x50; seed alpha = 0x40.
+        let pixels: Vec<u8> = vec![
+            0x11, 0x22, 0x33, 0x40, // row0 BGRA
+            0x44, 0x55, 0x66, 0x90, // row1 BGRA
+        ];
+        let row_bytes = 4;
+        let mut fused = vec![0u8; pixels.len()];
+        forward_decorr_gradient_subtract(&pixels, &mut fused, 4, row_bytes, 2);
+        assert_eq!(fused[3], 0x40); // row0 alpha verbatim (identity)
+        assert_eq!(fused[7], 0x90u8.wrapping_sub(0x40)); // row1 alpha gradient
+        let reference = naive_two_pass_decorr_gradient(&pixels, 4, row_bytes, 2);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round103_fused_decorr_gradient_height_1_no_op() {
+        // Height 1 → no row-above; output is just the decorrelated row 0.
+        let pixels: Vec<u8> = vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let row_bytes = 6;
+        let mut fused = vec![0u8; pixels.len()];
+        forward_decorr_gradient_subtract(&pixels, &mut fused, 3, row_bytes, 1);
+        // px0: B−G=0x10−0x20, G=0x20, R−G=0x30−0x20
+        assert_eq!(fused[0], 0x10u8.wrapping_sub(0x20));
+        assert_eq!(fused[1], 0x20);
+        assert_eq!(fused[2], 0x30u8.wrapping_sub(0x20));
+        assert_eq!(fused[3], 0x40u8.wrapping_sub(0x50));
+        assert_eq!(fused[4], 0x50);
+        assert_eq!(fused[5], 0x60u8.wrapping_sub(0x50));
+        let reference = naive_two_pass_decorr_gradient(&pixels, 3, row_bytes, 1);
         assert_eq!(fused, reference);
     }
 

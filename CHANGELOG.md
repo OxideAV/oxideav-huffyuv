@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-103: fused decorrelation+gradient encoder residual path
+  (completes the round-100 decorrelation fusion for method `0x41`).
+  - `predict::forward_decorr_gradient_subtract`: folds the RGB
+    decorrelation transform (`B−G`, `G` identity, `R−G`, and — for
+    RGB32 — alpha identity / NOT decorrelated per the spec/03 §2.4
+    Validator note) into the spec/03 §2.2.2 forward-gradient
+    same-column subtract, computing the gradient pre-pass output
+    directly from the caller's un-transformed `pixels` in a single
+    pass. Per spec/03 §2.4.2 the gradient+decorrelation residual is
+    `c_dec[i] − gradient(c_dec[i−1], c_dec_above[i], c_dec_above_left[i])`
+    per decorrelated channel, decomposed (§2.2.2) into a LEFT-pass
+    over the row-above differences plus the per-channel LEFT-subtract
+    series; the §2.2.2 gradient pre-pass therefore reads only
+    decorrelated channel values, which this helper produces without
+    materialising them. Row 0 is the decorrelated values verbatim
+    (the §2.2.1 first-row LEFT exemption); rows ≥ 1 are the
+    same-column decorrelated subtract.
+  - Encoder allocation elimination: round-100 fused the LeftDecorr
+    path (`0x40`) but the GradientDecorr path (`0x41`) still
+    materialised a full-frame `working_owned: Vec<u8>` (the
+    decorrelated buffer, `row_bytes × h` bytes/frame) because its
+    gradient pre-pass read the decorrelated buffer as input. Round
+    103 routes GradientDecorr through `forward_decorr_gradient_subtract`,
+    skipping the `working_owned` allocation entirely. With both
+    decorrelation paths now fused (round-100 LeftDecorr + round-103
+    GradientDecorr), `rgb24_residuals` / `rgb32_residuals` never
+    allocate the decorrelated buffer anymore — only the gradient
+    `intermediate` (which Gradient / GradientDecorr already required).
+    Net saving on the GradientDecorr path: `row_bytes × h` bytes
+    per frame.
+  - Wire-identical to round 100: the fused gradient pre-pass output
+    is byte-for-byte equal to the round-95/100 two-pass
+    "materialise the decorrelated `working` buffer, then
+    `forward_gradient_subtract` over it" output. Regression-guarded
+    by 5 new unit tests in `predict.rs`
+    (`round103_fused_decorr_gradient_matches_two_pass_rgb24` /
+    `_rgb32`, `round103_fused_decorr_gradient_modular_wrap`,
+    `round103_fused_decorr_gradient_alpha_identity_not_decorrelated`,
+    `round103_fused_decorr_gradient_height_1_no_op`) plus 4
+    end-to-end GradientDecorr round-trips in `roundtrip_tests.rs`
+    (RGB24 7×5 CustomV2 non-aligned width, RGB32 6×4 V1xCompat, an
+    RGB32 per-row-varying-alpha frame, and an RGB24 interlaced
+    height-300 frame), and by every pre-existing GradientDecorr
+    round-trip + the AVI-lockstep tests. Lib test count: 126 → 135.
+
 - Round-100: fused LEFT+decorrelation encoder residual path.
   - `predict::forward_left_decorr_residuals`: computes the
     decorrelated-LEFT residuals (`G` identity, `B−G`, `R−G`, and —

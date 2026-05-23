@@ -176,6 +176,99 @@ fn roundtrip_rgb32_gradient_decorr_4x4() {
     assert_eq!(out.pixels, pixels);
 }
 
+// ───────── round 103: fused decorrelation+gradient encoder path ─────────
+//
+// Round 103 folds the RGB decorrelation transform into the
+// forward-gradient subtract for method 0x41 (GradientDecorr), reading
+// un-transformed `pixels` directly so the round-95 `working_owned`
+// decorrelated buffer is no longer allocated (spec/03 §2.4.2 — the
+// gradient pre-pass reads only decorrelated channel values). The byte
+// identity of the fused vs two-pass gradient pre-pass is unit-tested in
+// `predict.rs`; these are end-to-end wire round-trips on non-aligned
+// widths and a per-row-varying-alpha RGB32 frame, complementing the
+// small-size GradientDecorr round-trips above.
+
+#[test]
+fn round103_roundtrip_rgb24_gradient_decorr_7x5_custom_v2() {
+    // Width 7 → row_bytes 21 (not u64-aligned); exercises the
+    // forward_decorr_gradient_subtract tail path on every row.
+    let pixels = synth_rgb24(7, 5);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb24,
+        Method::GradientDecorr,
+        7,
+        5,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round103_roundtrip_rgb32_gradient_decorr_6x4_v1x_compat() {
+    let pixels = synth_rgb32(6, 4);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb32,
+        Method::GradientDecorr,
+        6,
+        4,
+        &pixels,
+        ExtradataMode::V1xCompat,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round103_roundtrip_rgb32_gradient_decorr_per_row_alpha() {
+    // Alpha varies per row (constant within a row) — confirms the fused
+    // GradientDecorr path keeps alpha identity in BOTH the decorrelation
+    // step and the gradient subtract (spec/03 §2.4 Validator note).
+    let (w, h) = (5usize, 6usize);
+    let mut pixels = vec![0u8; w * 4 * h];
+    for row in 0..h {
+        for col in 0..w {
+            let off = (row * w + col) * 4;
+            pixels[off] = ((row * 3 + col * 9) & 0xFF) as u8; // B
+            pixels[off + 1] = ((row * 7 + col * 5) & 0xFF) as u8; // G
+            pixels[off + 2] = ((row * 11 + col) & 0xFF) as u8; // R
+            pixels[off + 3] = ((row * 16) & 0xFF) as u8; // A: per-row
+        }
+    }
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb32,
+        Method::GradientDecorr,
+        w as u32,
+        h as u32,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round103_roundtrip_rgb24_gradient_decorr_interlaced_300() {
+    // Height 300 > 288 trips the interlaced field-stride=2 path; each
+    // field is GradientDecorr-encoded through the fused helper.
+    let pixels = synth_rgb24(8, 300);
+    let (cfg, frame) = encode_for_test_with_mode(
+        PixelFamily::Rgb24,
+        Method::GradientDecorr,
+        8,
+        300,
+        &pixels,
+        ExtradataMode::ClassicV2,
+    )
+    .unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
 // ───────── v2.x custom (computed length tables) ─────────
 //
 // The CustomV2 path skips the classic blobs entirely and synthesises
