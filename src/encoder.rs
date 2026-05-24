@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
 use crate::predict::{
     forward_decorr_gradient_subtract, forward_gradient_subtract, forward_left_decorr_residuals,
-    gradient_predictor, is_interlaced_height, median3,
+    forward_median_subtract, is_interlaced_height,
 };
 use crate::tables::{
     classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
@@ -678,47 +678,37 @@ fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Res
     if w % 2 != 0 {
         return Err(Error::invalid("encoder: YUY2 width must be even"));
     }
-    // Round 95: avoid the `pixels.to_vec()` clone when no gradient
-    // pre-pass is needed by reading directly from `pixels` for the
-    // per-channel-stride subtract. For Gradient we still need the
-    // intermediate Vec (the per-channel subtract chain reads earlier
-    // intermediate bytes; an in-place rewrite would corrupt later
-    // reads). The intermediate is now built by `forward_gradient_subtract`
-    // (spec/03 §2.2.2 `@0x10001eab..@0x10001f9e`).
-    let intermediate: Option<Vec<u8>> = if method.predictor() == Predictor::Gradient {
-        let mut iv = vec![0u8; row_bytes * h];
-        forward_gradient_subtract(pixels, &mut iv, row_bytes, h);
-        Some(iv)
-    } else {
-        None
-    };
-    let pred_input: &[u8] = intermediate.as_deref().unwrap_or(pixels);
     let mut residuals = vec![0u8; row_bytes * h];
-    let copy_n = 4.min(pred_input.len());
-    residuals[..copy_n].copy_from_slice(&pred_input[..copy_n]);
-    for i in 4..pred_input.len() {
-        let stride = if i & 1 == 0 { 2 } else { 4 };
-        residuals[i] = pred_input[i].wrapping_sub(pred_input[i - stride]);
-    }
     if method.predictor() == Predictor::Median {
-        // Replace LEFT residuals with MEDIAN residuals for row 1 byte
-        // ≥ 8 + every later row. spec/03 §2.3 / §2.3.2.
-        let row1_start = row_bytes;
-        let row1_median_start = row1_start + 8.min(row_bytes);
-        for pos in row1_median_start..pixels.len() {
-            if pos < row_bytes {
-                continue;
-            }
-            let l = pixels[pos.wrapping_sub(2)];
-            let a = pixels[pos - row_bytes];
-            let al = if pos >= row_bytes + 2 {
-                pixels[pos - row_bytes - 2]
-            } else {
-                0
-            };
-            let g = gradient_predictor(l, a, al);
-            let predictor = median3(l, a, g);
-            residuals[pos] = pixels[pos].wrapping_sub(predictor);
+        // Round 115: the YUY2 forward MEDIAN pre-pass is produced in a
+        // single pass by `forward_median_subtract` (spec/03 §2.3 /
+        // §2.3.2) — LEFT residuals for row 0 + the first 8 wire bytes
+        // of row 1, MEDIAN residuals for the rest. Previously this
+        // computed a full-frame LEFT residual stream and then
+        // overwrote the median region (recomputing the median region's
+        // LEFT residuals only to discard them).
+        forward_median_subtract(pixels, &mut residuals, row_bytes, h);
+    } else {
+        // Round 95: avoid the `pixels.to_vec()` clone when no gradient
+        // pre-pass is needed by reading directly from `pixels` for the
+        // per-channel-stride subtract. For Gradient we still need the
+        // intermediate Vec (the per-channel subtract chain reads earlier
+        // intermediate bytes; an in-place rewrite would corrupt later
+        // reads). The intermediate is now built by `forward_gradient_subtract`
+        // (spec/03 §2.2.2 `@0x10001eab..@0x10001f9e`).
+        let intermediate: Option<Vec<u8>> = if method.predictor() == Predictor::Gradient {
+            let mut iv = vec![0u8; row_bytes * h];
+            forward_gradient_subtract(pixels, &mut iv, row_bytes, h);
+            Some(iv)
+        } else {
+            None
+        };
+        let pred_input: &[u8] = intermediate.as_deref().unwrap_or(pixels);
+        let copy_n = 4.min(pred_input.len());
+        residuals[..copy_n].copy_from_slice(&pred_input[..copy_n]);
+        for i in 4..pred_input.len() {
+            let stride = if i & 1 == 0 { 2 } else { 4 };
+            residuals[i] = pred_input[i].wrapping_sub(pred_input[i - stride]);
         }
     }
     let mut seed = [0u8; 4];

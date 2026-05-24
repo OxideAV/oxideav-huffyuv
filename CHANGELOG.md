@@ -8,6 +8,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-115: YUY2 forward MEDIAN pre-pass factored into a tested
+  `predict.rs` helper (single-pass; eliminates the wasted full-frame
+  LEFT recompute on the median path).
+  - `predict::forward_median_subtract`: the encoder analogue of
+    `inverse_median_post` (spec/03 §2.3 / §2.3.2), matching the
+    round-95 `forward_gradient_subtract` and round-100/103
+    decorrelation-forward factoring. Produces the complete YUY2 median
+    residual stream in a single pass: LEFT residuals for row 0 and the
+    first 8 wire bytes of row 1 (the §2.3.2 MMX-8-byte
+    first-second-row exemption), and MEDIAN residuals
+    (`pixel − median3(L, A, G)` with the §2.3 output offsets
+    `−2 / −row_stride / −row_stride − 2`) for the remaining bytes.
+  - Encoder simplification: the previous `yuy2_residuals` median path
+    computed a full-frame LEFT residual stream and then **overwrote**
+    the median region with median residuals — recomputing the median
+    region's LEFT residuals only to discard them. Round 115 routes the
+    Median predictor through `forward_median_subtract`, computing LEFT
+    only for the exempt region and median directly for the rest, in one
+    traversal.
+  - Wire-identical to round 103: the single-pass output is
+    byte-for-byte equal to the prior two-phase
+    "full-LEFT-then-overwrite" output. Regression-guarded by 5 new
+    unit tests in `predict.rs`
+    (`round115_forward_median_matches_two_phase`,
+    `round115_forward_median_modular_wrap`,
+    `round115_forward_median_height_1_is_all_left`,
+    `round115_forward_median_short_second_row_is_all_left`,
+    `round115_forward_median_roundtrips_via_decoder_model`) plus every
+    pre-existing YUY2 median round-trip and the
+    `lockstep_yuy2_median_classic` AVI-lockstep test. Lib test count:
+    135 → 140.
+
 - Round-103: fused decorrelation+gradient encoder residual path
   (completes the round-100 decorrelation fusion for method `0x41`).
   - `predict::forward_decorr_gradient_subtract`: folds the RGB

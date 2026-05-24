@@ -5,8 +5,10 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 103 — fused decorrelation+gradient encoder residual
-path; round 100 added the fused LEFT+decorrelation path.** Rounds
+**Round 115 — YUY2 forward-median pre-pass factored into a tested
+`predict.rs` helper (single-pass, no wasted LEFT recompute); round
+103 fused the decorrelation+gradient encoder residual path; round
+100 added the fused LEFT+decorrelation path.** Rounds
 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4 (interlace +
 lockstep), 5 (walking-stride encoder memory optimisation), 6
 (predictor RDO + single-symbol fix), 7 (auto-selector residual
@@ -333,6 +335,35 @@ test-only `[dev-dependencies] oxideav-avi`.
   round-trips in `roundtrip_tests.rs`: RGB24 7×5 CustomV2
   non-aligned width, RGB32 6×4 V1xCompat, a per-row-varying-alpha
   RGB32 frame, and an RGB24 interlaced-height-300 frame).
+
+## What works (Round 115)
+
+- **`predict::forward_median_subtract`** — the YUY2 forward MEDIAN
+  pre-pass factored out of the encoder into a dedicated, tested
+  `predict.rs` helper (the encoder analogue of `inverse_median_post`,
+  matching how round 95 factored `forward_gradient_subtract` and
+  rounds 100/103 factored the decorrelation forwards). Produces the
+  complete YUY2 median residual stream in a **single pass** per
+  spec/03 §2.3 / §2.3.2: LEFT residuals for row 0 and the first 8 wire
+  bytes of row 1 (the §2.3.2 MMX-8-byte first-second-row exemption),
+  and MEDIAN residuals (`pixel − median3(L, A, G)` with the §2.3
+  output offsets `−2 / −row_stride / −row_stride − 2`) for the rest.
+- **Wasted-LEFT-recompute eliminated.** The previous `yuy2_residuals`
+  median path ran a full-frame LEFT subtract over the entire frame and
+  then **overwrote** the median region with median residuals —
+  computing the median region's LEFT residuals only to throw them
+  away. Round 115 computes LEFT only for the exempt region and median
+  directly for the rest, in one traversal.
+- Wire-identical to round 103 — the single-pass output is
+  byte-for-byte equal to the prior two-phase
+  "full-LEFT-then-overwrite" output (regression-guarded by
+  `round115_forward_median_matches_two_phase` /
+  `round115_forward_median_modular_wrap`), the height-1 and
+  short-second-row edge cases stay all-LEFT, a decoder-model
+  round-trip reconstructs the source exactly, and every pre-existing
+  YUY2 median round-trip + the `lockstep_yuy2_median_classic`
+  AVI-lockstep test stays green. Lib test count: 135 → 140 (+5
+  round-115 tests in `predict.rs`).
 
 ## Out of scope (deferred)
 

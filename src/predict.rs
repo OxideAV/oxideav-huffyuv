@@ -500,6 +500,89 @@ pub fn forward_decorr_gradient_subtract(
     }
 }
 
+/// Forward MEDIAN pre-pass for YUY2 streams — the encoder analogue of
+/// [`inverse_median_post`] (spec/03 §2.3 + §2.3.2).
+///
+/// Produces the complete YUY2 median residual stream from the raw
+/// `pixels` into `dst`, in a single pass:
+///
+/// - **Row 0** (the §2.3.2 first-row exemption) uses LEFT residuals:
+///   byte 0..4 verbatim (the uncompressed first macropixel), then
+///   `pixels[i] − pixels[i − stride]` with the YUY2 channel stride
+///   (`2` for the Y₁/Y₂ intra-pair byte positions, `4` for the
+///   U/V positions).
+/// - **The first 8 wire bytes of row 1** (the §2.3.2 MMX-8-byte
+///   exemption: "the first 4 pixel / 2 pairs / 8 bytes of the second
+///   row are compressed with predict left") also use LEFT residuals.
+/// - **The rest of row 1 and every later row** use MEDIAN residuals:
+///   `pixels[i] − median3(L, A, G)` where `L = pixels[i − 2]`,
+///   `A = pixels[i − row_bytes]`, `AL = pixels[i − row_bytes − 2]`,
+///   and `G = L + A − AL` (mod 256). The reference samples are the
+///   spec/03 §2.3 output offsets `−2 / −row_stride / −row_stride − 2`,
+///   matching the decode-side median post-pass.
+///
+/// This is the forward counterpart that the decoder reverses with a
+/// full LEFT decode followed by [`inverse_median_post`]: the LEFT
+/// region (row 0 + the 8-byte row-1 exemption) round-trips through the
+/// LEFT inverse alone, and the median region round-trips through the
+/// LEFT inverse followed by the median post-pass.
+///
+/// Earlier encoder code computed a full-frame LEFT residual stream and
+/// then **overwrote** the median region — recomputing the median
+/// region's LEFT residuals only to discard them. This single-pass form
+/// computes LEFT only for the exempt region and median directly for the
+/// rest, and is byte-for-byte identical to the two-phase output
+/// (regression-guarded by `round115_forward_median_matches_two_phase`).
+///
+/// `row_bytes` is the wire-byte stride of one row (= `2 × width` for
+/// YUY2). `dst` must be the same length as `pixels` (= `row_bytes ×
+/// height`).
+pub fn forward_median_subtract(pixels: &[u8], dst: &mut [u8], row_bytes: usize, height: usize) {
+    assert_eq!(pixels.len(), dst.len(), "dst length != pixels length");
+    debug_assert!(
+        row_bytes == 0 || pixels.len() == row_bytes * height,
+        "buffer size != row_bytes * height"
+    );
+    let n = pixels.len();
+    if n == 0 {
+        return;
+    }
+    // LEFT region: row 0 in full, plus the first 8 wire bytes of row 1
+    // (spec/03 §2.3.2). When the frame has only one row, the whole
+    // buffer is LEFT (no median region exists).
+    let median_start = if height < 2 || row_bytes == 0 {
+        n
+    } else {
+        (row_bytes + 8.min(row_bytes)).min(n)
+    };
+    // Uncompressed first macropixel (≤ 4 bytes).
+    let copy_n = 4.min(n);
+    dst[..copy_n].copy_from_slice(&pixels[..copy_n]);
+    // LEFT residuals for the rest of the LEFT region.
+    for i in copy_n..median_start {
+        let stride = if i & 1 == 0 { 2 } else { 4 };
+        dst[i] = pixels[i].wrapping_sub(pixels[i - stride]);
+    }
+    // MEDIAN residuals for the median region. All references are into
+    // `pixels` (the original raster), so `AL` is well defined for every
+    // `pos >= row_bytes + 2`; the §2.3.2 exemption guarantees
+    // `median_start >= row_bytes + 8 >= row_bytes + 2`, so the
+    // below-row-1 `al = 0` fallback is never actually taken here, but
+    // it mirrors `inverse_median_post`'s guard for safety.
+    for pos in median_start..n {
+        let l = pixels[pos.wrapping_sub(2)];
+        let a = pixels[pos - row_bytes];
+        let al = if pos >= row_bytes + 2 {
+            pixels[pos - row_bytes - 2]
+        } else {
+            0
+        };
+        let g = gradient_predictor(l, a, al);
+        let predictor = median3(l, a, g);
+        dst[pos] = pixels[pos].wrapping_sub(predictor);
+    }
+}
+
 /// Spec/02 §2 / spec/05 (planned): the codec engages its
 /// field-stride=2 interlaced path when `biHeight > 288`. The
 /// threshold is the i386 build's compiled-in constant `0x120` (= 288)
@@ -953,6 +1036,156 @@ mod tests {
         // recon now holds the decorrelated buffer (B−G, G, R−G); invert
         // decorrelation in place.
         inverse_rgb_decorr_bgr(&mut recon);
+        assert_eq!(recon, pixels);
+    }
+
+    /// Reference two-phase YUY2 forward MEDIAN: compute a full-frame
+    /// LEFT residual stream (4-byte raw seed + per-channel-stride
+    /// subtract), then OVERWRITE the median region (row 1 byte ≥ 8 +
+    /// every later row) with MEDIAN residuals. This is exactly what the
+    /// encoder did before round 115 inlined the two phases; the
+    /// single-pass `forward_median_subtract` must match it byte-for-byte.
+    fn naive_two_phase_forward_median(pixels: &[u8], row_bytes: usize, height: usize) -> Vec<u8> {
+        let mut residuals = vec![0u8; pixels.len()];
+        // Phase 1: full-frame LEFT.
+        let copy_n = 4.min(pixels.len());
+        residuals[..copy_n].copy_from_slice(&pixels[..copy_n]);
+        for i in 4..pixels.len() {
+            let stride = if i & 1 == 0 { 2 } else { 4 };
+            residuals[i] = pixels[i].wrapping_sub(pixels[i - stride]);
+        }
+        // Phase 2: overwrite the median region.
+        if height >= 2 && row_bytes > 0 {
+            let row1_median_start = row_bytes + 8.min(row_bytes);
+            for pos in row1_median_start..pixels.len() {
+                if pos < row_bytes {
+                    continue;
+                }
+                let l = pixels[pos.wrapping_sub(2)];
+                let a = pixels[pos - row_bytes];
+                let al = if pos >= row_bytes + 2 {
+                    pixels[pos - row_bytes - 2]
+                } else {
+                    0
+                };
+                let g = gradient_predictor(l, a, al);
+                let predictor = median3(l, a, g);
+                residuals[pos] = pixels[pos].wrapping_sub(predictor);
+            }
+        }
+        residuals
+    }
+
+    #[test]
+    fn round115_forward_median_matches_two_phase() {
+        // 8×6 YUY2 (row_bytes = 16, 6 rows) — large enough to exercise
+        // the row-0 LEFT region, the 8-byte row-1 exemption, and several
+        // full median rows.
+        let row_bytes = 16usize;
+        let height = 6usize;
+        let pixels: Vec<u8> = (0..(row_bytes * height))
+            .map(|x| ((x * 37 + 11) ^ 0x5C) as u8)
+            .collect();
+        let mut fused = vec![0u8; pixels.len()];
+        forward_median_subtract(&pixels, &mut fused, row_bytes, height);
+        let reference = naive_two_phase_forward_median(&pixels, row_bytes, height);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round115_forward_median_modular_wrap() {
+        // Pixels chosen so the median predictor and the residual both
+        // wrap mod-256.
+        let row_bytes = 8usize;
+        let height = 3usize;
+        let pixels: Vec<u8> = vec![
+            // row 0
+            0xF0, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, // row 1
+            0x05, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, // row 2
+            0xFF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        ];
+        let mut fused = vec![0u8; pixels.len()];
+        forward_median_subtract(&pixels, &mut fused, row_bytes, height);
+        let reference = naive_two_phase_forward_median(&pixels, row_bytes, height);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round115_forward_median_height_1_is_all_left() {
+        // One row → no row above; the whole buffer is LEFT residuals.
+        let row_bytes = 8usize;
+        let pixels: Vec<u8> = vec![0x10, 0x20, 0x30, 0x40, 0x55, 0x66, 0x77, 0x88];
+        let mut fused = vec![0u8; pixels.len()];
+        forward_median_subtract(&pixels, &mut fused, row_bytes, 1);
+        // First 4 bytes raw, rest LEFT (stride 2 for even i, 4 for odd).
+        assert_eq!(&fused[..4], &pixels[..4]);
+        for i in 4..pixels.len() {
+            let stride = if i & 1 == 0 { 2 } else { 4 };
+            assert_eq!(fused[i], pixels[i].wrapping_sub(pixels[i - stride]));
+        }
+    }
+
+    #[test]
+    fn round115_forward_median_short_second_row_is_all_left() {
+        // Two rows but the median region is empty: with row_bytes = 8,
+        // the 8-byte row-1 exemption covers the whole of row 1, so every
+        // byte is LEFT and the median post-pass is a no-op. Matches the
+        // two-phase reference (which leaves the median region untouched).
+        let row_bytes = 8usize;
+        let height = 2usize;
+        let pixels: Vec<u8> = (0..(row_bytes * height))
+            .map(|x| (x * 13 + 3) as u8)
+            .collect();
+        let mut fused = vec![0u8; pixels.len()];
+        forward_median_subtract(&pixels, &mut fused, row_bytes, height);
+        let reference = naive_two_phase_forward_median(&pixels, row_bytes, height);
+        assert_eq!(fused, reference);
+    }
+
+    #[test]
+    fn round115_forward_median_roundtrips_via_decoder_model() {
+        // forward_median_subtract → the decoder's exact YUY2 median
+        // inverse (LEFT over row 0 + first 8 bytes of row 1, median ADD
+        // for the rest) must reconstruct the original pixels. This
+        // mirrors `decoder::inverse_yuy2_median` (spec/03 §2.3.2): the
+        // LEFT region residuals are `pixel − left` (reversed by LEFT
+        // add) and the median region residuals are `pixel − median`
+        // (reversed by adding the median predictor).
+        let row_bytes = 16usize;
+        let height = 5usize;
+        let pixels: Vec<u8> = (0..(row_bytes * height))
+            .map(|x| ((x * 53 + 7) ^ 0x2A) as u8)
+            .collect();
+        let mut recon = vec![0u8; pixels.len()];
+        forward_median_subtract(&pixels, &mut recon, row_bytes, height);
+
+        // YUY2 LEFT add over a byte range, using the per-byte strides
+        // (−2 for the Y₁/Y₂ positions, −4 for U/V).
+        fn left_range(out: &mut [u8], begin: usize, end: usize) {
+            for i in begin..end {
+                let stride = if i & 1 == 0 { 2 } else { 4 };
+                out[i] = out[i].wrapping_add(out[i - stride]);
+            }
+        }
+        let len = recon.len();
+        // Row 0 LEFT (bytes 4..row_bytes; first 4 are the raw seed).
+        left_range(&mut recon, 4, row_bytes.min(len));
+        // First 8 bytes of row 1 LEFT (the §2.3.2 exemption).
+        let row1_left_end = (row_bytes + 8).min(len);
+        left_range(&mut recon, row_bytes, row1_left_end);
+        // Median ADD for the rest.
+        for pos in row1_left_end..recon.len() {
+            let l = recon[pos - 2];
+            let a = recon[pos - row_bytes];
+            let al = if pos >= row_bytes + 2 {
+                recon[pos - row_bytes - 2]
+            } else {
+                0
+            };
+            let g = gradient_predictor(l, a, al);
+            let predictor = median3(l, a, g);
+            recon[pos] = recon[pos].wrapping_add(predictor);
+        }
         assert_eq!(recon, pixels);
     }
 }
