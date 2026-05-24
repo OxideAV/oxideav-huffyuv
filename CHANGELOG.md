@@ -6,6 +6,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-huffyuv/releases/tag/v0.0.2) - 2026-05-24
+
+### Other
+
+- factor YUY2 forward-median into single-pass predict helper (round 115)
+- fuse decorrelation into the GradientDecorr gradient pre-pass (round 103)
+- Round 100: fused LEFT+decorrelation encoder residual path
+- Round 95: encoder SWAR forward gradient + drop redundant intermediate clones
+- Round 91: flat overflow_entries slow path + SWAR gradient post-pass
+- Round 7: auto-selector residual reuse + V1xCompat OnceLock cache
+- Round 6: encoder predictor auto-selection (bit-cost RDO)
+- Round 5 docs: fix memory-reduction headline (~1.5x, not ~2x)
+- Round 5: walking-stride interlaced encoder (~2x memory reduction)
+- Round 4 fixup: lockstep tests skip on published oxideav-avi 0.0.5
+- Round 4: interlaced field-stride=2 + oxideav-avi container lockstep
+- drop in-tree AVI walker — container handling lives in oxideav-avi
+- Round-3 push: decoder fast-LUT + AVI walker + v1.x compat coverage
+- Round-2 encoder push: full HuffYUV/FFVHuff frame encoder
+- Vendor table data into src/tables_data/ for crate-self-contained build
+- Round-1 8-bit decoder for HuffYUV/FFVHuff streams
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Added
 
 - Round-115: YUY2 forward MEDIAN pre-pass factored into a tested
