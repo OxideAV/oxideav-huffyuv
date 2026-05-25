@@ -77,7 +77,13 @@ fn decode_frame_interlaced(
         tables,
     )?;
     let bot_frame = if bot_h > 0 {
-        let rest = &frame_bytes[top_consumed..];
+        // A malformed/truncated top field can leave the bit cursor past
+        // the end of the chunk, so `top_consumed` may exceed the buffer
+        // length; clamp the split point to avoid a slice-bounds panic.
+        // The bottom field then sees the (possibly empty) remainder and
+        // its own length guard rejects it cleanly.
+        let split = top_consumed.min(frame_bytes.len());
+        let rest = &frame_bytes[split..];
         let (bf, _) = decode_field(
             config.family,
             config.method.predictor(),
@@ -210,6 +216,14 @@ fn decode_yuy2_field(
     }
     let row_bytes = width_us * 2; // Y₁ U Y₂ V per 2 px = 4 bytes per pair × (width/2) pairs = width × 2.
     let total_bytes = row_bytes * height_us;
+    // A degenerate frame (zero width or height) leaves the output
+    // raster too small to even hold the 4-byte uncompressed seed pixel
+    // written below; reject it before the slice write would panic.
+    if total_bytes < 4 {
+        return Err(Error::invalid(
+            "YUY2 frame: degenerate dimensions (need ≥ 1 macropixel)",
+        ));
+    }
     if frame_bytes.len() < 4 {
         return Err(Error::invalid(
             "YUY2 frame: missing 4-byte uncompressed pixel",
@@ -286,6 +300,14 @@ fn decode_rgb24_field(
     let height_us = height as usize;
     let row_bytes = width_us * 3;
     let total_bytes = row_bytes * height_us;
+    // A degenerate frame (zero width or height) leaves the output
+    // raster too small to hold the first 3-byte BGR pixel written
+    // below; reject it before the indexed writes would panic.
+    if total_bytes < 3 {
+        return Err(Error::invalid(
+            "RGB24 frame: degenerate dimensions (need ≥ 1 pixel)",
+        ));
+    }
     if frame_bytes.len() < 4 {
         return Err(Error::invalid(
             "RGB24 frame: missing 4-byte uncompressed pixel",
@@ -382,6 +404,14 @@ fn decode_rgb32_field(
     let height_us = height as usize;
     let row_bytes = width_us * 4;
     let total_bytes = row_bytes * height_us;
+    // A degenerate frame (zero width or height) leaves the output
+    // raster too small to hold the first 4-byte BGRA pixel written
+    // below; reject it before the slice write would panic.
+    if total_bytes < 4 {
+        return Err(Error::invalid(
+            "RGB32 frame: degenerate dimensions (need ≥ 1 pixel)",
+        ));
+    }
     if frame_bytes.len() < 4 {
         return Err(Error::invalid(
             "RGB32 frame: missing 4-byte uncompressed pixel",
@@ -528,5 +558,70 @@ fn inverse_yuy2_median(out: &mut [u8], row_bytes: usize) {
             out[pos] = out[pos].wrapping_add(predictor);
             pos += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod degenerate_dims_tests {
+    //! Regression coverage for fuzz-found degenerate-dimension crashes.
+    //!
+    //! A `BITMAPINFOHEADER` may declare a zero width or height (or a
+    //! width/height pair whose product is too small to hold even the
+    //! uncompressed seed pixel). Earlier the field decoders guarded the
+    //! *input* frame length (`< 4`) but allocated the *output* raster as
+    //! `w * h * bpp` and then wrote the seed pixel into it — so a zero
+    //! raster panicked on the slice write rather than returning `Err`.
+    //! These cases must return `Err`, never panic.
+
+    use super::*;
+    use crate::header::{Method, PixelFamily, StreamConfig};
+
+    fn cfg(family: PixelFamily, method: Method, width: u32, height: u32) -> StreamConfig {
+        StreamConfig {
+            family,
+            method,
+            width,
+            height,
+            has_extradata: false,
+            extradata_tables: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn yuy2_zero_height_is_err_not_panic() {
+        let c = cfg(PixelFamily::Yuy2, Method::Left, 4, 0);
+        let frame = [0u8; 64];
+        assert!(decode_frame(&c, &frame).is_err());
+    }
+
+    #[test]
+    fn yuy2_zero_width_is_err_not_panic() {
+        let c = cfg(PixelFamily::Yuy2, Method::Left, 0, 4);
+        let frame = [0u8; 64];
+        assert!(decode_frame(&c, &frame).is_err());
+    }
+
+    #[test]
+    fn rgb24_zero_height_is_err_not_panic() {
+        let c = cfg(PixelFamily::Rgb24, Method::Left, 4, 0);
+        let frame = [0u8; 64];
+        assert!(decode_frame(&c, &frame).is_err());
+    }
+
+    #[test]
+    fn rgb32_zero_height_is_err_not_panic() {
+        let c = cfg(PixelFamily::Rgb32, Method::Left, 4, 0);
+        let frame = [0u8; 64];
+        assert!(decode_frame(&c, &frame).is_err());
+    }
+
+    #[test]
+    fn interlaced_truncated_top_field_no_panic() {
+        // height > 288 engages the interlaced path; a tiny frame body
+        // makes the top field over-consume so the bottom-field split
+        // point would exceed the buffer. Must not panic.
+        let c = cfg(PixelFamily::Yuy2, Method::Left, 2, 290);
+        let frame = [0u8; 8];
+        let _ = decode_frame(&c, &frame); // Ok or Err, never panic.
     }
 }

@@ -6,6 +6,48 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round-134: `fuzz/` cargo-fuzz harness (`decode_huffyuv`) driving the
+  full decode chain — `StreamConfig::parse_bitmapinfoheader`
+  (`BITMAPINFOHEADER` + 4-byte extradata prefix + RLE-compressed
+  Huffman length tables) followed by `decode_frame` (canonical-Huffman
+  build, per-pixel codeword read, LEFT / GRADIENT / MEDIAN predictor
+  inverse, RGB decorrelation inverse). The fuzz buffer is split
+  `[u16-LE strf-len][strf][frame body]` so a single mutation can perturb
+  either the configuration or the frame body; declared rasters above a
+  16 MiB cap are skipped in the harness (a resource request, not a
+  logic bug). Seeded from six encoder-emitted valid streams (YUY2 /
+  RGB24 / RGB32 across LEFT / MEDIAN / decorr methods, v2.x-classic /
+  v2.x-custom / v1.x-compat) plus three fuzz-found crash regressions.
+  Daily CI via `.github/workflows/fuzz.yml` (org `crate-fuzz.yml`,
+  30-minute budget). 60s local baseline post-fix: ~21.7k execs,
+  `oom/timeout/crash: 0/0/0`.
+
+### Fixed
+
+- Round-134 (fuzz): two input-driven panics found by the new
+  `decode_huffyuv` harness, both turned into clean `Err` returns:
+  - **Degenerate output dimensions.** `decode_{yuy2,rgb24,rgb32}_field`
+    guarded the *input* frame length (`< 4`) but allocated the *output*
+    raster as `width * height * bpp` and then wrote the uncompressed
+    seed pixel into it. A zero width or height produced a raster smaller
+    than the seed, panicking on the slice/index write
+    (`decoder.rs:219` `range end index 4 out of range for slice of
+    length 0`). Now each field decoder rejects a raster too small to
+    hold its seed pixel. Also clamped the interlaced bottom-field split
+    point (`frame_bytes[top_consumed..]`) so an over-consuming top field
+    cannot index past the buffer.
+  - **Oversized declared `biSize` with a short buffer.** On the
+    `low3 != 0` method path the `biSize <= strf.len()` check was
+    skipped, so a header declaring `biSize > 0x29` while supplying only
+    40 bytes indexed the missing bpp-override byte at `+0x29`
+    (`header.rs:236` `index out of bounds: the len is 40 but the index
+    is 41`). The override read now gates on the real buffer length too.
+  - Locked in by 5 `decoder.rs` regression tests
+    (`degenerate_dims_tests`) and 1 `header.rs` regression test
+    (`oversized_bisize_with_short_buffer_no_panic`).
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-huffyuv/releases/tag/v0.0.2) - 2026-05-24
 
 ### Other

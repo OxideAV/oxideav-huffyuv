@@ -1,0 +1,20 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. HuffYUV's
+# decoder (BITMAPINFOHEADER + RLE-Huffman-table parse, canonical-Huffman
+# build, then per-pixel predictor inverse) is the attack surface; there
+# is no external library oracle worth pulling in (and the clean-room
+# wall bars any reference codec source anyway), so this is a decode-only
+# panic-free harness: one target gets the whole 30-minute budget.
+
+on:
+  schedule:
+    - cron: "41 6 * * *"   # daily 06:41 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

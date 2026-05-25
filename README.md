@@ -365,6 +365,31 @@ test-only `[dev-dependencies] oxideav-avi`.
   AVI-lockstep test stays green. Lib test count: 135 → 140 (+5
   round-115 tests in `predict.rs`).
 
+## What works (Round 134)
+
+- **Fuzz harness** (`fuzz/fuzz_targets/decode_huffyuv.rs`) — a
+  cargo-fuzz target driving the full decode chain
+  (`parse_bitmapinfoheader` → `decode_frame`) on arbitrary bytes,
+  framed `[u16-LE strf-len][strf][frame body]` so one mutation can hit
+  either the header/Huffman-table config or the per-frame body.
+  Declared rasters above a 16 MiB cap are skipped in the harness (an
+  expected resource request, not a logic bug). Seeded with six
+  encoder-emitted valid streams plus the fuzz-found crash regressions;
+  daily CI via `.github/workflows/fuzz.yml`. 60s baseline post-fix:
+  ~21.7k execs, zero crashes / OOMs / timeouts.
+- **Two input-driven panics fixed**, both now clean `Err`:
+  - Zero-width/height frames whose output raster was smaller than the
+    uncompressed seed pixel panicked on the seed write in
+    `decode_{yuy2,rgb24,rgb32}_field`; each now rejects a too-small
+    raster, and the interlaced bottom-field split point is clamped
+    against the buffer length.
+  - A header declaring `biSize > 0x29` on the `low3 != 0` method path
+    (which skips the `biSize <= len` check) read the bpp-override byte
+    at `+0x29` out of bounds; the read now gates on the real buffer
+    length too.
+  - 6 regression tests added (5 in `decoder.rs`, 1 in `header.rs`). Lib
+    test count: 140 → 146.
+
 ## Out of scope (deferred)
 
 - 10/12-bit FFVHuff family — explicitly excluded from the

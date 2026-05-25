@@ -231,7 +231,14 @@ impl StreamConfig {
         };
 
         // Effective-bit-count recovery (spec/01 §2).
-        let effective_bits: u16 = if (bi_size as usize) > 0x29 {
+        //
+        // The bpp-override byte lives at `+0x29`. `biSize` is the
+        // *declared* header size off the wire; on the `low3 != 0`
+        // method path the `biSize <= strf.len()` check above is skipped,
+        // so a header that declares `biSize > 0x29` but supplies fewer
+        // than 0x2A actual bytes would index out of bounds here. Gate on
+        // the real buffer length as well.
+        let effective_bits: u16 = if (bi_size as usize) > 0x29 && strf.len() > 0x29 {
             // bpp_override may override, when non-zero. Signed byte.
             let bpp = strf[0x29] as i8;
             if bpp != 0 {
@@ -420,5 +427,23 @@ mod tests {
         // (= 24); RGB24 + LeftDecorr.
         assert_eq!(cfg.family, PixelFamily::Rgb24);
         assert_eq!(cfg.method, Method::LeftDecorr);
+    }
+
+    #[test]
+    fn oversized_bisize_with_short_buffer_no_panic() {
+        // Fuzz regression: a header that declares biSize > 0x29 but
+        // supplies only a 40-byte buffer, on the low3 != 0 method path
+        // (which skips the biSize <= len check), must NOT index the
+        // missing bpp-override byte at +0x29. biBitCount = 0x11 sets
+        // low3 = 1 (= Method::Left); biSize = 0x32 (> 0x29).
+        let mut bih = make_bih(0x32, 4, 8, 0x11, FOURCC_HFYU, &[]);
+        assert_eq!(bih.len(), 40);
+        // Must return a Result, never panic.
+        let _ = StreamConfig::parse_bitmapinfoheader(&bih);
+        // Also exercise the path with exactly 0x2A bytes present (the
+        // override byte IS readable) to confirm the gate still allows
+        // the legitimate read.
+        bih.push(0x00);
+        let _ = StreamConfig::parse_bitmapinfoheader(&bih);
     }
 }

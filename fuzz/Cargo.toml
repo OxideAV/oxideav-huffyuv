@@ -1,0 +1,38 @@
+[package]
+name = "oxideav-huffyuv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# HuffYUV's decoder is the part worth fuzzing: a `BITMAPINFOHEADER` +
+# extradata blob (method byte, effective-bit-count override, then three
+# RLE-compressed Huffman length tables) configures a canonical-Huffman
+# build, after which an arbitrary per-frame body is read codeword by
+# codeword and run through the LEFT / GRADIENT / MEDIAN predictor
+# inverse. There is no external library worth pulling in as a
+# cross-decode oracle (and the clean-room wall bars any reference codec
+# source anyway), so this fuzz crate is **decode-only**: split the fuzz
+# buffer into an extradata prefix and a frame body, feed both at the
+# real `parse_bitmapinfoheader` + `decode_frame` entry points, and
+# assert neither path panics / aborts / overflows / indexes OOB.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-huffyuv]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_huffyuv"
+path = "fuzz_targets/decode_huffyuv.rs"
+test = false
+doc = false
