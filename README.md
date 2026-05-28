@@ -5,10 +5,13 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 115 — YUY2 forward-median pre-pass factored into a tested
-`predict.rs` helper (single-pass, no wasted LEFT recompute); round
-103 fused the decorrelation+gradient encoder residual path; round
-100 added the fused LEFT+decorrelation path.** Rounds
+**Round 174 — Criterion bench harness (`benches/{decode,encode,roundtrip}.rs`,
+22 scenarios) lands so future optimisation rounds get a
+directly-comparable per-scenario baseline; round 134 added the
+cargo-fuzz harness + fixed 2 input-driven panics; round 115 factored
+the YUY2 forward-median pre-pass into a tested `predict.rs` helper;
+round 103 fused the decorrelation+gradient encoder residual path;
+round 100 added the fused LEFT+decorrelation path.** Rounds
 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4 (interlace +
 lockstep), 5 (walking-stride encoder memory optimisation), 6
 (predictor RDO + single-symbol fix), 7 (auto-selector residual
@@ -389,6 +392,37 @@ test-only `[dev-dependencies] oxideav-avi`.
     length too.
   - 6 regression tests added (5 in `decoder.rs`, 1 in `header.rs`). Lib
     test count: 140 → 146.
+
+## What works (Round 174)
+
+- **Criterion bench harness** (`benches/decode.rs`, `benches/encode.rs`,
+  `benches/roundtrip.rs`) covering 22 representative
+  `(family, method, extradata-mode, raster)` scenarios — chosen to
+  mirror the README's "measured" headline numbers from rounds 3, 7,
+  91, 95, 100, 103, and 115 so future optimisation rounds can read a
+  regression directly off the criterion delta. Inputs synthesised on
+  the fly from a deterministic xorshift32 + diagonal-gradient pattern
+  (no committed binary fixtures, no `docs/` dependency, no
+  third-party samples). Wired via `[dev-dependencies] criterion =
+  "0.5"` + three `[[bench]] harness = false` entries; the lib test
+  surface (146 tests) is unchanged.
+- **Coverage**:
+  - **decode** (7): YUY2 320×240 LEFT/Gradient/Median ClassicV2,
+    YUY2 1280×720 LEFT ClassicV2, YUY2 320×240 LEFT V1xCompat, RGB24
+    320×240 LeftDecorr ClassicV2, RGB32 320×240 GradientDecorr
+    ClassicV2.
+  - **encode** (10): eight fixed-method ClassicV2 / V1xCompat
+    scenarios that the README headline numbers covered, plus two
+    `MethodSelection::Auto` + CustomV2 scenarios (YUY2 / RGB24).
+  - **roundtrip** (5): end-to-end encode → parse-BIH → decode
+    pipeline health checks.
+- **Local `--quick` smoke (M1, warm-up 1 s, measurement 2 s)**: all
+  22 benches execute cleanly; representative throughputs ~100-110
+  MiB/s on decode and ~240-325 MiB/s on encode at 320×240 / 1280×720.
+  The numbers aren't a regression baseline yet (README headlines
+  came from 500-iter `cargo bench` runs, not Criterion `--quick`),
+  but `cargo bench -p oxideav-huffyuv` now produces directly
+  comparable per-scenario figures for the next optimisation round.
 
 ## Out of scope (deferred)
 

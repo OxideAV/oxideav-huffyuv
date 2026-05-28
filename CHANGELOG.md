@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-174: `benches/` Criterion harness (`decode`, `encode`,
+  `roundtrip`) covering 22 representative
+  `(pixel-family, method, extradata-mode, raster)` scenarios. Inputs
+  are synthesised on the fly with a deterministic xorshift32 +
+  diagonal-gradient pattern, so the benches stay self-contained (no
+  committed binary fixtures, no `docs/` dependency). Coverage mirrors
+  the README's "measured" headline scenarios so a future round can
+  read a regression directly off the criterion delta:
+  - **decode** (7 scenarios): YUY2 320×240 LEFT/Gradient/Median
+    ClassicV2, YUY2 1280×720 LEFT ClassicV2, YUY2 320×240 LEFT
+    V1xCompat (the round-3 fast-LUT, round-91 SWAR gradient post-pass,
+    round-91 flat overflow-entries slow path, and round-7 OnceLock
+    table cache all surface here).
+  - **encode** (10 scenarios): the eight ClassicV2 / V1xCompat fixed
+    methods that the README quoted ms/frame numbers for plus two
+    `MethodSelection::Auto` + CustomV2 scenarios (YUY2 + RGB24).
+  - **roundtrip** (5 scenarios): end-to-end encode → parse-BIH →
+    decode pipeline health check.
+  - Wired via `[dev-dependencies] criterion = "0.5"` + three
+    `[[bench]] harness = false` entries. Local `--quick` run on M1
+    (warm-up 1 s, measurement 2 s) confirms all 22 benches execute
+    cleanly with representative throughputs of ~100-110 MiB/s on
+    decode and ~240-325 MiB/s on encode at 320×240 / 1280×720 — the
+    figures aren't a regression baseline yet (the README's reference
+    numbers came from 500-iter `cargo bench` runs, not Criterion's
+    `--quick` mode), but the same `cargo bench -p oxideav-huffyuv`
+    invocation now produces directly comparable per-scenario
+    numbers for future optimisation rounds.
+
 - Round-134: `fuzz/` cargo-fuzz harness (`decode_huffyuv`) driving the
   full decode chain — `StreamConfig::parse_bitmapinfoheader`
   (`BITMAPINFOHEADER` + 4-byte extradata prefix + RLE-compressed
