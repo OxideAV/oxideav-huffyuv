@@ -512,14 +512,12 @@ fn inverse_yuy2_left_range(out: &mut [u8], begin: usize, end: usize) {
     if end <= begin {
         return;
     }
-    let mut i = begin;
-    while i < end {
-        match i & 3 {
-            0 | 2 => out[i] = out[i].wrapping_add(out[i - 2]),
-            _ => out[i] = out[i].wrapping_add(out[i - 4]),
-        }
-        i += 1;
-    }
+    // Round 181: route through the branch-free macropixel-step
+    // helper (spec/03 §2.1.1, four-channel Y₁ / U / Y₂ / V body)
+    // instead of the per-byte `i & 3` switch. Bit-identical output;
+    // see `predict::inverse_yuy2_left_macropixel` for the spec
+    // citation + equivalence regression test.
+    crate::predict::inverse_yuy2_left_macropixel(out, begin, end);
 }
 
 /// YUY2 MEDIAN inverse: spec/03 §2.3.2. LEFT-predicts row 0 + the

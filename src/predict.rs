@@ -643,6 +643,190 @@ pub fn interleave_fields(top: &[u8], bot: &[u8], row_bytes: usize, height: usize
     out
 }
 
+/// YUY2 LEFT inverse, byte range `[begin, end)`, in place.
+///
+/// spec/03 §2.1.1: within each 4-byte macropixel `Y₁ U Y₂ V`, the
+/// LEFT predictor reads at the byte-position-dependent offsets
+/// `-2 / -4 / -2 / -4` (Y₁ ← previous-macropixel Y₂; U ← previous-
+/// macropixel U; Y₂ ← *same*-macropixel Y₁ (intra-pair); V ←
+/// previous-macropixel V). The decoder's pre-existing
+/// `inverse_yuy2_left_range` walked the buffer one byte at a time,
+/// switching the lookback stride on every iteration via `i & 3`:
+///
+/// ```text
+///   for i in begin..end {
+///       match i & 3 {
+///           0 | 2 => out[i] = out[i].wrapping_add(out[i - 2]),
+///           _     => out[i] = out[i].wrapping_add(out[i - 4]),
+///       }
+///   }
+/// ```
+///
+/// Round 181 rewrites this as the **macropixel-step form** documented
+/// at spec/03 §2.1.1 `@0x100020f4..@0x1000210e` (a four-step Y₁ / U /
+/// Y₂ / V body that advances one whole 4-byte macropixel per outer
+/// iteration). The body keeps three byte-wide accumulators
+/// (`prev_y`, `prev_u`, `prev_v`) and updates them in sequence —
+/// `Y₁ += prev_y` (= previous-macropixel Y₂), `prev_y = Y₁`, `U +=
+/// prev_u`, `prev_u = U`, `Y₂ += prev_y` (= just-reconstructed
+/// intra-pair Y₁), `prev_y = Y₂`, `V += prev_v`, `prev_v = V`. No
+/// per-iteration `i & 3` branch; the inner loop is a fixed
+/// straight-line 8-add / 4-store sequence the compiler can schedule
+/// freely.
+///
+/// `begin` must be a multiple of 4 and at least 4 (so the seed
+/// macropixel at indices 0..4 sits below `begin`). All current
+/// callers (the full-frame YUY2 LEFT and the median row-0 / row-1
+/// LEFT-exemption walks) honour both invariants because YUY2 wire
+/// rows are 4-byte aligned (`row_bytes = 2 × width`, width is
+/// even). `end - begin` may be any value ≥ 0; a tail of 1 / 2 / 3
+/// bytes after the last whole macropixel is handled by a small
+/// scalar fall-through that uses the same channel-stride choices
+/// as the macropixel body.
+///
+/// Bit-identical to the prior per-byte-branch loop — regression
+/// guarded by [`tests::round181_yuy2_left_macropixel_matches_branchy`]
+/// across full-frame, single-row, and row-1-first-8-bytes ranges.
+pub fn inverse_yuy2_left_macropixel(out: &mut [u8], begin: usize, end: usize) {
+    debug_assert!(begin >= 4, "LEFT seed macropixel sits at indices 0..4");
+    debug_assert!(begin % 4 == 0, "begin must align to a macropixel boundary");
+    let end = end.min(out.len());
+    if end <= begin {
+        return;
+    }
+    // Seed the three rolling channel accumulators from the
+    // already-reconstructed bytes immediately before `begin`. For
+    // `begin = 4 k` with k ≥ 1 the layout at `begin - 4 ..= begin - 1`
+    // is the previous macropixel's `Y₁ U Y₂ V`, so:
+    //   prev_y = out[begin - 2]  (Y₂ of the previous macropixel)
+    //   prev_u = out[begin - 3]  (U)
+    //   prev_v = out[begin - 1]  (V)
+    let mut prev_y = out[begin - 2];
+    let mut prev_u = out[begin - 3];
+    let mut prev_v = out[begin - 1];
+    // Walk whole macropixels with a branch-free 4-byte step.
+    let mut i = begin;
+    let body_end = end - ((end - begin) & 3);
+    while i < body_end {
+        // Y₁ ← Y₁_residual + prev_y (= previous macropixel's Y₂).
+        let y1 = out[i].wrapping_add(prev_y);
+        out[i] = y1;
+        prev_y = y1;
+        // U ← U_residual + prev_u.
+        let u = out[i + 1].wrapping_add(prev_u);
+        out[i + 1] = u;
+        prev_u = u;
+        // Y₂ ← Y₂_residual + prev_y (= just-reconstructed *same*-pair Y₁).
+        let y2 = out[i + 2].wrapping_add(prev_y);
+        out[i + 2] = y2;
+        prev_y = y2;
+        // V ← V_residual + prev_v.
+        let v = out[i + 3].wrapping_add(prev_v);
+        out[i + 3] = v;
+        prev_v = v;
+        i += 4;
+    }
+    // Tail of 1..=3 bytes after the last whole macropixel (only
+    // reachable if (end - begin) % 4 != 0; in practice all callers
+    // pass an aligned end, but the fall-through keeps the helper
+    // robust against future row layouts and matches the prior
+    // per-byte semantics exactly).
+    while i < end {
+        match i & 3 {
+            0 => {
+                out[i] = out[i].wrapping_add(prev_y);
+                prev_y = out[i];
+            }
+            1 => {
+                out[i] = out[i].wrapping_add(prev_u);
+                prev_u = out[i];
+            }
+            2 => {
+                out[i] = out[i].wrapping_add(prev_y);
+                prev_y = out[i];
+            }
+            _ => {
+                out[i] = out[i].wrapping_add(prev_v);
+                prev_v = out[i];
+            }
+        }
+        i += 1;
+    }
+}
+
+/// YUY2 LEFT forward subtract — encoder analogue of
+/// [`inverse_yuy2_left_macropixel`]. Reads `src` (un-modified
+/// pre-pass input — raw pixels for the Left method or the gradient
+/// pre-pass output for the Gradient method) and writes the per-byte
+/// LEFT residuals into `dst`, starting at byte index 4. Bytes 0..4
+/// of `dst` are the verbatim seed macropixel from `src` (= `Y₁ U Y₂
+/// V` of macropixel 0).
+///
+/// Per spec/03 §2.1.1 the YUY2 LEFT residual at byte position `i ≥
+/// 4` is `src[i] − src[i − stride]` where `stride = 2` for `i %
+/// 4 ∈ {0, 2}` (Y channels: intra-pair for `i % 4 == 2`,
+/// previous-pair Y₂ for `i % 4 == 0`) and `stride = 4` for `i % 4
+/// ∈ {1, 3}` (U / V channels — previous-macropixel same-channel).
+/// The pre-existing encoder loop walked one byte at a time, branching
+/// on `i & 1` per iteration:
+///
+/// ```text
+///   for i in 4..pred_input.len() {
+///       let stride = if i & 1 == 0 { 2 } else { 4 };
+///       dst[i] = src[i].wrapping_sub(src[i - stride]);
+///   }
+/// ```
+///
+/// Round 181 unrolls the loop to the four-channel macropixel body
+/// documented at spec/03 §2.1.1 (Y₁ / U / Y₂ / V), reading both
+/// `src[i]` and `src[i − stride]` directly from `src` (no
+/// `src.to_vec()` clone needed because the subtract operates on the
+/// caller-owned read-only slice). Inner loop is straight-line
+/// 4 loads + 4 subs + 4 stores per macropixel, no per-iteration
+/// branching.
+///
+/// Bit-identical to the prior per-byte-branch loop — regression
+/// guarded by [`tests::round181_yuy2_forward_left_matches_branchy`]
+/// across YUY2 raster widths 2 / 4 / 320 / 640 and a height-1
+/// no-tail case.
+pub fn forward_yuy2_left_subtract(src: &[u8], dst: &mut [u8]) {
+    assert_eq!(src.len(), dst.len(), "dst length != src length");
+    let n = src.len();
+    if n == 0 {
+        return;
+    }
+    // Seed macropixel (indices 0..min(4, n)) copies verbatim — the
+    // encoder writes it as the uncompressed first pixel of the frame.
+    let head = 4.min(n);
+    dst[..head].copy_from_slice(&src[..head]);
+    if n <= 4 {
+        return;
+    }
+    // Walk whole macropixels with a branch-free 4-byte step starting
+    // at i = 4. The lookbacks are:
+    //   Y₁ at i+0: stride 2 → reads src[i - 2] (= Y₂ of previous macro).
+    //   U  at i+1: stride 4 → reads src[i - 3] (= U  of previous macro).
+    //   Y₂ at i+2: stride 2 → reads src[i]     (= Y₁ of THIS macro — intra-pair).
+    //   V  at i+3: stride 4 → reads src[i - 1] (= V  of previous macro).
+    let mut i = 4;
+    let body_end = n - ((n - 4) & 3);
+    while i < body_end {
+        dst[i] = src[i].wrapping_sub(src[i - 2]);
+        dst[i + 1] = src[i + 1].wrapping_sub(src[i - 3]);
+        dst[i + 2] = src[i + 2].wrapping_sub(src[i]);
+        dst[i + 3] = src[i + 3].wrapping_sub(src[i - 1]);
+        i += 4;
+    }
+    // Tail (1..=3 bytes) — uses the same per-byte stride rule as the
+    // branching loop. In practice YUY2 rows are 4-byte aligned so
+    // this never triggers; kept for robustness.
+    while i < n {
+        let stride = if i & 1 == 0 { 2 } else { 4 };
+        dst[i] = src[i].wrapping_sub(src[i - stride]);
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,5 +1371,184 @@ mod tests {
             recon[pos] = recon[pos].wrapping_add(predictor);
         }
         assert_eq!(recon, pixels);
+    }
+
+    /// Reference: the previous per-byte-branch decoder LEFT inverse,
+    /// retained here as the equivalence oracle for the round-181
+    /// macropixel-step rewrite.
+    fn ref_inverse_yuy2_left_range(out: &mut [u8], begin: usize, end: usize) {
+        if end <= begin {
+            return;
+        }
+        let mut i = begin;
+        while i < end {
+            match i & 3 {
+                0 | 2 => out[i] = out[i].wrapping_add(out[i - 2]),
+                _ => out[i] = out[i].wrapping_add(out[i - 4]),
+            }
+            i += 1;
+        }
+    }
+
+    /// Build a deterministic YUY2 raster of `width × height` bytes
+    /// (= `width × 2` per row), filled with a sawtooth pattern so
+    /// every byte-position channel sees non-trivial residuals.
+    fn make_yuy2_raster(width: usize, height: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = vec![0u8; width * 2 * height];
+        for byte in &mut out {
+            // xorshift32 → low byte, plus a tiny offset to avoid
+            // hitting only one channel value.
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *byte = (s & 0xff) as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn round181_yuy2_left_macropixel_matches_branchy_full_frame() {
+        // Full-frame YUY2 LEFT inverse: branch-free helper matches
+        // the per-byte reference across the proprietary's documented
+        // raster widths.
+        for &(w, h) in &[(2_usize, 1_usize), (4, 1), (4, 4), (320, 8), (640, 2)] {
+            let raw = make_yuy2_raster(w, h, 0xc0ffee + (w * h) as u32);
+            // Build a "residual"-shaped buffer: the seed macropixel
+            // at indices 0..4 holds raw values; the rest hold the
+            // LEFT residuals derived from a reference (forward
+            // subtract) so the two inverses share an input.
+            let mut residuals = raw.clone();
+            for i in 4..raw.len() {
+                let stride = if i & 1 == 0 { 2 } else { 4 };
+                residuals[i] = raw[i].wrapping_sub(raw[i - stride]);
+            }
+            let mut a = residuals.clone();
+            let mut b = residuals.clone();
+            let n = a.len();
+            ref_inverse_yuy2_left_range(&mut a, 4, n);
+            inverse_yuy2_left_macropixel(&mut b, 4, n);
+            assert_eq!(a, b, "full-frame mismatch for {w}x{h}");
+            // Sanity: the inverse should reconstruct the original raster.
+            assert_eq!(b, raw, "inverse failed to reconstruct {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn round181_yuy2_left_macropixel_matches_branchy_row1_first8() {
+        // The median path calls the helper with begin = row_bytes
+        // and end = row_bytes + 8 (the §2.3.2 LEFT exemption). Cover
+        // a row width where this is well below the buffer end so the
+        // tail logic of the macropixel walk is exercised but no
+        // out-of-range write happens.
+        let w = 320usize;
+        let h = 3usize;
+        let row_bytes = w * 2;
+        let raw = make_yuy2_raster(w, h, 0xfeed_face);
+        // Build residuals as above.
+        let mut residuals = raw.clone();
+        for i in 4..raw.len() {
+            let stride = if i & 1 == 0 { 2 } else { 4 };
+            residuals[i] = raw[i].wrapping_sub(raw[i - stride]);
+        }
+        // Apply row 0 LEFT inverse to get the same buffer state both
+        // implementations would see at the row-1 entry point.
+        let mut a = residuals.clone();
+        let mut b = residuals.clone();
+        ref_inverse_yuy2_left_range(&mut a, 4, row_bytes);
+        inverse_yuy2_left_macropixel(&mut b, 4, row_bytes);
+        assert_eq!(a, b, "row-0 LEFT mismatch");
+        // Now the row-1-first-8 range:
+        ref_inverse_yuy2_left_range(&mut a, row_bytes, row_bytes + 8);
+        inverse_yuy2_left_macropixel(&mut b, row_bytes, row_bytes + 8);
+        assert_eq!(a, b, "row-1-first-8 LEFT mismatch");
+    }
+
+    #[test]
+    fn round181_yuy2_left_macropixel_modular_wrap() {
+        // Force per-byte modular wrap on every channel by using
+        // residuals that cross 0xff repeatedly.
+        let raw: Vec<u8> = (0..1024u32)
+            .map(|i| (i.wrapping_mul(73) & 0xff) as u8)
+            .collect();
+        let mut residuals = raw.clone();
+        for i in 4..raw.len() {
+            let stride = if i & 1 == 0 { 2 } else { 4 };
+            residuals[i] = raw[i].wrapping_sub(raw[i - stride]);
+        }
+        let mut a = residuals.clone();
+        let mut b = residuals.clone();
+        let n = a.len();
+        ref_inverse_yuy2_left_range(&mut a, 4, n);
+        inverse_yuy2_left_macropixel(&mut b, 4, n);
+        assert_eq!(a, b);
+        assert_eq!(b, raw);
+    }
+
+    #[test]
+    fn round181_yuy2_left_macropixel_short_buffer_noop() {
+        // begin == end is a no-op.
+        let mut buf = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let copy = buf.clone();
+        inverse_yuy2_left_macropixel(&mut buf, 4, 4);
+        assert_eq!(buf, copy);
+    }
+
+    /// Reference: the previous per-byte-branch encoder LEFT forward
+    /// subtract, retained here as the round-181 equivalence oracle.
+    fn ref_forward_yuy2_left_subtract(src: &[u8], dst: &mut [u8]) {
+        let n = src.len();
+        let head = 4.min(n);
+        dst[..head].copy_from_slice(&src[..head]);
+        for i in 4..n {
+            let stride = if i & 1 == 0 { 2 } else { 4 };
+            dst[i] = src[i].wrapping_sub(src[i - stride]);
+        }
+    }
+
+    #[test]
+    fn round181_yuy2_forward_left_matches_branchy() {
+        for &(w, h) in &[(2_usize, 1_usize), (4, 1), (4, 4), (320, 8), (640, 2)] {
+            let raw = make_yuy2_raster(w, h, 0xbeef_cafe + (w * h) as u32);
+            let mut a = vec![0u8; raw.len()];
+            let mut b = vec![0u8; raw.len()];
+            ref_forward_yuy2_left_subtract(&raw, &mut a);
+            forward_yuy2_left_subtract(&raw, &mut b);
+            assert_eq!(a, b, "forward LEFT mismatch for {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn round181_yuy2_forward_left_short_buffers() {
+        // Lengths 0, 1, 2, 3, 4 — all <= 4 means the body loop is
+        // skipped and only the seed copy runs.
+        for n in 0..=4usize {
+            let raw: Vec<u8> = (0..n as u8).collect();
+            let mut a = vec![0u8; n];
+            let mut b = vec![0u8; n];
+            ref_forward_yuy2_left_subtract(&raw, &mut a);
+            forward_yuy2_left_subtract(&raw, &mut b);
+            assert_eq!(a, b, "len={n} mismatch");
+        }
+    }
+
+    #[test]
+    fn round181_yuy2_forward_then_inverse_roundtrips() {
+        // End-to-end: the new forward subtract followed by the new
+        // inverse LEFT macropixel walk reconstructs the original
+        // raster bit-exactly. This is the load-bearing wire-format
+        // claim — the two helpers must be exact inverses.
+        for &(w, h) in &[(4_usize, 4_usize), (320, 16), (640, 3)] {
+            let raw = make_yuy2_raster(w, h, 0x1234_5678 + (w * h) as u32);
+            let mut residuals = vec![0u8; raw.len()];
+            forward_yuy2_left_subtract(&raw, &mut residuals);
+            // The first 4 bytes are the seed copy; the body holds
+            // residuals. The decoder inverse reads from index 4 and
+            // walks to the end.
+            let mut recon = residuals.clone();
+            let n = recon.len();
+            inverse_yuy2_left_macropixel(&mut recon, 4, n);
+            assert_eq!(recon, raw, "roundtrip failed for {w}x{h}");
+        }
     }
 }

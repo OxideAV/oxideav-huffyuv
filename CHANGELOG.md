@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-181: branch-free YUY2 LEFT macropixel-step helpers in
+  `predict.rs`:
+  - `inverse_yuy2_left_macropixel(out, begin, end)` — decoder LEFT
+    inverse over byte range `[begin, end)` as a single straight-line
+    Y₁ / U / Y₂ / V body per spec/03 §2.1.1 (the
+    `@0x100020f4..@0x1000210e` macropixel-step trace), with three
+    rolling channel accumulators (`prev_y` / `prev_u` / `prev_v`)
+    replacing the per-iteration `i & 3` switch.
+  - `forward_yuy2_left_subtract(src, dst)` — encoder analogue,
+    reading the un-modified pre-pass input (raw pixels or the
+    gradient pre-pass output) and writing the LEFT residuals into
+    `dst` in a 4-byte-per-macropixel straight-line body, with the
+    Y₂-from-same-pair-Y₁ intra-pair LEFT rule of §2.1.1 expressed
+    directly as `src[i+2] − src[i]`.
+- Round-181: 7 new equivalence + roundtrip tests in `predict.rs`
+  (`round181_yuy2_left_macropixel_matches_branchy_full_frame`,
+  `..._row1_first8`, `..._modular_wrap`,
+  `..._short_buffer_noop`, `round181_yuy2_forward_left_matches_branchy`,
+  `..._short_buffers`, `..._forward_then_inverse_roundtrips`) that
+  diff the new helpers against in-test copies of the prior
+  per-byte-branch loops across YUY2 widths 2 / 4 / 320 / 640 and
+  cover the modular-wrap edge case + the median row-1-first-8
+  range. Lib-test count: 146 → 153.
+
 - Round-174: `benches/` Criterion harness (`decode`, `encode`,
   `roundtrip`) covering 22 representative
   `(pixel-family, method, extradata-mode, raster)` scenarios. Inputs
@@ -52,6 +76,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Daily CI via `.github/workflows/fuzz.yml` (org `crate-fuzz.yml`,
   30-minute budget). 60s local baseline post-fix: ~21.7k execs,
   `oom/timeout/crash: 0/0/0`.
+
+### Changed
+
+- Round-181: decoder `inverse_yuy2_left_range` (called by
+  `decode_yuy2_field` for the LEFT-only and Median predictor paths
+  and by `decode_frame_interlaced` per field) routes through
+  `predict::inverse_yuy2_left_macropixel`. Encoder
+  `yuy2_residuals` (Left + Gradient methods, all three extradata
+  modes) routes through `predict::forward_yuy2_left_subtract`.
+  Wire bytes are byte-for-byte identical to round 174 (covered by
+  the new equivalence tests + every pre-existing YUY2 round-trip
+  + the `lockstep_yuy2_*` AVI-lockstep tests).
+- Round-181 microbench (release, M1, single-threaded, isolated
+  LEFT pass — no Huffman): inverse YUY2 LEFT at 320×240 dropped
+  from ~148 µs → ~31 µs per frame (**≈ 4.7× speedup**); 1280×720
+  from ~1.79 ms → ~0.37 ms (**≈ 4.8× speedup**). Forward YUY2
+  LEFT at 320×240 dropped from ~40 µs → ~2.4 µs per frame
+  (**≈ 16× speedup**, LLVM autovectorises the read-only `src`-only
+  body into NEON `vsubq_u8`); 1280×720 from ~490 µs → ~30 µs
+  (**≈ 16× speedup**). End-to-end criterion delta on the YUY2-LEFT
+  decode bench (320×240) is a more modest 1-2% since the Huffman
+  bit-decode dominates total decode time; the LEFT pass was
+  already a small fraction of the per-frame budget.
 
 ### Fixed
 

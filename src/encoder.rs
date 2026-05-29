@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
 use crate::predict::{
     forward_decorr_gradient_subtract, forward_gradient_subtract, forward_left_decorr_residuals,
-    forward_median_subtract, is_interlaced_height,
+    forward_median_subtract, forward_yuy2_left_subtract, is_interlaced_height,
 };
 use crate::tables::{
     classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
@@ -704,12 +704,13 @@ fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Res
             None
         };
         let pred_input: &[u8] = intermediate.as_deref().unwrap_or(pixels);
-        let copy_n = 4.min(pred_input.len());
-        residuals[..copy_n].copy_from_slice(&pred_input[..copy_n]);
-        for i in 4..pred_input.len() {
-            let stride = if i & 1 == 0 { 2 } else { 4 };
-            residuals[i] = pred_input[i].wrapping_sub(pred_input[i - stride]);
-        }
+        // Round 181: route the YUY2 forward LEFT residual through
+        // the branch-free macropixel-step helper (spec/03 §2.1.1
+        // four-channel Y₁ / U / Y₂ / V body) instead of the per-byte
+        // `i & 1` stride-select. Bit-identical output; see
+        // `predict::forward_yuy2_left_subtract` for the spec
+        // citation + equivalence regression test.
+        forward_yuy2_left_subtract(pred_input, &mut residuals);
     }
     let mut seed = [0u8; 4];
     let copy_n = 4.min(pixels.len());

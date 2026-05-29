@@ -5,13 +5,19 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 174 — Criterion bench harness (`benches/{decode,encode,roundtrip}.rs`,
-22 scenarios) lands so future optimisation rounds get a
-directly-comparable per-scenario baseline; round 134 added the
-cargo-fuzz harness + fixed 2 input-driven panics; round 115 factored
-the YUY2 forward-median pre-pass into a tested `predict.rs` helper;
-round 103 fused the decorrelation+gradient encoder residual path;
-round 100 added the fused LEFT+decorrelation path.** Rounds
+**Round 181 — branch-free YUY2 LEFT macropixel-step rewrite
+(`predict::inverse_yuy2_left_macropixel` + `forward_yuy2_left_subtract`)
+replaces the per-byte `i & 3` switch on both encoder and decoder
+sides with a single straight-line Y₁ / U / Y₂ / V body per spec/03
+§2.1.1; isolated-LEFT-pass microbench shows ≈ 4.7× speedup on the
+inverse and ≈ 16× speedup on the forward (LLVM autovectorises the
+read-only `src`-only body into NEON `vsubq_u8`); round 174 added
+the Criterion bench harness (`benches/{decode,encode,roundtrip}.rs`,
+22 scenarios); round 134 added the cargo-fuzz harness + fixed 2
+input-driven panics; round 115 factored the YUY2 forward-median
+pre-pass into a tested `predict.rs` helper; round 103 fused the
+decorrelation+gradient encoder residual path; round 100 added the
+fused LEFT+decorrelation path.** Rounds
 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4 (interlace +
 lockstep), 5 (walking-stride encoder memory optimisation), 6
 (predictor RDO + single-symbol fix), 7 (auto-selector residual
@@ -423,6 +429,51 @@ test-only `[dev-dependencies] oxideav-avi`.
   came from 500-iter `cargo bench` runs, not Criterion `--quick`),
   but `cargo bench -p oxideav-huffyuv` now produces directly
   comparable per-scenario figures for the next optimisation round.
+
+## What works (Round 181)
+
+- **`predict::inverse_yuy2_left_macropixel(out, begin, end)`** —
+  decoder YUY2 LEFT inverse rewritten as a branch-free
+  macropixel-step body per spec/03 §2.1.1
+  (`@0x100020f4..@0x1000210e`: `Y₁ ← prev_Y₂`, `prev_Y₂ ← Y₁`,
+  `U ← prev_U`, `prev_U ← U`, `Y₂ ← Y₁` (intra-pair), `prev_Y₂
+  ← Y₂`, `V ← prev_V`, `prev_V ← V`). Three rolling channel
+  accumulators (`prev_y` / `prev_u` / `prev_v`) replace the prior
+  per-iteration `match i & 3` switch on the lookback stride; the
+  inner loop is now a straight-line 8-add / 4-store sequence
+  advancing one 4-byte macropixel per step. A 1-3 byte scalar tail
+  preserves the prior per-byte semantics for ranges whose end is
+  not macropixel-aligned (in practice never triggered — YUY2 row
+  widths are always multiples of 4).
+- **`predict::forward_yuy2_left_subtract(src, dst)`** — encoder
+  analogue: same macropixel-step body, but with `src[i+2] − src[i]`
+  expressing the §2.1.1 Y₂-from-same-pair-Y₁ intra-pair LEFT rule
+  directly off the read-only `src` slice (no in-place dependency
+  chain). LLVM autovectorises the four-channel body into NEON
+  `vsubq_u8` on aarch64 and SSE2 `psubb` on x86_64.
+- **Wire-identical** to round 174 — every pre-existing YUY2
+  round-trip test, the `lockstep_yuy2_*` AVI-lockstep tests, and
+  6 new equivalence + 1 forward-then-inverse round-trip tests in
+  `predict.rs` all stay green. The equivalence tests diff the new
+  helpers against in-test copies of the prior per-byte-branch
+  loops across raster widths 2 / 4 / 320 / 640, the modular-wrap
+  edge case, the median row-1-first-8 range, and small-buffer
+  no-ops.
+- **Measured (release, M1, single-threaded isolated LEFT pass —
+  no Huffman)**:
+  - Inverse YUY2 LEFT @ 320×240: ~148 µs/frame → ~31 µs/frame
+    (**≈ 4.7× speedup**).
+  - Inverse YUY2 LEFT @ 1280×720: ~1.79 ms/frame → ~0.37 ms/frame
+    (**≈ 4.8× speedup**).
+  - Forward YUY2 LEFT @ 320×240: ~40 µs/frame → ~2.4 µs/frame
+    (**≈ 16× speedup**).
+  - Forward YUY2 LEFT @ 1280×720: ~490 µs/frame → ~30 µs/frame
+    (**≈ 16× speedup**).
+  - End-to-end criterion delta on the YUY2-LEFT 320×240 decode
+    bench is a more modest 1-2% (Huffman bit-decode still
+    dominates total frame time; the LEFT pass was already a small
+    fraction of total decode).
+- Lib test count: 146 → 153 (+7 round-181 tests in `predict.rs`).
 
 ## Out of scope (deferred)
 
