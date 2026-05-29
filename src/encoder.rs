@@ -23,7 +23,8 @@ use crate::error::{Error, Result};
 use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
 use crate::predict::{
     forward_decorr_gradient_subtract, forward_gradient_subtract, forward_left_decorr_residuals,
-    forward_median_subtract, forward_yuy2_left_subtract, is_interlaced_height,
+    forward_median_subtract, forward_rgb_left_subtract_linear, forward_yuy2_left_subtract,
+    is_interlaced_height,
 };
 use crate::tables::{
     classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
@@ -794,14 +795,13 @@ fn rgb24_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
             None
         };
         let pred_input: &[u8] = intermediate.as_deref().unwrap_or(working);
-        for ch in 0..3usize {
-            residuals[ch] = pred_input[ch];
-            let mut idx = ch + 3;
-            while idx < pred_input.len() {
-                residuals[idx] = pred_input[idx].wrapping_sub(pred_input[idx - 3]);
-                idx += 3;
-            }
-        }
+        // Round 186: single linear stride-1 walk replaces the prior
+        // three-pass stride-3 channel loop (3× fewer cache traversals
+        // + a contiguous SIMD-friendly inner subtract). spec/03 §2.1
+        // encoder evidence `@0x10001850`. Bit-identical to the prior
+        // per-channel loop — regression guarded by
+        // `predict::tests::round186_rgb_left_linear_matches_per_channel_rgb24`.
+        forward_rgb_left_subtract_linear(pred_input, &mut residuals, 3);
     }
     // Wire seed: `00 B G R` (the decoder writes pad as 0; first
     // pixel goes into bytes 1..4). For the fused LeftDecorr path the
@@ -921,14 +921,15 @@ fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
             None
         };
         let pred_input: &[u8] = intermediate.as_deref().unwrap_or(working);
-        for ch in 0..4usize {
-            residuals[ch] = pred_input[ch];
-            let mut idx = ch + 4;
-            while idx < pred_input.len() {
-                residuals[idx] = pred_input[idx].wrapping_sub(pred_input[idx - 4]);
-                idx += 4;
-            }
-        }
+        // Round 186: single linear stride-1 walk replaces the prior
+        // four-pass stride-4 channel loop (4× fewer cache traversals
+        // + a contiguous SIMD-friendly inner subtract). spec/03 §2.1
+        // encoder evidence `@0x10001b21..@0x10001b3c` (the RGB32-LEFT
+        // byte-3 / A emit reusing the same offset-N-back identity as
+        // the byte-0 / B emit). Bit-identical to the prior
+        // per-channel loop — regression guarded by
+        // `predict::tests::round186_rgb_left_linear_matches_per_channel_rgb32`.
+        forward_rgb_left_subtract_linear(pred_input, &mut residuals, 4);
         // Seed = decorrelated-or-plain first pixel. For the fused
         // GradientDecorr path compute it from `pixels` (B−G, G, R−G, A
         // — alpha identity); otherwise read `working`'s first pixel.

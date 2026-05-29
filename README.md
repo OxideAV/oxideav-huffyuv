@@ -5,19 +5,31 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 181 — branch-free YUY2 LEFT macropixel-step rewrite
-(`predict::inverse_yuy2_left_macropixel` + `forward_yuy2_left_subtract`)
-replaces the per-byte `i & 3` switch on both encoder and decoder
-sides with a single straight-line Y₁ / U / Y₂ / V body per spec/03
-§2.1.1; isolated-LEFT-pass microbench shows ≈ 4.7× speedup on the
-inverse and ≈ 16× speedup on the forward (LLVM autovectorises the
-read-only `src`-only body into NEON `vsubq_u8`); round 174 added
-the Criterion bench harness (`benches/{decode,encode,roundtrip}.rs`,
-22 scenarios); round 134 added the cargo-fuzz harness + fixed 2
-input-driven panics; round 115 factored the YUY2 forward-median
-pre-pass into a tested `predict.rs` helper; round 103 fused the
-decorrelation+gradient encoder residual path; round 100 added the
-fused LEFT+decorrelation path.** Rounds
+**Round 186 — `predict::forward_rgb_left_subtract_linear(src, dst,
+n_channels)` collapses the encoder's per-channel triple/quad-pass
+stride-`n` LEFT-residual loop (RGB24: 3 passes with stride 3; RGB32:
+4 passes with stride 4) into a single linear stride-1 walk producing
+every per-channel residual in one traversal per spec/03 §2.1
+(encoder evidence `@0x10001850` for RGB24-LEFT and
+`@0x10001b21..@0x10001b3c` for the RGB32 byte-3 / A emit reusing the
+same offset-`n`-back rule); cuts traversal count by 3× (RGB24) /
+4× (RGB32) and exposes a contiguous SIMD-friendly inner subtract;
+isolated LEFT-subtract microbench shows ≈ 20× speedup across
+RGB24/RGB32 @ 320×240 / 1280×720 on M1 (LLVM constant-folds
+`n_channels` from the `#[inline]` helper into NEON `vsubq_u8` /
+SSE2 `psubb` on the interior). Round 181 (branch-free YUY2 LEFT
+macropixel-step rewrite — `predict::inverse_yuy2_left_macropixel` +
+`forward_yuy2_left_subtract` — replaces the per-byte `i & 3` switch
+on both encoder and decoder sides with a single straight-line Y₁ /
+U / Y₂ / V body per spec/03 §2.1.1; isolated-LEFT-pass microbench
+shows ≈ 4.7× speedup on the inverse and ≈ 16× speedup on the
+forward; round 174 added the Criterion bench harness
+(`benches/{decode,encode,roundtrip}.rs`, 22 scenarios); round 134
+added the cargo-fuzz harness + fixed 2 input-driven panics; round
+115 factored the YUY2 forward-median pre-pass into a tested
+`predict.rs` helper; round 103 fused the decorrelation+gradient
+encoder residual path; round 100 added the fused
+LEFT+decorrelation path.** Rounds
 1 (decoder), 2 (encoder), 3 (decoder fast-LUT), 4 (interlace +
 lockstep), 5 (walking-stride encoder memory optimisation), 6
 (predictor RDO + single-symbol fix), 7 (auto-selector residual
@@ -474,6 +486,66 @@ test-only `[dev-dependencies] oxideav-avi`.
     dominates total frame time; the LEFT pass was already a small
     fraction of total decode).
 - Lib test count: 146 → 153 (+7 round-181 tests in `predict.rs`).
+
+## What works (Round 186)
+
+- **`predict::forward_rgb_left_subtract_linear(src, dst, n_channels)`**
+  — single linear stride-1 walk producing the per-channel LEFT
+  residuals for RGB24 (`n = 3`) and RGB32 (`n = 4`) buffers.
+  Replaces the encoder's pre-round-186 per-channel
+  triple/quad-pass stride-`n` loop
+  (`for ch in 0..N { idx = ch + N; while idx < len { residuals[idx]
+  = pred_input[idx] − pred_input[idx − N]; idx += N; } }`) with a
+  single contiguous `for i in N..len { dst[i] = src[i] −
+  src[i − N]; }` pass. The per-channel residual identity holds for
+  every output position because `i` taken mod `n_channels` selects
+  the channel, so the same `src[i] − src[i − n_channels]`
+  expression computes the correct per-channel residual at every
+  byte without an explicit channel split. Per spec/03 §2.1 (encoder
+  evidence `@0x10001850` for the RGB24-LEFT byte-B emit + spec/03
+  §1.2 / §2.1 evidence `@0x10001b21..@0x10001b3c` for the RGB32
+  byte-3 / A emit reusing the same offset-`n`-back rule).
+- **Allocation + pass-count reduction.** The pre-round-186 encoder
+  re-traversed the entire residual buffer `n_channels` times (once
+  per channel) and produced strided reads/writes that LLVM cannot
+  fuse into vector instructions. The linear walk traverses once
+  (`n` × fewer cache-line loads) and the inner subtract is a
+  `src[i] − src[i − n]` over consecutive bytes, which LLVM
+  autovectorises into NEON `vsubq_u8` on aarch64 and SSE2 `psubb`
+  on x86_64. The helper is `#[inline]` so the `n_channels`
+  argument constant-folds at the encoder call sites (both pass the
+  literal `3` or `4`), letting the compiler specialise the inner
+  body for each width.
+- **Measured (release, M1, single-threaded isolated LEFT-subtract
+  microbench — `src.len()` bytes / `iters = 2000` for 320×240 /
+  200 for 1280×720, no Huffman)**:
+  - RGB24 320×240 LEFT: ~86.7 µs/frame → ~4.3 µs/frame
+    (**≈ 20× speedup**).
+  - RGB24 1280×720 LEFT: ~1036 µs/frame → ~51.7 µs/frame
+    (**≈ 20× speedup**).
+  - RGB32 320×240 LEFT: ~114.9 µs/frame → ~5.8 µs/frame
+    (**≈ 20× speedup**).
+  - RGB32 1280×720 LEFT: ~1380 µs/frame → ~69.6 µs/frame
+    (**≈ 20× speedup**).
+  - End-to-end criterion delta on the encode benches will be more
+    modest (Huffman bit-encode dominates total frame time; the
+    LEFT-subtract pass was already a small fraction of total
+    encode), but the LEFT-pass itself was the dominant non-Huffman
+    cost on the non-gradient / non-decorrelated RGB encoder paths.
+- **Wire-identical to round 181** — every per-channel residual byte
+  the linear walk produces equals the byte the prior triple/quad-pass
+  loop produced (regression-guarded by
+  `round186_rgb_left_linear_matches_per_channel_rgb24` /
+  `_rgb32` covering widths 1 / 4 / 320 and heights 1 / 4,
+  `round186_rgb_left_linear_modular_wrap` for the 0xFF/0x01
+  alternator that forces every byte to mod-256 wrap,
+  `round186_rgb_left_linear_short_buffer_seed_only` for the
+  smaller-than-one-pixel degenerate case, and
+  `round186_rgb_left_linear_then_inverse_roundtrips` end-to-end via
+  the decoder's per-channel `wrapping_add` inverse). Every
+  pre-existing RGB24 / RGB32 LEFT / Gradient / LeftDecorr /
+  GradientDecorr round-trip + the `lockstep_rgb24_*` AVI-lockstep
+  tests stay green. Lib test count: 153 → 158.
 
 ## Out of scope (deferred)
 

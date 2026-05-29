@@ -8,6 +8,52 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-186: `predict::forward_rgb_left_subtract_linear(src, dst,
+  n_channels)` — single linear stride-1 walk producing the per-channel
+  LEFT residuals for RGB24 (`n = 3`) and RGB32 (`n = 4`) buffers,
+  replacing the encoder's prior per-channel triple/quad-pass
+  stride-`n` loop. The per-channel identity `dst[i] =
+  src[i].wrapping_sub(src[i − n])` is the same for every channel
+  (spec/03 §2.1, encoder evidence `@0x10001850` for RGB24 and
+  `@0x10001b21..@0x10001b3c` for the RGB32 byte-3/A emit reusing the
+  same offset-N-back rule), so the three (RGB24) or four (RGB32)
+  strided passes collapse into one linear pass. Cuts traversal count
+  by `n` (3× / 4× fewer cache-line loads) and exposes a contiguous
+  inner subtract that LLVM autovectorises into NEON `vsubq_u8` on
+  aarch64 / SSE2 `psubb` on x86_64 (the helper is `#[inline]` so
+  `n_channels` constant-folds at every encoder call site, where it is
+  the literal `3` or `4`).
+- Round-186: 5 new equivalence + roundtrip tests in `predict.rs`
+  (`round186_rgb_left_linear_matches_per_channel_rgb24`,
+  `..._rgb32`, `..._modular_wrap`,
+  `round186_rgb_left_linear_short_buffer_seed_only`,
+  `round186_rgb_left_linear_then_inverse_roundtrips`) that diff the
+  linear walk against an in-test copy of the prior per-channel
+  stride-`n` loop across widths 1 / 4 / 16 / 320, heights 1 / 4 / 8,
+  the 0xFF/0x01 modular-wrap alternator, and a buffer-smaller-than-
+  one-pixel degenerate case, plus an end-to-end forward-then-inverse
+  round-trip via the decoder's per-channel `wrapping_add` walk.
+
+### Changed
+
+- Round-186: `encoder::rgb24_residuals` / `rgb32_residuals` route the
+  non-fused LEFT-residual emit through
+  `predict::forward_rgb_left_subtract_linear` instead of the prior
+  per-channel `for ch in 0..N { idx = ch + N; while idx < len { …
+  idx += N; } }` loop. Wire-identical (every output byte is a pure
+  function of `i mod n_channels`, so the linear walk produces the
+  same residuals at every position); regression-guarded by the round
+  186 equivalence tests + every pre-existing RGB24 / RGB32 LEFT /
+  Gradient / LeftDecorr / GradientDecorr round-trip and the
+  `lockstep_rgb24_*` AVI-lockstep tests.
+- Round-186 measured (release, M1, isolated LEFT-subtract pass —
+  no Huffman): RGB24 320×240 LEFT 86.7 µs/frame → 4.3 µs/frame
+  (**≈ 20× speedup**); RGB24 1280×720 LEFT 1036 µs/frame →
+  51.7 µs/frame (**≈ 20× speedup**); RGB32 320×240 LEFT
+  114.9 µs/frame → 5.8 µs/frame (**≈ 20× speedup**); RGB32
+  1280×720 LEFT 1380 µs/frame → 69.6 µs/frame (**≈ 20× speedup**).
+  Lib test count: 153 → 158.
+
 - Round-181: branch-free YUY2 LEFT macropixel-step helpers in
   `predict.rs`:
   - `inverse_yuy2_left_macropixel(out, begin, end)` — decoder LEFT
