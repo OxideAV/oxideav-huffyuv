@@ -236,10 +236,21 @@ pub fn inverse_median_post(out: &mut [u8], row_bytes: usize, height: usize) {
     if height < 2 || row_bytes == 0 {
         return;
     }
-    // Row 1 starts at offset row_bytes; skip the first 8 bytes that
-    // the LEFT pass already produced as final values.
+    // Row 1 starts at offset row_bytes; skip the first 8 wire bytes
+    // that the LEFT pass already produced as final values.
+    //
+    // Round-196: the 8-byte LEFT exemption is in *wire bytes*, not in
+    // "min(8, row_bytes)" (audit/01 §7.2 validation note: the
+    // i386 decoder loop bound at `huffyuv.dll@0x100020e8` sets the
+    // LEFT region end at `row_start_of_row_1 + row_stride + 8`,
+    // independent of row_stride). For narrow streams where
+    // `row_bytes < 8` (e.g. width = 2 → row_bytes = 4) the LEFT
+    // exemption extends past the end of row 1 into row 2; only the
+    // buffer-length cap is appropriate. The live decoder path
+    // (`decoder::inverse_yuy2_median`) had this right; this companion
+    // helper is brought into agreement so the two cannot drift.
     let row1_start = row_bytes;
-    let row1_median_start = row1_start + 8.min(row_bytes);
+    let row1_median_start = (row1_start + 8).min(out.len());
     // For each byte from there to end-of-buffer, replace
     // residual-with-LEFT with proper median reconstruction.
     let mut pos = row1_median_start;
@@ -550,10 +561,26 @@ pub fn forward_median_subtract(pixels: &[u8], dst: &mut [u8], row_bytes: usize, 
     // LEFT region: row 0 in full, plus the first 8 wire bytes of row 1
     // (spec/03 §2.3.2). When the frame has only one row, the whole
     // buffer is LEFT (no median region exists).
+    //
+    // Round-196 fix (found by `encode_huffyuv.rs` fuzz target on a
+    // 2×18 YUY2 Median input): the spec defines the LEFT exemption in
+    // **wire bytes** ("first 4 pixel (2 pairs, 8 bytes) of the second
+    // row", spec/03 §2.3.2 + the audit/01 §7.2 validation note: the
+    // i386 decoder loop bound at `huffyuv.dll@0x100020e8` sets the
+    // LEFT region end at `row_start_of_row_1 + row_stride + 8`,
+    // *independent* of row_stride). For narrow YUY2 streams where
+    // `row_bytes < 8` (e.g. width = 2 → row_bytes = 4), this means
+    // the LEFT exemption extends BEYOND the end of row 1 into row 2.
+    // The earlier `8.min(row_bytes)` clamp under-sized the LEFT
+    // region to a single row at width = 2, while the decoder's
+    // `inverse_yuy2_median` correctly extended LEFT to
+    // `row_bytes + 8` per the spec — producing a wire-corruption
+    // asymmetry. The clamp is now removed; only the buffer-length
+    // cap `.min(n)` remains.
     let median_start = if height < 2 || row_bytes == 0 {
         n
     } else {
-        (row_bytes + 8.min(row_bytes)).min(n)
+        (row_bytes + 8).min(n)
     };
     // Uncompressed first macropixel (≤ 4 bytes).
     let copy_n = 4.min(n);
@@ -1315,7 +1342,9 @@ mod tests {
         }
         // Phase 2: overwrite the median region.
         if height >= 2 && row_bytes > 0 {
-            let row1_median_start = row_bytes + 8.min(row_bytes);
+            // Round-196: 8-wire-byte LEFT exemption (not `min(8, row_bytes)`)
+            // — see the matching comment in `forward_median_subtract`.
+            let row1_median_start = (row_bytes + 8).min(pixels.len());
             for pos in row1_median_start..pixels.len() {
                 if pos < row_bytes {
                     continue;

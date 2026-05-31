@@ -36,3 +36,16 @@ name = "decode_huffyuv"
 path = "fuzz_targets/decode_huffyuv.rs"
 test = false
 doc = false
+
+# Round-196: encoder-side companion fuzz target. Drives
+# `encode_frame_with_mode` across every legal (family, method,
+# extradata-mode) triple on arbitrary input pixels, then re-parses the
+# synthesised BIH + re-decodes and asserts bit-exact round-trip
+# equality. Covers a code path the decode-only target cannot reach
+# (the package-merge length-limited Huffman builder, three extradata
+# modes, and the SWAR forward predictor fusion paths).
+[[bin]]
+name = "encode_huffyuv"
+path = "fuzz_targets/encode_huffyuv.rs"
+test = false
+doc = false

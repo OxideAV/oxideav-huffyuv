@@ -106,6 +106,41 @@ fn roundtrip_yuy2_median_8x6() {
     assert_eq!(out.pixels, pixels);
 }
 
+/// Round-196 regression: narrow YUY2 Median (width = 2 → row_bytes = 4,
+/// which is less than the 8-wire-byte row-1 LEFT exemption defined in
+/// spec/03 §2.3.2 + audit/01 §7.2). Earlier `forward_median_subtract`
+/// under-sized the LEFT region by clamping the exemption with
+/// `8.min(row_bytes)`, while the decoder's `inverse_yuy2_median` used
+/// the unclamped `row_bytes + 8` per the spec — the asymmetry produced
+/// non-roundtripping wires on every `width < 4` YUY2 Median input.
+/// Found by the `encode_huffyuv.rs` cargo-fuzz target. The 18 rows are
+/// large enough to push the median region well past the LEFT
+/// exemption.
+#[test]
+fn roundtrip_yuy2_median_2x18_round196() {
+    let pixels: Vec<u8> = (0..2 * 18 * 2)
+        .map(|x| ((x * 11 + 5) ^ 0x3A) as u8)
+        .collect();
+    let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Median, 2, 18, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+/// Round-196 regression — minimal reproducer from the
+/// `encode_huffyuv.rs` libfuzzer crash: prefix
+/// `[80, 255, 17, 80, 175]` then all-zero pixel tail. With
+/// pre-fix `forward_median_subtract` the round-2 byte at
+/// position 8 reconstructed to `98` instead of `0`, producing the
+/// repeating `98, 0, 98, 0, …` corruption from row 2 onward.
+#[test]
+fn roundtrip_yuy2_median_2x18_round196_fuzz_minimal() {
+    let mut pixels = vec![0u8; 2 * 18 * 2];
+    pixels[..5].copy_from_slice(&[80, 255, 17, 80, 175]);
+    let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Median, 2, 18, &pixels).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
 #[test]
 fn roundtrip_rgb24_predict_old_4x4() {
     let pixels = synth_rgb24(4, 4);

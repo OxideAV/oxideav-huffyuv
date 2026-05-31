@@ -8,6 +8,50 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-196: `fuzz/fuzz_targets/encode_huffyuv.rs` — second cargo-fuzz
+  target driving `encode_frame_with_mode` across every legal
+  `(family, method, extradata-mode)` triple on arbitrary input pixels
+  (5-byte selector prefix + raw pixel tail; widths 1–64, heights 1–32
+  plus a low-probability lift into the interlaced regime >288). Each
+  iteration encodes, parses the encoder-produced strf back via
+  `StreamConfig::parse_bitmapinfoheader`, re-decodes via
+  `decode_frame`, and asserts bit-exact round-trip equality of the
+  raster (HuffYUV is lossless per spec/00 §1.1). Also exercises the
+  publicly-exposed `build_bitmapinfoheader` strf-write helper on the
+  same configuration so muxer-side callers are fuzz-covered too. Seven
+  curated corpus seeds (six valid `(family, method, mode)` triples +
+  the round-196 regression below). 200k-run smoke against the fixed
+  encoder: 103.5k execs in 181 s with `oom/timeout/crash: 0/0/0`.
+- Round-196: two new regression tests in `roundtrip_tests.rs`
+  (`roundtrip_yuy2_median_2x18_round196` + the matching minimal
+  fuzz-discovered repro `_fuzz_minimal` with prefix
+  `[80, 255, 17, 80, 175]` and zero-padded tail) covering the
+  `width = 2` YUY2 Median path (row_bytes = 4 < the 8-wire-byte LEFT
+  exemption). Lib test count: 158 → 160.
+
+### Fixed
+
+- Round-196 (fuzz-found): `predict::forward_median_subtract` under-sized
+  the YUY2 Median LEFT-exemption region for narrow streams. spec/03
+  §2.3.2 + audit/01 §7.2 define the exemption as "first 4 pixel (2
+  pairs, 8 **wire** bytes) of the second row are compressed with the
+  predict left algorithm," independent of row stride (i386 decoder
+  loop bound at `huffyuv.dll@0x100020e8` sets the LEFT-region end at
+  `row_start_of_row_1 + row_stride + 8`). Prior code clamped the
+  exemption with `8.min(row_bytes)`, so for `row_bytes < 8` (e.g.
+  width = 2 → row_bytes = 4) the LEFT region ended at the row 1
+  boundary instead of `row_bytes + 8`; the decoder
+  (`inverse_yuy2_median`) had this right per the spec, so the encoder
+  was emitting MEDIAN residuals for wire bytes the decoder would
+  treat as LEFT — producing wrong reconstruction from row 2 onward on
+  every `width < 4` YUY2 Median input. Fix: drop the clamp; use
+  `(row_bytes + 8).min(n)` symmetrically. Same correction applied to
+  the dead-but-documented `inverse_median_post` and the
+  `naive_two_phase_forward_median` reference helper so the spec
+  reference cannot drift. Discovered by the new `encode_huffyuv.rs`
+  cargo-fuzz harness; pinned by the two new round-196 round-trip
+  tests.
+
 - Round-186: `predict::forward_rgb_left_subtract_linear(src, dst,
   n_channels)` — single linear stride-1 walk producing the per-channel
   LEFT residuals for RGB24 (`n = 3`) and RGB32 (`n = 4`) buffers,
