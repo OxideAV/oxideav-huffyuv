@@ -6,6 +6,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Round-202: strip three intra-loop dead branches from the YUY2 Median
+  tail-loop on both sides of the codec. After spec/03 §2.3.2 +
+  audit/01 §7.2's wire-byte LEFT exemption (the loop start sits at
+  `row_bytes + 8` capped at the buffer length), every iteration
+  satisfies `pos >= row_bytes + 8`, which implies `pos >= 2`,
+  `pos >= row_bytes`, and `pos - row_bytes >= 8 >= 2`. The pre-round-202
+  body of `predict::inverse_median_post` /
+  `decoder::inverse_yuy2_median` carried per-iteration `if pos < 2 ||
+  pos < row_bytes { continue; }` and `if pos >= row_bytes + 2 { … }
+  else { 0 }` arms that the loop precondition makes provably dead;
+  `predict::forward_median_subtract`'s encoder analogue carried the
+  matching `al = 0` else-arm. The cleanup replaces the `while`/`if`
+  shape with a straight-line `for pos in row1_median_start..n {}`
+  body that reads `out[pos - 2]`, `out[pos - row_bytes]`, and
+  `out[pos - row_bytes - 2]` directly — three branch-free
+  `wrapping_*` median-builder steps per iteration. The wrap-arithmetic
+  `pos.wrapping_sub(2)` substitute in the pre-202 form (placed there to
+  silence the formerly-not-provably-non-wrapping `pos - 2`) is also
+  dropped: with the dead branches gone, `pos - 2` is a plain
+  non-wrapping subtraction. `debug_assert!`s anchor the row-stride
+  invariants at function entry. Lib test count: 160 → 161 (new
+  `roundtrip_yuy2_median_round202_boundary_widths` sweeps nine
+  `(width, height)` pairs bracketing the LEFT-exemption + AL-index
+  boundaries — widths 2 / 4 / 6 / 8 × heights 3..8 — to keep the
+  invariants the dead-branch strip relies on regression-guarded).
+
 ### Added
 
 - Round-196: `fuzz/fuzz_targets/encode_huffyuv.rs` — second cargo-fuzz

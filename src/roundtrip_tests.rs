@@ -141,6 +141,55 @@ fn roundtrip_yuy2_median_2x18_round196_fuzz_minimal() {
     assert_eq!(out.pixels, pixels);
 }
 
+/// Round-202 boundary coverage: exercise the YUY2 Median tail-loop
+/// at every per-frame size that brackets the LEFT exemption +
+/// AL-index invariants the dead-branch strip relies on.
+///
+/// - `width = 2 → row_bytes = 4` (narrow): the LEFT exemption end is
+///   `row_bytes + 8 = 12`, so the median region is non-empty only
+///   when `len > 12`, i.e. `height >= 4` (`len = 4 × 4 = 16 > 12`).
+///   This is the boundary the round-196 wire-asymmetry fix targeted;
+///   round 202 confirms the dead-branch strip in the post-exemption
+///   loop is still wire-stable across the size sweep that brackets
+///   `row1_left_end == len` (height 3 → no median region) and
+///   `row1_left_end < len` (height 4+ → first median byte at pos 12).
+/// - `width = 4 → row_bytes = 8`: the LEFT exemption boundary sits
+///   exactly on the row-2 start (`row_bytes + 8 == 2 × row_bytes`).
+///   Height 2 → no median region; height 3 → 8 median bytes; height
+///   4 → 16 median bytes. The AL lookback at the first median pos
+///   reads from row 0 col 6, A from row 1 col 0, L from row 1 col 6
+///   — all three reads landing in already-LEFT-decoded territory.
+#[test]
+fn roundtrip_yuy2_median_round202_boundary_widths() {
+    // Skewed pseudo-random pattern that won't accidentally degenerate
+    // to all-zero residuals (which would mask many predictor bugs).
+    fn synth(n: usize) -> Vec<u8> {
+        (0..n).map(|x| ((x * 31 + 7) ^ 0xA5) as u8).collect()
+    }
+    for &(w, h) in &[
+        (2u32, 4u32),
+        (2, 5),
+        (2, 6),
+        (2, 8),
+        (4, 3),
+        (4, 4),
+        (4, 8),
+        (6, 4),
+        (8, 4),
+    ] {
+        let pixels = synth((w * h * 2) as usize);
+        let (cfg, frame) = encode_for_test(PixelFamily::Yuy2, Method::Median, w, h, &pixels)
+            .unwrap_or_else(|e| panic!("encode failed for {}x{}: {:?}", w, h, e));
+        let out = decode_frame(&cfg, &frame)
+            .unwrap_or_else(|e| panic!("decode failed for {}x{}: {:?}", w, h, e));
+        assert_eq!(
+            out.pixels, pixels,
+            "YUY2 Median roundtrip failed at {}x{}",
+            w, h
+        );
+    }
+}
+
 #[test]
 fn roundtrip_rgb24_predict_old_4x4() {
     let pixels = synth_rgb24(4, 4);

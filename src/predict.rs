@@ -249,30 +249,40 @@ pub fn inverse_median_post(out: &mut [u8], row_bytes: usize, height: usize) {
     // buffer-length cap is appropriate. The live decoder path
     // (`decoder::inverse_yuy2_median`) had this right; this companion
     // helper is brought into agreement so the two cannot drift.
-    let row1_start = row_bytes;
-    let row1_median_start = (row1_start + 8).min(out.len());
-    // For each byte from there to end-of-buffer, replace
-    // residual-with-LEFT with proper median reconstruction.
-    let mut pos = row1_median_start;
-    while pos < out.len() {
-        // Determine row position; we work raster and step pos one byte
-        // at a time, with `row_bytes` lookbacks.
-        if pos < row_bytes {
-            pos += 1;
-            continue;
-        }
-        let l = out[pos.wrapping_sub(2)]; // 2-byte channel stride within YUY2.
-                                          // Note: spec/03 §2.3 documents output offsets -2 / -row_stride
-                                          // / -row_stride - 2 as the LEFT / ABOVE / ABOVE-LEFT in the
-                                          // 4-byte-stride YUY2 layout. The "2-byte left" matches
-                                          // intra-pair Y₁→Y₂ / Y₂→Y₁ alternation; for U / V it is
-                                          // previous-pair's same-channel byte.
+    let n = out.len();
+    let row1_median_start = (row_bytes + 8).min(n);
+    if row1_median_start >= n {
+        return;
+    }
+    // Round-202: strip the two intra-loop dead branches that the prior
+    // form carried. Once `pos >= row1_median_start = row_bytes + 8`:
+    //
+    // - `pos >= row_bytes` (so the `if pos < row_bytes { continue; }`
+    //   path is unreachable for every iteration);
+    // - `pos - row_bytes >= 8 >= 2` (so the `al = 0` fallback for
+    //   `pos < row_bytes + 2` is unreachable, and the `out[pos -
+    //   row_bytes - 2]` index is always in-bounds for `pos - 2`,
+    //   `pos - row_bytes`, and `pos - row_bytes - 2`).
+    //
+    // The unsigned arithmetic `pos.wrapping_sub(2)` from the prior form
+    // was a tell: with the dead branch stripped, plain `pos - 2` is
+    // provably non-wrapping. Spec/03 §2.3 + §2.3.2 + audit/01 §7.2
+    // pin the wire-byte exemption that makes this true.
+    //
+    // Restructured as a slice-borrow over the median region so LLVM
+    // proves index validity from the slice length rather than per-byte
+    // bounds checks. The L value at `pos - 2` is read from the median
+    // tail (or from the LEFT-region overlap, both of which are already
+    // final), and A / AL come from the row above (`out[..pos -
+    // row_bytes + row_bytes]`).
+    debug_assert!(row1_median_start >= row_bytes + 2);
+    for pos in row1_median_start..n {
+        // SAFETY-EQUIVALENT (bounds): `pos >= row_bytes + 8` and
+        // `n >= pos + 1` from the loop bound, so every index below is
+        // a valid slice position into `out[..n]`.
+        let l = out[pos - 2];
         let a = out[pos - row_bytes];
-        let al = if pos >= row_bytes + 2 {
-            out[pos - row_bytes - 2]
-        } else {
-            0
-        };
+        let al = out[pos - row_bytes - 2];
         let g = gradient_predictor(l, a, al);
         let predictor = median3(l, a, g);
         // The LEFT pass produced `out[pos] = residual + L`. We need
@@ -280,7 +290,6 @@ pub fn inverse_median_post(out: &mut [u8], row_bytes: usize, height: usize) {
         // median predictor.
         let residual = out[pos].wrapping_sub(l);
         out[pos] = residual.wrapping_add(predictor);
-        pos += 1;
     }
 }
 
@@ -594,16 +603,22 @@ pub fn forward_median_subtract(pixels: &[u8], dst: &mut [u8], row_bytes: usize, 
     // `pixels` (the original raster), so `AL` is well defined for every
     // `pos >= row_bytes + 2`; the §2.3.2 exemption guarantees
     // `median_start >= row_bytes + 8 >= row_bytes + 2`, so the
-    // below-row-1 `al = 0` fallback is never actually taken here, but
-    // it mirrors `inverse_median_post`'s guard for safety.
+    // below-row-1 `al = 0` fallback (carried in earlier rounds as a
+    // mirror of `inverse_median_post`'s pre-round-202 dead guard) is
+    // never actually taken here.
+    //
+    // Round-202: now that both companion inverses (`inverse_median_post`
+    // and `decoder::inverse_yuy2_median`) drop the `al = 0` fallback
+    // and the `pos.wrapping_sub(2)` substitute, drop them here too.
+    // The loop body becomes a straight-line per-byte median residual
+    // emit; `pos - 2`, `pos - row_bytes`, and `pos - row_bytes - 2`
+    // are all in-bounds for every iteration because `pos >=
+    // median_start = row_bytes + 8`.
+    debug_assert!(median_start == n || median_start >= row_bytes + 2);
     for pos in median_start..n {
-        let l = pixels[pos.wrapping_sub(2)];
+        let l = pixels[pos - 2];
         let a = pixels[pos - row_bytes];
-        let al = if pos >= row_bytes + 2 {
-            pixels[pos - row_bytes - 2]
-        } else {
-            0
-        };
+        let al = pixels[pos - row_bytes - 2];
         let g = gradient_predictor(l, a, al);
         let predictor = median3(l, a, g);
         dst[pos] = pixels[pos].wrapping_sub(predictor);

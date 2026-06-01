@@ -5,7 +5,29 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 186 — `predict::forward_rgb_left_subtract_linear(src, dst,
+**Round 202 — YUY2 Median tail-loop dead-branch strip on both sides
+of the codec.** spec/03 §2.3.2 + audit/01 §7.2's wire-byte LEFT
+exemption (`row_bytes + 8` bytes of LEFT before MEDIAN engages) means
+every iteration of the post-exemption median loop satisfies
+`pos >= row_bytes + 8`, so the pre-round-202 `if pos < 2 || pos <
+row_bytes { continue; }` and `if pos >= row_bytes + 2 { … } else { 0 }`
+arms — present in both `predict::inverse_median_post` and
+`decoder::inverse_yuy2_median` — were provably dead, and
+`predict::forward_median_subtract`'s `al = 0` encoder mirror was the
+matching dead else-arm. The bodies become straight-line
+`for pos in row1_median_start..n {}` walks with three branch-free
+lookback indices (`pos - 2`, `pos - row_bytes`, `pos - row_bytes -
+2`) — also dropping the `pos.wrapping_sub(2)` substitute that was
+only there to silence a no-longer-needed signed-wrap concern. Lib
+test count: 160 → 161 (new
+`roundtrip_yuy2_median_round202_boundary_widths` sweeps nine
+`(width, height)` pairs bracketing the LEFT-exemption + AL-index
+boundaries — widths 2 / 4 / 6 / 8 × heights 3..8). Decode bench
+(`decode_yuy2_320x240_median_classic`) lands at ≈ 1.45 ms/frame
+(within noise of the pre-202 baseline — the median tail-loop was
+already a small fraction of total decode time, where Huffman
+bit-decode dominates; the value is correctness clarity, not
+throughput delta). Round 186 — `predict::forward_rgb_left_subtract_linear(src, dst,
 n_channels)` collapses the encoder's per-channel triple/quad-pass
 stride-`n` LEFT-residual loop (RGB24: 3 passes with stride 3; RGB32:
 4 passes with stride 4) into a single linear stride-1 walk producing
@@ -546,6 +568,54 @@ test-only `[dev-dependencies] oxideav-avi`.
   pre-existing RGB24 / RGB32 LEFT / Gradient / LeftDecorr /
   GradientDecorr round-trip + the `lockstep_rgb24_*` AVI-lockstep
   tests stay green. Lib test count: 153 → 158.
+
+## What works (Round 202)
+
+- **YUY2 Median tail-loop dead-branch strip.** Both inverses
+  (`predict::inverse_median_post`, `decoder::inverse_yuy2_median`)
+  and the encoder analogue (`predict::forward_median_subtract`)
+  shed the three intra-loop dead branches they had carried since
+  round 1:
+  - `if pos < 2 || pos < row_bytes { pos += 1; continue; }` — never
+    triggered because the loop starts at `row1_median_start =
+    (row_bytes + 8).min(n)`, so `pos >= row_bytes + 8 >= row_bytes
+    >= 2` on every iteration.
+  - `let al = if pos >= row_bytes + 2 { out[pos - row_bytes - 2] }
+    else { 0 };` — the `else { 0 }` arm is unreachable for the same
+    reason (`pos - row_bytes >= 8 >= 2`).
+  - `let l = out[pos.wrapping_sub(2)];` — the `wrapping_sub`
+    substitute was only there to keep the index expression
+    well-formed under the now-dropped `pos < 2` reachability.
+    Replaced with the plain non-wrapping `out[pos - 2]`.
+- **Wire-identical to round 196.** spec/03 §2.3.2 + audit/01 §7.2's
+  wire-byte LEFT-exemption invariants (`row1_median_start >= row_bytes
+  + 8`, hence `>= row_bytes + 2`) anchor every dropped branch as
+  provably dead; the three lookback indices in the new straight-line
+  body (`out[pos - 2]`, `out[pos - row_bytes]`, `out[pos - row_bytes
+  - 2]`) are all in-bounds for every iteration. `debug_assert!`s at
+  function entry pin the row-stride invariant so future refactors
+  can't silently violate it. The branch-free body is a small win on
+  the median tail-loop itself, but the value is correctness
+  clarity — the prior form's wrap-arithmetic + multi-arm `if` was
+  carrying state the spec rules out.
+- **Boundary regression coverage.** New test
+  `roundtrip_yuy2_median_round202_boundary_widths` sweeps nine
+  `(width, height)` pairs that bracket the LEFT-exemption +
+  AL-index boundaries:
+  - Width 2 (`row_bytes = 4 < 8` — the narrow case the round-196
+    wire-asymmetry fix targeted): heights 4, 5, 6, 8 — confirming
+    the post-202 loop still wire-roundtrips when the LEFT
+    exemption extends past the row-1 boundary.
+  - Width 4 (`row_bytes = 8`, exemption ends exactly at row-2
+    start): heights 3, 4, 8 — exercising the AL-lookback into row
+    0 from the first median pos in row 2.
+  - Widths 6, 8 × height 4 — exemption sits mid-row 1, median
+    region starts later within row 1.
+- **Lib test count: 160 → 161.** Bench delta (320×240 YUY2 Median
+  ClassicV2 decode) is within Criterion noise of the pre-202
+  baseline (≈ 1.45 ms/frame; the median tail-loop accounted for a
+  small fraction of total decode time because the Huffman bit-decode
+  dominates the cost on the ClassicV2 path).
 
 ## Out of scope (deferred)
 

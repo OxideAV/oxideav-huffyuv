@@ -523,6 +523,18 @@ fn inverse_yuy2_left_range(out: &mut [u8], begin: usize, end: usize) {
 /// YUY2 MEDIAN inverse: spec/03 §2.3.2. LEFT-predicts row 0 + the
 /// first 8 wire bytes of row 1, then per-byte median add for rows 1
 /// pos ≥ 8 + every later row.
+///
+/// Round-202: strip the two dead branches the median tail-loop had
+/// been carrying since round 1. After the LEFT-exemption pass the
+/// loop start is at `row_bytes + 8` (capped at `len`), so for every
+/// iteration `pos >= row_bytes + 8 >= 8 >= 2` and `pos - row_bytes >=
+/// 8 >= 2` — i.e. neither `pos < 2 || pos < row_bytes` nor `pos <
+/// row_bytes + 2` is ever true here, so both `if`-arms were dead.
+/// The cleanup leaves a single straight-line per-byte median body
+/// whose three lookback indices (`pos - 2`, `pos - row_bytes`, `pos -
+/// row_bytes - 2`) are all provably in-bounds. Spec/03 §2.3.2 +
+/// audit/01 §7.2 anchor the wire-byte LEFT exemption that makes
+/// the AL-lookback safe without a per-iteration guard.
 fn inverse_yuy2_median(out: &mut [u8], row_bytes: usize) {
     let len = out.len();
     if len <= 4 {
@@ -532,30 +544,26 @@ fn inverse_yuy2_median(out: &mut [u8], row_bytes: usize) {
     let row0_end = row_bytes.min(len);
     inverse_yuy2_left_range(out, 4, row0_end);
     // First 8 bytes of row 1 (LEFT exemption).
-    if len > row_bytes {
-        let row1_left_end = (row_bytes + 8).min(len);
-        inverse_yuy2_left_range(out, row_bytes, row1_left_end);
-        // Median per-byte add for the remaining bytes of row 1 + all
-        // rows ≥ 2. spec/03 §2.3 trace: L at -2, A at -row_stride,
-        // AL at -row_stride - 2.
-        let mut pos = row1_left_end;
-        while pos < len {
-            if pos < 2 || pos < row_bytes {
-                pos += 1;
-                continue;
-            }
-            let l = out[pos - 2];
-            let a = out[pos - row_bytes];
-            let al = if pos >= row_bytes + 2 {
-                out[pos - row_bytes - 2]
-            } else {
-                0
-            };
-            let g = l.wrapping_add(a).wrapping_sub(al);
-            let predictor = crate::predict::median3(l, a, g);
-            out[pos] = out[pos].wrapping_add(predictor);
-            pos += 1;
-        }
+    if len <= row_bytes {
+        return;
+    }
+    let row1_left_end = (row_bytes + 8).min(len);
+    inverse_yuy2_left_range(out, row_bytes, row1_left_end);
+    if row1_left_end >= len {
+        return;
+    }
+    // Median per-byte add for the remaining bytes of row 1 + all
+    // rows ≥ 2. spec/03 §2.3 trace: L at -2, A at -row_stride,
+    // AL at -row_stride - 2. With `row1_left_end >= row_bytes + 8`,
+    // every lookback below is in-bounds.
+    debug_assert!(row1_left_end >= row_bytes + 2);
+    for pos in row1_left_end..len {
+        let l = out[pos - 2];
+        let a = out[pos - row_bytes];
+        let al = out[pos - row_bytes - 2];
+        let g = l.wrapping_add(a).wrapping_sub(al);
+        let predictor = crate::predict::median3(l, a, g);
+        out[pos] = out[pos].wrapping_add(predictor);
     }
 }
 
