@@ -5,8 +5,26 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 202 — YUY2 Median tail-loop dead-branch strip on both sides
-of the codec.** spec/03 §2.3.2 + audit/01 §7.2's wire-byte LEFT
+**Round 208 — decoder LEFT-helper consolidation.** Drops three
+single-use decoder-local wrappers (`decoder::inverse_left_per_channel`,
+`decoder::inverse_yuy2_left`, `decoder::inverse_yuy2_left_range`) and
+re-points the YUY2 + RGB24 + RGB32 decode paths at the public
+predict-side helpers (`predict::inverse_left_row` for the per-channel
+stride-`n` LEFT walk; `predict::inverse_yuy2_left_macropixel` for the
+YUY2 byte-position-stride LEFT walk) directly. The first was a
+byte-for-byte duplicate of `inverse_left_row` (same `if out.len() <=
+n { return; }` guard, same `out[i] = out[i].wrapping_add(out[i - n])`
+body); the two YUY2-LEFT shims were thin pass-throughs into
+`predict::inverse_yuy2_left_macropixel` already, left over from the
+round-181 macropixel-step rewrite. The decoder now uses one source
+of truth for both LEFT predictors — the predict-side helpers in
+`predict.rs` per spec/03 §2.1 (per-channel) + §2.1.1 (YUY2). Three
+new regression-guard tests (`round208_reuse_tests`) lock the
+predict-side helpers against a naive scalar reference of the spec
+form so a future refactor cannot silently invert LEFT differently.
+Lib test count: 161 → 164. **Round 202 — YUY2 Median tail-loop
+dead-branch strip on both sides of the codec.** spec/03 §2.3.2 +
+audit/01 §7.2's wire-byte LEFT
 exemption (`row_bytes + 8` bytes of LEFT before MEDIAN engages) means
 every iteration of the post-exemption median loop satisfies
 `pos >= row_bytes + 8`, so the pre-round-202 `if pos < 2 || pos <

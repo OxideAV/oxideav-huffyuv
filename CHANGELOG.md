@@ -8,6 +8,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Round-208: drop three single-use decoder-local LEFT wrappers
+  (`decoder::inverse_left_per_channel`, `decoder::inverse_yuy2_left`,
+  `decoder::inverse_yuy2_left_range`) and re-point the YUY2 + RGB24 +
+  RGB32 decode paths at the public predict-side helpers
+  (`predict::inverse_left_row` for the per-channel stride-`n` LEFT
+  walk; `predict::inverse_yuy2_left_macropixel` for the YUY2
+  byte-position-stride LEFT walk) directly. `inverse_left_per_channel`
+  was a byte-for-byte duplicate of `inverse_left_row` — same
+  `if out.len() <= n { return; }` guard, same `out[i] =
+  out[i].wrapping_add(out[i - n])` body, just expressed as a `while
+  idx < ...` loop in one and a `for` loop in the other — and the two
+  YUY2-LEFT shims (`inverse_yuy2_left` /
+  `inverse_yuy2_left_range`) were already thin pass-throughs into
+  `predict::inverse_yuy2_left_macropixel` (left over from the round-181
+  macropixel-step rewrite that retired the original per-byte `i & 3`
+  switch). The cleanup gives the decoder one source of truth for both
+  LEFT predictors (`predict.rs`) instead of two — matches spec/03 §2.1
+  (per-channel) and §2.1.1 (YUY2) as the single canonical
+  implementation. The three deleted helpers were 28 lines of
+  duplication. Lib test count: 161 → 164 (new `round208_reuse_tests`
+  module: `predict_inverse_left_row_matches_decoder_naive_rgb24` /
+  `_rgb32` /
+  `predict_inverse_yuy2_left_macropixel_matches_decoder_naive` — each
+  checks the predict-side helper produces byte-identical output to a
+  naive scalar reference of the spec/03 §2.1 / §2.1.1 textual form, so
+  a future refactor cannot silently invert LEFT differently on either
+  side).
+
 - Round-202: strip three intra-loop dead branches from the YUY2 Median
   tail-loop on both sides of the codec. After spec/03 §2.3.2 +
   audit/01 §7.2's wire-byte LEFT exemption (the loop start sits at

@@ -9,8 +9,8 @@ use crate::bitio::BitReader;
 use crate::error::{Error, Result};
 use crate::header::{PixelFamily, Predictor, StreamConfig};
 use crate::predict::{
-    interleave_fields, inverse_gradient_post, inverse_rgb_decorr_bgr, inverse_rgb_decorr_bgra,
-    is_interlaced_height,
+    interleave_fields, inverse_gradient_post, inverse_left_row, inverse_rgb_decorr_bgr,
+    inverse_rgb_decorr_bgra, inverse_yuy2_left_macropixel, is_interlaced_height,
 };
 use crate::tables::{
     classic_blob_bytes, decode_one, rle_decode_one_channel, rle_decode_three_channels,
@@ -265,10 +265,10 @@ fn decode_yuy2_field(
     //   row 1; median per-byte add elsewhere.
     match predictor {
         Predictor::Left => {
-            inverse_yuy2_left(&mut pixels);
+            inverse_yuy2_left_macropixel(&mut pixels, 4, total_bytes);
         }
         Predictor::Gradient => {
-            inverse_yuy2_left(&mut pixels);
+            inverse_yuy2_left_macropixel(&mut pixels, 4, total_bytes);
             inverse_gradient_post(&mut pixels, row_bytes, height_us);
         }
         Predictor::Median => {
@@ -368,7 +368,7 @@ fn decode_rgb24_field(
     // Predictor inverse on the per-channel residual stream. Channels
     // are interleaved 3-byte BGR; LEFT walks each channel via stride
     // 3.
-    inverse_left_per_channel(&mut pixels, 3);
+    inverse_left_row(&mut pixels, 3);
     match predictor {
         Predictor::Left => {}
         Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height_us),
@@ -464,7 +464,7 @@ fn decode_rgb32_field(
     let consumed = 4 + reader.bytes_consumed();
 
     // Per-channel LEFT inverse, stride 4.
-    inverse_left_per_channel(&mut pixels, 4);
+    inverse_left_row(&mut pixels, 4);
     match predictor {
         Predictor::Left => {}
         Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height_us),
@@ -487,39 +487,6 @@ fn decode_rgb32_field(
     ))
 }
 
-/// Per-channel LEFT inverse on an N-channel-interleaved buffer. Each
-/// channel walks its own LEFT-pass via stride `n_channels`. spec/03
-/// §2.1.
-fn inverse_left_per_channel(out: &mut [u8], n_channels: usize) {
-    if out.len() <= n_channels {
-        return;
-    }
-    for i in n_channels..out.len() {
-        out[i] = out[i].wrapping_add(out[i - n_channels]);
-    }
-}
-
-/// YUY2 LEFT inverse with the per-byte-position strides of spec/03
-/// §2.1.1 (Y₁ ← Y₂_prev_macro at -2; U ← U_prev_macro at -4 (= -3
-/// from byte 1); Y₂ ← Y₁_same_macro at -2; V ← V_prev_macro at -4
-/// (= -3 from byte 3)). Walks the linear raster from byte 4 onward;
-/// the first 4 bytes are the uncompressed seed.
-fn inverse_yuy2_left(out: &mut [u8]) {
-    inverse_yuy2_left_range(out, 4, out.len());
-}
-
-fn inverse_yuy2_left_range(out: &mut [u8], begin: usize, end: usize) {
-    if end <= begin {
-        return;
-    }
-    // Round 181: route through the branch-free macropixel-step
-    // helper (spec/03 §2.1.1, four-channel Y₁ / U / Y₂ / V body)
-    // instead of the per-byte `i & 3` switch. Bit-identical output;
-    // see `predict::inverse_yuy2_left_macropixel` for the spec
-    // citation + equivalence regression test.
-    crate::predict::inverse_yuy2_left_macropixel(out, begin, end);
-}
-
 /// YUY2 MEDIAN inverse: spec/03 §2.3.2. LEFT-predicts row 0 + the
 /// first 8 wire bytes of row 1, then per-byte median add for rows 1
 /// pos ≥ 8 + every later row.
@@ -535,6 +502,16 @@ fn inverse_yuy2_left_range(out: &mut [u8], begin: usize, end: usize) {
 /// row_bytes - 2`) are all provably in-bounds. Spec/03 §2.3.2 +
 /// audit/01 §7.2 anchor the wire-byte LEFT exemption that makes
 /// the AL-lookback safe without a per-iteration guard.
+///
+/// Round-208: drops three single-use decoder-local wrappers
+/// (`inverse_left_per_channel`, `inverse_yuy2_left`,
+/// `inverse_yuy2_left_range`) and consumes the public predict-side
+/// helpers directly. `inverse_left_per_channel` was a byte-for-byte
+/// duplicate of `predict::inverse_left_row`, and the two YUY2-LEFT
+/// shims were thin pass-throughs into
+/// `predict::inverse_yuy2_left_macropixel` already (left over from
+/// the round-181 macropixel-step rewrite). Single source of truth
+/// for both predictors now lives in `predict.rs`.
 fn inverse_yuy2_median(out: &mut [u8], row_bytes: usize) {
     let len = out.len();
     if len <= 4 {
@@ -542,13 +519,13 @@ fn inverse_yuy2_median(out: &mut [u8], row_bytes: usize) {
     }
     // Row 0 LEFT pass.
     let row0_end = row_bytes.min(len);
-    inverse_yuy2_left_range(out, 4, row0_end);
+    inverse_yuy2_left_macropixel(out, 4, row0_end);
     // First 8 bytes of row 1 (LEFT exemption).
     if len <= row_bytes {
         return;
     }
     let row1_left_end = (row_bytes + 8).min(len);
-    inverse_yuy2_left_range(out, row_bytes, row1_left_end);
+    inverse_yuy2_left_macropixel(out, row_bytes, row1_left_end);
     if row1_left_end >= len {
         return;
     }
@@ -629,5 +606,76 @@ mod degenerate_dims_tests {
         let c = cfg(PixelFamily::Yuy2, Method::Left, 2, 290);
         let frame = [0u8; 8];
         let _ = decode_frame(&c, &frame); // Ok or Err, never panic.
+    }
+}
+
+#[cfg(test)]
+mod round208_reuse_tests {
+    //! Round-208 regression guard. After the three single-use
+    //! decoder-local LEFT wrappers (`inverse_left_per_channel`,
+    //! `inverse_yuy2_left`, `inverse_yuy2_left_range`) were dropped
+    //! and the YUY2 / RGB decode paths re-pointed at the public
+    //! predict-side helpers (`inverse_left_row` /
+    //! `inverse_yuy2_left_macropixel`) directly, we lock the new
+    //! call-graph in against a from-scratch reference body to keep
+    //! a future refactor from silently inverting LEFT differently.
+    //!
+    //! spec/03 §2.1 (per-channel LEFT) and §2.1.1 (YUY2 macropixel
+    //! LEFT) define the two predictors exercised here.
+    use crate::predict::{inverse_left_row, inverse_yuy2_left_macropixel};
+
+    /// Naive scalar per-channel LEFT inverse — one cumulative running
+    /// sum per channel slot, stride `n` apart. Mirrors the textual
+    /// definition in spec/03 §2.1.
+    fn ref_inverse_left_per_channel(out: &mut [u8], n: usize) {
+        for i in n..out.len() {
+            out[i] = out[i].wrapping_add(out[i - n]);
+        }
+    }
+
+    /// Naive scalar YUY2 LEFT inverse — the per-byte-position-stride
+    /// form from spec/03 §2.1.1 (Y₁ / Y₂ at -2, U / V at -4).
+    fn ref_inverse_yuy2_left(out: &mut [u8]) {
+        for i in 4..out.len() {
+            let stride = if i & 1 == 0 { 2 } else { 4 };
+            out[i] = out[i].wrapping_add(out[i - stride]);
+        }
+    }
+
+    #[test]
+    fn predict_inverse_left_row_matches_decoder_naive_rgb24() {
+        // 3-channel BGR @ width=7, height=5 → 105 bytes.
+        let mut a = (0..105u32)
+            .map(|x| (x.wrapping_mul(37) ^ 0x5a) as u8)
+            .collect::<Vec<_>>();
+        let mut b = a.clone();
+        ref_inverse_left_per_channel(&mut a, 3);
+        inverse_left_row(&mut b, 3);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn predict_inverse_left_row_matches_decoder_naive_rgb32() {
+        // 4-channel BGRA @ width=6, height=4 → 96 bytes.
+        let mut a = (0..96u32)
+            .map(|x| (x.wrapping_mul(53) ^ 0xa5) as u8)
+            .collect::<Vec<_>>();
+        let mut b = a.clone();
+        ref_inverse_left_per_channel(&mut a, 4);
+        inverse_left_row(&mut b, 4);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn predict_inverse_yuy2_left_macropixel_matches_decoder_naive() {
+        // YUY2 row_bytes = 2*width; 8x6 → 96 bytes.
+        let mut a = (0..96u32)
+            .map(|x| (x.wrapping_mul(29) ^ 0xc3) as u8)
+            .collect::<Vec<_>>();
+        let mut b = a.clone();
+        let n = b.len();
+        ref_inverse_yuy2_left(&mut a);
+        inverse_yuy2_left_macropixel(&mut b, 4, n);
+        assert_eq!(a, b);
     }
 }
