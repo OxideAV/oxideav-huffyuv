@@ -5,7 +5,32 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 214 — macropixel-step YUY2 Huffman-decode body.** The
+**Round 221 — macropixel-step YUY2 Huffman-encode body.** The
+encoder mirror of r214's decode-side rewrite. The pre-r221
+`emit_bitstream_parts` YUY2 branch ran `match byte_idx & 3` on every
+body byte to pick the per-channel slot (Y₁/Y₂ → slot1, U → slot2,
+V → slot3), so the slot-pointer reload + branch sat on the critical
+path of every Huffman emit. Round 221 pins spec/03 §1.2's three-slot
+architecture at the source by stepping four body bytes per outer
+iteration with the slot resolved at compile time — the inner body
+becomes a fixed straight-line
+`lookup_code(slot1) → write_msb → lookup_code(slot2) → write_msb →
+lookup_code(slot1) → write_msb → lookup_code(slot3) → write_msb`
+sequence per 4-byte macropixel. `body.len() & !3` is the aligned
+upper bound; `body.len() % 4 == 0` holds in the in-spec input space
+(YUY2 width is even per the spec/02 §3.1 macropixel-pair invariant
+and `body.len() = total_bytes − 4` per field), so the macropixel
+body covers every emit byte. A 1..=3-byte scalar fall-through is
+kept for defence-in-depth, mirroring the same shape landed in r214
+on the decoder side. Wire-identical to round 214 — six new
+`round221_yuy2_emit_macropixel_tests` lock the rewrite at byte
+equality, including a `*_matches_per_byte_reference` witness that
+diffs the production emit against an inlined copy of the pre-r221
+per-byte slot-dispatch body across Left / Gradient / Median
+predictors (CustomV2 mode so the three slot tables are content-
+distinct and a slot mix-up surfaces immediately as a Huffman-code
+mismatch on the wire). Lib test count: 170 → 176. **Round 214 —
+macropixel-step YUY2 Huffman-decode body.** The
 pre-r214 `decode_yuy2_field` loop ran `match byte_idx % 4` on every
 output byte to pick the per-channel slot (Y₁/Y₂ → slot1, U → slot2,
 V → slot3), so the slot-pointer reload sat on the critical path of

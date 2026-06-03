@@ -1180,14 +1180,62 @@ fn emit_bitstream_parts(
     let mut writer = BitWriter::new();
     match family {
         PixelFamily::Yuy2 => {
-            for (byte_idx, &sym) in (4usize..).zip(body.iter()) {
+            // Round-221: macropixel-step YUY2 Huffman-encode body.
+            // spec/03 §1.2's three-slot architecture pins the YUY2
+            // wire-byte → slot mapping at a fixed 4-byte cycle:
+            //
+            //   +0 (Y₁) → slot1   +1 (U) → slot2
+            //   +2 (Y₂) → slot1   +3 (V) → slot3
+            //
+            // The pre-r221 loop ran `match byte_idx & 3 { … }` on
+            // every body byte to pick the slot — a per-byte branch
+            // the optimiser couldn't eliminate because `byte_idx` was
+            // tied to the iterator state. r214 rewrote the decoder's
+            // mirror loop (`decode_yuy2_field`) to step four output
+            // bytes per outer iteration with the slot resolved at
+            // compile time; this round mirrors the same shape on the
+            // encoder side. `lookup_code` + `write_msb` per slot,
+            // four pairs straight-line per macropixel.
+            //
+            // `body.len()` is always a multiple of 4 in the in-spec
+            // input space: spec/02 §3.1 fixes YUY2 width even (the
+            // §2.1.1 macropixel-pair invariant the predict pipeline
+            // already enforces), so `total_bytes = width × 2 ×
+            // height` is divisible by 4 and `body.len() = total_bytes
+            // − 4` (per-field for interlaced) is a multiple of 4.
+            // We keep a 1..=3-byte scalar fall-through for
+            // defence-in-depth against future pixel-family
+            // extensions — same shape as the decoder-side fall-
+            // through landed in r214.
+            let body_aligned = body.len() & !3;
+            let mut i = 0usize;
+            while i < body_aligned {
+                // byte_idx = i + 4 → byte_idx & 3 == i & 3, and
+                // i is 4-aligned here so the four slots line up at
+                // i+0 / i+1 / i+2 / i+3 = Y₁ / U / Y₂ / V.
+                let (c0, l0) = lookup_code(slot1, body[i])?;
+                writer.write_msb(c0, l0);
+                let (c1, l1) = lookup_code(slot2, body[i + 1])?;
+                writer.write_msb(c1, l1);
+                let (c2, l2) = lookup_code(slot1, body[i + 2])?;
+                writer.write_msb(c2, l2);
+                let (c3, l3) = lookup_code(slot3, body[i + 3])?;
+                writer.write_msb(c3, l3);
+                i += 4;
+            }
+            // Scalar fall-through for any 1..=3 trailing bytes
+            // (unreachable for valid YUY2 inputs; kept for
+            // robustness).
+            while i < body.len() {
+                let byte_idx = i + 4;
                 let slot = match byte_idx & 3 {
                     0 | 2 => slot1,
                     1 => slot2,
                     _ => slot3,
                 };
-                let (code, length) = lookup_code(slot, sym)?;
+                let (code, length) = lookup_code(slot, body[i])?;
                 writer.write_msb(code, length);
+                i += 1;
             }
         }
         PixelFamily::Rgb24 => {
@@ -1244,4 +1292,233 @@ fn lookup_code(table: &HuffTable, sym: u8) -> Result<(u32, u32)> {
         )));
     }
     Ok((entry.code, entry.length as u32))
+}
+
+#[cfg(test)]
+mod round221_yuy2_emit_macropixel_tests {
+    //! Round-221 regression guard. The encoder's YUY2 Huffman-emit
+    //! loop in [`emit_bitstream_parts`] was rewritten from a per-byte
+    //! `match byte_idx & 3` slot dispatch into a macropixel-step body
+    //! that emits four codes per outer iteration (Y₁ via slot1, U via
+    //! slot2, Y₂ via slot1, V via slot3) — the encoder-side analogue
+    //! of round 214's decode-side macropixel rewrite (also branch
+    //! elimination on the same 4-byte cycle).
+    //!
+    //! spec/03 §1.2's three-slot architecture (the wire-format
+    //! invariant the rewrite leans on) pins the YUY2 byte → slot
+    //! mapping at `+0 (Y₁) → slot1; +1 (U) → slot2; +2 (Y₂) → slot1;
+    //! +3 (V) → slot3` for every 4-byte macropixel.
+    //!
+    //! Coverage:
+    //!
+    //! - **Encode-then-decode round-trips** for widths bracketing the
+    //!   macropixel-step boundary (2 / 4 / 8 / 16). The in-spec input
+    //!   space is already `body.len() % 4 == 0` because YUY2 width is
+    //!   even per the §2.1.1 macropixel-pair invariant the predict
+    //!   pipeline already enforces, but explicit small-width coverage
+    //!   exercises the new step body against minimal macropixel
+    //!   counts.
+    //! - **Wire-byte witness** — the production emit is diffed
+    //!   against an inlined copy of the pre-r221 per-byte slot
+    //!   dispatch body across Left / Gradient / Median predictors.
+    //!   The wire bytes must be byte-identical between the two.
+    //! - **V1xCompat path** — slot1 / slot2 / slot3 hold distinct
+    //!   tables (slot1 = set A, slot2 = set B, slot3 = set B per
+    //!   spec/04 §4.1), so a slot mix-up inside the unrolled body
+    //!   would surface as a Huffman-code mismatch on the wire even
+    //!   before the round-trip predictor pass.
+
+    use super::*;
+
+    fn synth_yuy2(width: usize, height: usize) -> Vec<u8> {
+        // Deterministic xorshift32 ramp; same shape as the
+        // round214 decoder-side helper but inlined to keep this
+        // module self-contained.
+        let mut s: u32 = 0xDEAD_BEEF;
+        let n = width * height * 2;
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    fn rt_yuy2(width: u32, height: u32, method: Method, mode: ExtradataMode) {
+        use crate::decoder::decode_frame;
+        let pixels = synth_yuy2(width as usize, height as usize);
+        let (bih, frame) =
+            encode_frame_with_mode(PixelFamily::Yuy2, method, width, height, &pixels, mode)
+                .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let decoded = decode_frame(&cfg, &frame).expect("decode");
+        assert_eq!(decoded.pixels, pixels);
+    }
+
+    #[test]
+    fn round221_yuy2_left_classic_width_2() {
+        // width=2 → row_bytes=4, exactly one macropixel per row.
+        // Step body fires exactly (height − 1) × 1 + (W/2 − 1) times
+        // depending on field split; the small case exercises the
+        // body against minimal macropixel counts.
+        rt_yuy2(2, 6, Method::Left, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round221_yuy2_left_classic_width_4() {
+        // width=4 → row_bytes=8, two macropixels per row.
+        rt_yuy2(4, 4, Method::Left, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round221_yuy2_gradient_custom_width_8() {
+        // width=8 / Gradient / CustomV2 — runtime-built Huffman
+        // tables (CustomV2 derives per-channel lengths from
+        // histograms, so a slot mix-up inside the unrolled body
+        // surfaces as a Huffman-code mismatch).
+        rt_yuy2(8, 5, Method::Gradient, ExtradataMode::CustomV2);
+    }
+
+    #[test]
+    fn round221_yuy2_median_v1x_width_8() {
+        // V1xCompat path: slot1 = set A, slot2 = set B, slot3 = set
+        // B per spec/04 §4.1. Distinct tables-per-slot is the
+        // cleanest wire-level witness that the step body wires each
+        // residual byte to the right slot.
+        rt_yuy2(8, 7, Method::Median, ExtradataMode::V1xCompat);
+    }
+
+    #[test]
+    fn round221_yuy2_left_classic_width_16_height_3() {
+        // Wider row + small height — four macropixels per row across
+        // three rows so the step body crosses the row boundary
+        // multiple times. The emit loop doesn't depend on row
+        // boundaries (the slot mapping is wire-byte-modular, not
+        // row-modular), so this also pins the rewrite against a
+        // future attempt to re-introduce row-aware state inside the
+        // step body.
+        rt_yuy2(16, 3, Method::Left, ExtradataMode::ClassicV2);
+    }
+
+    /// Reference body: the pre-r221 per-byte slot-dispatch emit loop
+    /// inlined verbatim. Drives a wire-byte witness alongside the
+    /// production [`emit_bitstream_parts`] over the same `body`,
+    /// `slot1`, `slot2`, `slot3` triple. The two streams must be
+    /// byte-identical.
+    fn ref_emit_yuy2_per_byte(
+        seed: &[u8; 4],
+        body: &[u8],
+        slot1: &HuffTable,
+        slot2: &HuffTable,
+        slot3: &HuffTable,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(seed);
+        let mut writer = BitWriter::new();
+        for (byte_idx, &sym) in (4usize..).zip(body.iter()) {
+            let slot = match byte_idx & 3 {
+                0 | 2 => slot1,
+                1 => slot2,
+                _ => slot3,
+            };
+            let (code, length) = lookup_code(slot, sym).expect("ref lookup");
+            writer.write_msb(code, length);
+        }
+        out.extend_from_slice(&writer.finish());
+        out
+    }
+
+    #[test]
+    fn round221_yuy2_emit_matches_per_byte_reference() {
+        // For each (width, height, predictor) triple, drive the
+        // residual pipeline twice with identical inputs: once via
+        // the production emit_bitstream_parts (round-221 step body),
+        // once via the pre-r221 per-byte reference above. The
+        // resulting wire frames must be byte-identical — any
+        // divergence implies the step body's slot mapping has
+        // drifted from the spec/03 §1.2 invariant.
+        //
+        // We exercise CustomV2 mode specifically because
+        // (a) it produces three distinct, content-dependent
+        // length tables (slot1 / slot2 / slot3), so a slot mix-up
+        // changes code lengths immediately, and (b) it runs the
+        // full encode pipeline from `pixels`. The ClassicV2 path
+        // would also work but its three tables for YUY2 happen to
+        // coincide on enough symbols that mismatches could mask.
+        for (w, h, method) in [
+            (4u32, 4u32, Method::Left),
+            (8, 6, Method::Gradient),
+            (8, 6, Method::Median),
+            (16, 3, Method::Left),
+        ] {
+            let pixels = synth_yuy2(w as usize, h as usize);
+            // Production wire bytes via the full encode_frame path.
+            let (_bih, prod_frame) = encode_frame_with_mode(
+                PixelFamily::Yuy2,
+                method,
+                w,
+                h,
+                &pixels,
+                ExtradataMode::CustomV2,
+            )
+            .expect("encode");
+
+            // Re-derive the seed + body the encoder fed to
+            // emit_bitstream_parts. compute_frame_residuals +
+            // compute_lengths_from_body gives us a body identical
+            // to the production path; build_three_tables (via
+            // CustomV2's emitted extradata) gives us slot1/2/3.
+            let frame = compute_frame_residuals(PixelFamily::Yuy2, method, w, h, &pixels)
+                .expect("residuals");
+            let lengths =
+                compute_lengths_from_body(PixelFamily::Yuy2, method, &frame.combined_body);
+            // Build the slot HuffTables from the computed lengths.
+            // Matches the v2.x Custom path in encode_with_precomputed.
+            let slot1 = HuffTable::build_from_lengths(&lengths[0]).expect("slot1");
+            let slot2 = HuffTable::build_from_lengths(&lengths[1]).expect("slot2");
+            let slot3 = HuffTable::build_from_lengths(&lengths[2]).expect("slot3");
+
+            // Reference emit using the pre-r221 per-byte body.
+            let ref_frame = ref_emit_yuy2_per_byte(
+                &frame.top_seed,
+                &frame.combined_body,
+                &slot1,
+                &slot2,
+                &slot3,
+            );
+
+            // The production wire bytes start with the bih extradata
+            // we discarded; the round we care about is the frame
+            // chunk itself, which is what encode_frame_with_mode
+            // already returns as the second tuple element. Cross-
+            // check production wire equals our local reference
+            // assembly using identical tables.
+            let prod_emit = emit_bitstream_parts(
+                PixelFamily::Yuy2,
+                method,
+                &frame.top_seed,
+                &frame.combined_body,
+                &slot1,
+                &slot2,
+                &slot3,
+            )
+            .expect("prod emit");
+            assert_eq!(
+                prod_emit, ref_frame,
+                "round221 wire-byte divergence @ {}x{} {:?}",
+                w, h, method
+            );
+            // And the production end-to-end frame must contain the
+            // same emit-region bytes (its tail = prod_emit).
+            assert!(
+                prod_frame.windows(prod_emit.len()).any(|w| w == prod_emit),
+                "round221 production frame does not contain reference emit @ {}x{} {:?}",
+                w,
+                h,
+                method
+            );
+        }
+    }
 }
