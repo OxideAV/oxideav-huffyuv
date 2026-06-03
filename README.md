@@ -5,8 +5,31 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 208 — decoder LEFT-helper consolidation.** Drops three
-single-use decoder-local wrappers (`decoder::inverse_left_per_channel`,
+**Round 214 — macropixel-step YUY2 Huffman-decode body.** The
+pre-r214 `decode_yuy2_field` loop ran `match byte_idx % 4` on every
+output byte to pick the per-channel slot (Y₁/Y₂ → slot1, U → slot2,
+V → slot3), so the slot-pointer reload sat on the critical path of
+every Huffman lookup. Round 214 pins spec/03 §1.2's three-slot
+architecture at the source by stepping four output bytes per outer
+iteration with the slot resolved at compile time — the inner body
+becomes a fixed straight-line `decode_one(slot1) → decode_one(slot2)
+→ decode_one(slot1) → decode_one(slot3)` sequence plus four indexed
+stores per 4-byte macropixel. The decode-side analogue of round 181's
+LEFT macropixel-step rewrite (also branch-elimination on the same
+4-byte cycle, mirrored to the Huffman-decode loop now that the LEFT
+inverse already shed its `i & 3` switch). `(total_bytes - 4) % 4 ==
+0` is invariant in the in-spec input space (YUY2 width is even per
+the macropixel-pair invariant the decoder already checks), so the
+macropixel body covers every remaining byte; a 1..=3-byte scalar
+fall-through is kept for defence-in-depth against future
+pixel-family extensions. Wire-identical to round 208 — six new
+`round214_yuy2_decode_macropixel_tests` lock the rewrite at
+byte-equality, including a `*_matches_per_byte_reference` witness
+that diffs the production decode against an inlined copy of the
+pre-r214 per-byte slot-dispatch body across Left / Gradient / Median
+predictors. Lib test count: 164 → 170. **Round 208 — decoder
+LEFT-helper consolidation.** Drops three single-use decoder-local
+wrappers (`decoder::inverse_left_per_channel`,
 `decoder::inverse_yuy2_left`, `decoder::inverse_yuy2_left_range`) and
 re-points the YUY2 + RGB24 + RGB32 decode paths at the public
 predict-side helpers (`predict::inverse_left_row` for the per-channel
@@ -634,6 +657,37 @@ test-only `[dev-dependencies] oxideav-avi`.
   baseline (≈ 1.45 ms/frame; the median tail-loop accounted for a
   small fraction of total decode time because the Huffman bit-decode
   dominates the cost on the ClassicV2 path).
+
+## What works (Round 214)
+
+- **`decode_yuy2_field` macropixel-step Huffman-decode body.** The
+  pre-r214 loop ran `match byte_idx % 4` on every output byte to pick
+  the per-channel slot — for a 1920×1080 YUY2 frame that's ~4M
+  per-byte branches with a `&tables.slotN` reload on the critical
+  path of every `decode_one` call. Round 214 hoists the spec/03 §1.2
+  three-slot wire-byte pattern out of the loop entirely by stepping
+  four output bytes per outer iteration with the slot resolved at
+  compile time. The inner body is now a fixed straight-line
+  4-decode / 4-store sequence (`decode_one(slot1) → decode_one(slot2)
+  → decode_one(slot1) → decode_one(slot3)`) the optimiser can
+  schedule freely. spec/03 §1.2 invariants used: byte +0 (Y₁) → slot1,
+  byte +1 (U) → slot2, byte +2 (Y₂) → slot1, byte +3 (V) → slot3.
+  Decode-side mirror of round 181's LEFT macropixel-step rewrite.
+- **Wire-identical to round 208** — the new step body produces the
+  identical pre-predictor sample stream for every YUY2 input that
+  `(total_bytes - 4) % 4 == 0` covers (the in-spec input space; YUY2
+  width is even per the §2.1.1 macropixel-pair invariant the decoder
+  already checks). A 1..=3-byte scalar fall-through preserves the
+  prior per-byte semantics for any future layout that lands the body
+  on a non-macropixel boundary. Six new
+  `round214_yuy2_decode_macropixel_tests` cover (a) round-trip at
+  widths 2 / 4 / 8 / 16 bracketing the macropixel-step boundary, (b)
+  the v1.x compat path where slot1/slot2/slot3 hold distinct tables
+  (slot mix-up would surface as a Huffman-table mismatch before the
+  predictor pass), and (c) a `*_matches_per_byte_reference` witness
+  that diffs the production decode against an inlined copy of the
+  pre-r214 per-byte slot-dispatch loop across Left / Gradient /
+  Median predictors. Lib test count: 164 → 170.
 
 ## Out of scope (deferred)
 

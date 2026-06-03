@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Round-214: macropixel-step YUY2 Huffman-decode body. The
+  pre-r214 `decode_yuy2_field` loop ran `match byte_idx % 4` on every
+  output byte to pick the per-channel slot (Y₁/Y₂ → slot1, U → slot2,
+  V → slot3), so the slot-pointer reload sat on the critical path of
+  every Huffman lookup. Round 214 pins spec/03 §1.2's three-slot
+  architecture at the source by stepping four output bytes per outer
+  iteration with the slot resolved at compile time — the inner body
+  becomes a fixed straight-line `decode_one(slot1) →
+  decode_one(slot2) → decode_one(slot1) → decode_one(slot3)` sequence
+  plus four indexed stores per 4-byte macropixel. The
+  decode-side analogue of round 181's LEFT macropixel-step rewrite
+  (also branch-elimination on the same 4-byte cycle, mirrored to the
+  Huffman-decode loop now that the LEFT inverse has already shed its
+  `i & 3` switch). `(total_bytes - 4) % 4 == 0` is invariant in the
+  in-spec input space (YUY2 width is even per the macropixel-pair
+  invariant the decoder already checks), so the macropixel body
+  covers every remaining byte; a 1..=3-byte scalar fall-through is
+  kept for defence-in-depth against future pixel-family extensions.
+  Wire-identical to round 208 — every pre-existing YUY2 round-trip
+  test stays green and 6 new `round214_yuy2_decode_macropixel_tests`
+  pin the rewrite at byte-equality. Lib test count: 164 → 170.
+
 - Round-208: drop three single-use decoder-local LEFT wrappers
   (`decoder::inverse_left_per_channel`, `decoder::inverse_yuy2_left`,
   `decoder::inverse_yuy2_left_range`) and re-point the YUY2 + RGB24 +
