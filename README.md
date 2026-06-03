@@ -5,8 +5,37 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 221 — macropixel-step YUY2 Huffman-encode body.** The
-encoder mirror of r214's decode-side rewrite. The pre-r221
+**Round 227 — macropixel-step YUY2 histogram + verify bodies.**
+Encoder-side companion to the r214 decode-loop + r221 emit-loop
+rewrites. Two more YUY2-body iterators still ran per-byte `match
+byte_idx & 3` slot dispatch:
+`encoder::histogramise` (called once per frame on the CustomV2
+path and once per candidate inside `bit_cost_for_method` on the
+`MethodSelection::Auto` path) and `encoder::verify_body_in_table`
+(the V1xCompat sanity walk that checks every body symbol against
+its slot's v1.x precomputed-code length). Round 227 hoists the
+spec/03 §1.2 three-slot architecture out of both loops by stepping
+four body bytes per outer iteration with the slot resolved at
+compile time — histograms become four indexed counter increments
+per macropixel (`h1[+0] += 1 → h2[+1] += 1 → h1[+2] += 1 → h3[+3]
++= 1`); verify becomes four indexed `entries[sym].length == 0`
+gates per macropixel against the matching slot tables. `body.len()
+% 4 == 0` holds in the in-spec input space (spec/02 §3.1 even-width
+macropixel-pair invariant + `body.len() = total_bytes − 4` per
+field), so the macropixel body covers every input byte; a
+1..=3-byte scalar fall-through stays for defence-in-depth, matching
+r214 / r221. Wire-identical to round 221 — twelve new
+`round227_yuy2_histogram_verify_macropixel_tests` lock the rewrite:
+two `*_matches_per_byte_reference` witnesses diff the production
+histograms + verify result against an inlined copy of the
+pre-r227 per-byte slot-dispatch body across Left / Gradient /
+Median predictors (success path) and against a slot2-targeted
+out-of-codebook symbol (verify failure path); eight end-to-end
+round-trips (four CustomV2 widths exercising the histograms → length-
+table → emit chain, four V1xCompat widths exercising the verify
+walk). Lib test count: 176 → 188. **Round 221 — macropixel-step
+YUY2 Huffman-encode body.** The encoder mirror of r214's
+decode-side rewrite. The pre-r221
 `emit_bitstream_parts` YUY2 branch ran `match byte_idx & 3` on every
 body byte to pick the per-channel slot (Y₁/Y₂ → slot1, U → slot2,
 V → slot3), so the slot-pointer reload + branch sat on the critical

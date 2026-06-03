@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Round-227: macropixel-step YUY2 histogram + verify bodies. Two
+  YUY2-body iterators still ran per-byte `match byte_idx & 3`
+  slot dispatch after r214 (decode loop) and r221 (emit loop)
+  closed the equivalent dispatch on the Huffman-decode and
+  Huffman-emit sides:
+  - `encoder::histogramise` — called once per frame on the
+    CustomV2 path and once per candidate inside
+    `bit_cost_for_method` on the `MethodSelection::Auto` path,
+    so the per-byte dispatch was multiplied by the number of
+    candidates per frame on the auto-selector path.
+  - `encoder::verify_body_in_table` — V1xCompat sanity walk
+    that checks every body symbol against its slot's v1.x
+    precomputed-code length to reject inputs whose residual
+    symbol set isn't covered by the v1.x tables.
+  Round 227 hoists the spec/03 §1.2 three-slot architecture out
+  of both loops at the source by stepping four body bytes per
+  outer iteration with the slot resolved at compile time. The
+  inner histogram body becomes a fixed straight-line `h1[+0]
+  += 1 → h2[+1] += 1 → h1[+2] += 1 → h3[+3] += 1` sequence per
+  4-byte macropixel; the inner verify body becomes a matching
+  `slot1[+0] / slot2[+1] / slot1[+2] / slot3[+3]` `entries[sym]
+  .length == 0` gate sequence. `body.len()` is always a multiple
+  of 4 in the in-spec input space (YUY2 width is even per
+  spec/02 §3.1's macropixel-pair invariant and `body.len() =
+  total_bytes − 4` per field, so the body length sits at
+  `(width × 2 × height) − 4`, divisible by 4), so the macropixel
+  body covers every input byte. A 1..=3-byte scalar fall-through
+  is kept for defence-in-depth, mirroring the same shape landed
+  in r214 / r221. Wire-identical to round 221 — twelve new
+  `round227_yuy2_histogram_verify_macropixel_tests` pin the
+  rewrite at byte-equality, including two
+  `*_matches_per_byte_reference` witnesses that diff the
+  production histograms + verify result against an inlined copy
+  of the pre-r227 per-byte slot-dispatch body across Left /
+  Gradient / Median predictors (success path) and against a
+  slot2-targeted out-of-codebook symbol (verify failure path),
+  plus eight end-to-end round-trips (four CustomV2 widths
+  exercising the histograms → length-table → emit chain at
+  widths 2 / 4 / 8 / 16, four V1xCompat widths exercising the
+  verify walk at the same widths). Lib test count: 176 → 188.
+
 - Round-221: macropixel-step YUY2 Huffman-encode body. The
   encoder mirror of round-214's decode-side rewrite. The pre-r221
   `emit_bitstream_parts` YUY2 branch ran `match byte_idx & 3` on

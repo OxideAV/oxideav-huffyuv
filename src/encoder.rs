@@ -993,14 +993,47 @@ fn histogramise(
     let mut h3 = [0u32; 256];
     match family {
         PixelFamily::Yuy2 => {
-            // body[i] corresponds to source byte index (i + 4).
-            for (i, &b) in body.iter().enumerate() {
+            // Round-227: macropixel-step YUY2 histogram body. The
+            // spec/03 §1.2 three-slot architecture pins the YUY2
+            // wire-byte → slot mapping at a fixed 4-byte cycle:
+            //
+            //   +0 (Y₁) → slot1   +1 (U)  → slot2
+            //   +2 (Y₂) → slot1   +3 (V)  → slot3
+            //
+            // The pre-r227 loop ran `match byte_idx & 3 { … }` on
+            // every body byte to pick the histogram. body[i]
+            // corresponds to source byte index (i + 4), and `(i + 4)
+            // & 3 == i & 3`, so the cycle starts in phase at i = 0
+            // with slot1 / slot2 / slot1 / slot3. Round 227 steps
+            // four body bytes per outer iteration with the slot
+            // resolved at compile time — same shape as the r214
+            // decode-side and r221 emit-side rewrites — so the
+            // optimiser can schedule the four indexed counter
+            // increments freely. `body.len() % 4 == 0` in the
+            // in-spec input space (YUY2 width is even per the
+            // spec/02 §3.1 macropixel-pair invariant and `body.len()
+            // = total_bytes − 4` per field), so the macropixel body
+            // covers every count byte. A 1..=3-byte scalar
+            // fall-through is kept for defence-in-depth against
+            // future pixel-family extensions, mirroring the r214 /
+            // r221 fall-throughs.
+            let body_aligned = body.len() & !3;
+            let mut i = 0usize;
+            while i < body_aligned {
+                h1[body[i] as usize] += 1;
+                h2[body[i + 1] as usize] += 1;
+                h1[body[i + 2] as usize] += 1;
+                h3[body[i + 3] as usize] += 1;
+                i += 4;
+            }
+            while i < body.len() {
                 let byte_idx = i + 4;
                 match byte_idx & 3 {
-                    0 | 2 => h1[b as usize] += 1,
-                    1 => h2[b as usize] += 1,
-                    _ => h3[b as usize] += 1,
+                    0 | 2 => h1[body[i] as usize] += 1,
+                    1 => h2[body[i] as usize] += 1,
+                    _ => h3[body[i] as usize] += 1,
                 }
+                i += 1;
             }
         }
         PixelFamily::Rgb24 => {
@@ -1104,6 +1137,67 @@ fn verify_body_in_table(
     s2: &HuffTable,
     s3: &HuffTable,
 ) -> Result<()> {
+    // Round-227: hoist YUY2 macropixel-step verification out of the
+    // generic per-byte byte_idx-driven match. The other two pixel
+    // families still use the per-byte `i % 3 / i % 4` dispatch
+    // below — `verify_body_in_table` is RGB-agnostic until those
+    // paths grow a step body of their own, which is a separate
+    // wire-cycle (3 vs 4) and warrants its own round.
+    if let PixelFamily::Yuy2 = family {
+        // spec/03 §1.2: YUY2 wire-byte → slot at a fixed 4-byte
+        // cycle (+0/+2 Y → slot1; +1 U → slot2; +3 V → slot3).
+        // `byte_idx = i + 4` so `(i + 4) & 3 == i & 3`, i.e. the
+        // cycle is phase-aligned at i = 0. `body.len() % 4 == 0`
+        // holds in the in-spec input space (see the
+        // `emit_bitstream_parts` r221 comment for the derivation).
+        // A 1..=3-byte scalar fall-through stays for defence-in-
+        // depth, mirroring r214 / r221.
+        let body_aligned = body.len() & !3;
+        let mut i = 0usize;
+        while i < body_aligned {
+            let sym0 = body[i];
+            if s1.entries[sym0 as usize].length == 0 {
+                return Err(Error::unsupported(format!(
+                    "v1.x compat: residual symbol 0x{sym0:02x} not in v1.x codebook"
+                )));
+            }
+            let sym1 = body[i + 1];
+            if s2.entries[sym1 as usize].length == 0 {
+                return Err(Error::unsupported(format!(
+                    "v1.x compat: residual symbol 0x{sym1:02x} not in v1.x codebook"
+                )));
+            }
+            let sym2 = body[i + 2];
+            if s1.entries[sym2 as usize].length == 0 {
+                return Err(Error::unsupported(format!(
+                    "v1.x compat: residual symbol 0x{sym2:02x} not in v1.x codebook"
+                )));
+            }
+            let sym3 = body[i + 3];
+            if s3.entries[sym3 as usize].length == 0 {
+                return Err(Error::unsupported(format!(
+                    "v1.x compat: residual symbol 0x{sym3:02x} not in v1.x codebook"
+                )));
+            }
+            i += 4;
+        }
+        while i < body.len() {
+            let byte_idx = i + 4;
+            let slot = match byte_idx & 3 {
+                0 | 2 => s1,
+                1 => s2,
+                _ => s3,
+            };
+            let sym = body[i];
+            if slot.entries[sym as usize].length == 0 {
+                return Err(Error::unsupported(format!(
+                    "v1.x compat: residual symbol 0x{sym:02x} not in v1.x codebook"
+                )));
+            }
+            i += 1;
+        }
+        return Ok(());
+    }
     for (byte_idx, (i, &sym)) in (4usize..).zip(body.iter().enumerate()) {
         let slot = match family {
             PixelFamily::Yuy2 => match byte_idx & 3 {
@@ -1520,5 +1614,325 @@ mod round221_yuy2_emit_macropixel_tests {
                 method
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod round227_yuy2_histogram_verify_macropixel_tests {
+    //! Round-227 regression guard. The encoder's YUY2 histogram body
+    //! (`histogramise`) and v1.x verification body (`verify_body_in_table`)
+    //! were both rewritten from a per-byte `match byte_idx & 3` slot
+    //! dispatch into a 4-byte macropixel-step body, mirroring the
+    //! same branch elimination round 214 applied to the decoder's
+    //! YUY2 Huffman-decode loop and round 221 applied to the
+    //! encoder's YUY2 Huffman-emit loop.
+    //!
+    //! spec/03 §1.2's three-slot architecture pins the YUY2 wire-byte
+    //! → slot mapping at a fixed 4-byte cycle: `+0 (Y₁) → slot1;
+    //! +1 (U) → slot2; +2 (Y₂) → slot1; +3 (V) → slot3`. The
+    //! histogram body now counts four bytes per outer iteration into
+    //! the fixed slots; the verify body now checks four bytes per
+    //! outer iteration against the same fixed slot tables.
+    //!
+    //! Coverage:
+    //!
+    //! - **Per-byte witness** — both rewrites are diffed against an
+    //!   inlined copy of the pre-r227 per-byte slot dispatch over a
+    //!   deterministic body. Histograms must be element-wise equal;
+    //!   verify must return the same `Result` (and the same first
+    //!   offending symbol on the failure path).
+    //! - **End-to-end CustomV2 round-trip** at widths bracketing the
+    //!   macropixel-step boundary (2 / 4 / 8 / 16) ensures the
+    //!   histograms drive the same canonical length tables and the
+    //!   wire frames stay bit-identical after the rewrite.
+    //! - **End-to-end V1xCompat round-trip** at the same widths
+    //!   exercises the verify body: V1xCompat fails closed if any
+    //!   residual symbol lands on a slot whose v1.x precomputed code
+    //!   table has length 0, so a slot mix-up inside the unrolled
+    //!   verify would surface as a false rejection (or, worse, a
+    //!   false acceptance that the v1.x decoder would then mis-
+    //!   route).
+
+    use super::*;
+
+    fn synth_yuy2(width: usize, height: usize) -> Vec<u8> {
+        let mut s: u32 = 0x1234_5678;
+        let n = width * height * 2;
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    /// Reference body: the pre-r227 per-byte slot-dispatch histogram
+    /// inlined verbatim. Output must match `histogramise(Yuy2, ...)`
+    /// element-by-element across all three slot tables.
+    fn ref_histogramise_yuy2_per_byte(body: &[u8]) -> ([u32; 256], [u32; 256], [u32; 256]) {
+        let mut h1 = [0u32; 256];
+        let mut h2 = [0u32; 256];
+        let mut h3 = [0u32; 256];
+        for (i, &b) in body.iter().enumerate() {
+            let byte_idx = i + 4;
+            match byte_idx & 3 {
+                0 | 2 => h1[b as usize] += 1,
+                1 => h2[b as usize] += 1,
+                _ => h3[b as usize] += 1,
+            }
+        }
+        (h1, h2, h3)
+    }
+
+    /// Reference body: the pre-r227 per-byte slot-dispatch verify
+    /// inlined verbatim. Must return the same `Result` shape as the
+    /// production verify, including the first symbol carried in the
+    /// error path so the diagnostic text stays stable.
+    fn ref_verify_body_in_table_yuy2_per_byte(
+        body: &[u8],
+        s1: &HuffTable,
+        s2: &HuffTable,
+        s3: &HuffTable,
+    ) -> Result<()> {
+        for (byte_idx, (_i, &sym)) in (4usize..).zip(body.iter().enumerate()) {
+            let slot = match byte_idx & 3 {
+                0 | 2 => s1,
+                1 => s2,
+                _ => s3,
+            };
+            if slot.entries[sym as usize].length == 0 {
+                return Err(Error::unsupported(format!(
+                    "v1.x compat: residual symbol 0x{sym:02x} not in v1.x codebook"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn round227_yuy2_histogram_matches_per_byte_reference() {
+        // Drive the residual pipeline across Left / Gradient / Median
+        // at widths 2 / 4 / 8 / 16. For each frame, take the
+        // combined_body the encoder feeds to histogramise and compare
+        // the production histograms against the per-byte reference.
+        for &(w, h) in &[(2u32, 4u32), (4, 4), (8, 6), (16, 3)] {
+            for &method in &[Method::Left, Method::Gradient, Method::Median] {
+                let pixels = synth_yuy2(w as usize, h as usize);
+                let frame = compute_frame_residuals(PixelFamily::Yuy2, method, w, h, &pixels)
+                    .expect("residuals");
+                let (h1_prod, h2_prod, h3_prod) =
+                    histogramise(PixelFamily::Yuy2, method, &frame.combined_body);
+                let (h1_ref, h2_ref, h3_ref) = ref_histogramise_yuy2_per_byte(&frame.combined_body);
+                assert_eq!(
+                    h1_prod, h1_ref,
+                    "round227 slot1 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                assert_eq!(
+                    h2_prod, h2_ref,
+                    "round227 slot2 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                assert_eq!(
+                    h3_prod, h3_ref,
+                    "round227 slot3 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                // Sanity: histograms must sum to body.len() (every
+                // body byte is counted exactly once).
+                let total: u64 = h1_prod
+                    .iter()
+                    .chain(h2_prod.iter())
+                    .chain(h3_prod.iter())
+                    .map(|&c| c as u64)
+                    .sum();
+                assert_eq!(
+                    total,
+                    frame.combined_body.len() as u64,
+                    "round227 histogram total != body.len() @ {}x{} {:?}",
+                    w,
+                    h,
+                    method
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round227_yuy2_histogram_synth_body_matches_per_byte_reference() {
+        // Direct check against a synthetic body that exercises every
+        // residue position. Uses a 32-byte body (= 8 macropixels) so
+        // the slot positions are densely covered with distinct values
+        // — a slot mix-up inside the step body would surface as
+        // counts attributed to the wrong slot table.
+        let body: Vec<u8> = (0u8..32).collect();
+        let (h1_prod, h2_prod, h3_prod) = histogramise(PixelFamily::Yuy2, Method::Left, &body);
+        let (h1_ref, h2_ref, h3_ref) = ref_histogramise_yuy2_per_byte(&body);
+        assert_eq!(h1_prod, h1_ref);
+        assert_eq!(h2_prod, h2_ref);
+        assert_eq!(h3_prod, h3_ref);
+
+        // And the fixed expectations:
+        // slot1 counts bytes at i = 0, 2, 4, 6, 8, …, 30 (16 values:
+        // even indices), each exactly once.
+        // slot2 counts bytes at i = 1, 5, 9, 13, 17, 21, 25, 29 (8
+        // values), each exactly once.
+        // slot3 counts bytes at i = 3, 7, 11, 15, 19, 23, 27, 31 (8
+        // values), each exactly once.
+        for v in (0u8..32).step_by(2) {
+            assert_eq!(
+                h1_prod[v as usize], 1,
+                "slot1 should hold byte {v} exactly once",
+            );
+        }
+        for v in [1u8, 5, 9, 13, 17, 21, 25, 29] {
+            assert_eq!(
+                h2_prod[v as usize], 1,
+                "slot2 should hold byte {v} exactly once",
+            );
+        }
+        for v in [3u8, 7, 11, 15, 19, 23, 27, 31] {
+            assert_eq!(
+                h3_prod[v as usize], 1,
+                "slot3 should hold byte {v} exactly once",
+            );
+        }
+    }
+
+    #[test]
+    fn round227_yuy2_verify_matches_per_byte_reference_success_path() {
+        // Build the v1.x YUY2 codebook triple and ask both the
+        // production verify and the per-byte reference to walk a
+        // synthetic body. Both must accept.
+        let (s1, s2, s3) = build_v1x_tables(PixelFamily::Yuy2).expect("v1x build");
+        let body: Vec<u8> = (0u8..64).collect();
+        let prod = verify_body_in_table(PixelFamily::Yuy2, Method::Left, &body, &s1, &s2, &s3);
+        let refr = ref_verify_body_in_table_yuy2_per_byte(&body, &s1, &s2, &s3);
+        match (prod, refr) {
+            (Ok(()), Ok(())) => {}
+            (Err(e1), Err(e2)) => assert_eq!(format!("{e1}"), format!("{e2}")),
+            (a, b) => panic!("round227 verify result drift: prod={a:?} ref={b:?}"),
+        }
+    }
+
+    #[test]
+    fn round227_yuy2_verify_matches_per_byte_reference_failure_path() {
+        // Build the v1.x YUY2 codebook triple, then synthesise a
+        // body containing a symbol the v1.x set rejects, placed at a
+        // known slot position (i % 4 == 1, so the production verify
+        // tests it against slot2). The production verify and the
+        // per-byte reference must both reject, with the same error
+        // text.
+        let (s1, s2, s3) = build_v1x_tables(PixelFamily::Yuy2).expect("v1x build");
+        // Pick a symbol that has length 0 in slot2's v1.x table. The
+        // v1.x precomputed-code set B doesn't cover the full 256-
+        // symbol space densely on every position, so we scan for an
+        // uncovered symbol in slot2.
+        let mut bad_sym: Option<u8> = None;
+        for s in 0u16..256 {
+            let s = s as u8;
+            if s2.entries[s as usize].length == 0 {
+                bad_sym = Some(s);
+                break;
+            }
+        }
+        if let Some(sym) = bad_sym {
+            // Body layout: index 1 falls on slot2 (the +1 macropixel
+            // position). Pad with a valid slot1 symbol at index 0
+            // (length-1 entry by construction — slot1 = set A covers
+            // every symbol).
+            let mut body = vec![0u8; 8];
+            body[1] = sym;
+            let prod = verify_body_in_table(PixelFamily::Yuy2, Method::Left, &body, &s1, &s2, &s3);
+            let refr = ref_verify_body_in_table_yuy2_per_byte(&body, &s1, &s2, &s3);
+            match (prod, refr) {
+                (Err(e1), Err(e2)) => assert_eq!(format!("{e1}"), format!("{e2}")),
+                (a, b) => panic!("round227 verify failure-path drift: prod={a:?} ref={b:?}",),
+            }
+        }
+        // If every symbol is covered by slot2 (set B), the failure
+        // path can't be triggered through this fixture — that's
+        // fine; the success-path test above is the primary guard.
+    }
+
+    #[test]
+    fn round227_yuy2_custom_v2_roundtrip_width_2() {
+        // Exercises histogramise via the CustomV2 path: the encoder
+        // builds per-slot length tables from the slot-attributed
+        // histograms, so any drift in the histograms would change
+        // the emitted lengths and break the round-trip.
+        rt_yuy2_custom(2, 6, Method::Left);
+    }
+
+    #[test]
+    fn round227_yuy2_custom_v2_roundtrip_width_4() {
+        rt_yuy2_custom(4, 4, Method::Gradient);
+    }
+
+    #[test]
+    fn round227_yuy2_custom_v2_roundtrip_width_8() {
+        rt_yuy2_custom(8, 6, Method::Median);
+    }
+
+    #[test]
+    fn round227_yuy2_custom_v2_roundtrip_width_16() {
+        rt_yuy2_custom(16, 3, Method::Left);
+    }
+
+    #[test]
+    fn round227_yuy2_v1x_compat_roundtrip_width_2() {
+        // Exercises verify_body_in_table via the V1xCompat path.
+        rt_yuy2_v1x(2, 6, Method::Left);
+    }
+
+    #[test]
+    fn round227_yuy2_v1x_compat_roundtrip_width_4() {
+        rt_yuy2_v1x(4, 4, Method::Gradient);
+    }
+
+    #[test]
+    fn round227_yuy2_v1x_compat_roundtrip_width_8() {
+        rt_yuy2_v1x(8, 6, Method::Median);
+    }
+
+    #[test]
+    fn round227_yuy2_v1x_compat_roundtrip_width_16() {
+        rt_yuy2_v1x(16, 3, Method::Left);
+    }
+
+    fn rt_yuy2_custom(width: u32, height: u32, method: Method) {
+        use crate::decoder::decode_frame;
+        let pixels = synth_yuy2(width as usize, height as usize);
+        let (bih, frame) = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            method,
+            width,
+            height,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let decoded = decode_frame(&cfg, &frame).expect("decode");
+        assert_eq!(decoded.pixels, pixels);
+    }
+
+    fn rt_yuy2_v1x(width: u32, height: u32, method: Method) {
+        use crate::decoder::decode_frame;
+        let pixels = synth_yuy2(width as usize, height as usize);
+        let (bih, frame) = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            method,
+            width,
+            height,
+            &pixels,
+            ExtradataMode::V1xCompat,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let decoded = decode_frame(&cfg, &frame).expect("decode");
+        assert_eq!(decoded.pixels, pixels);
     }
 }
