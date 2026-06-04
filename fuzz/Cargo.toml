@@ -49,3 +49,20 @@ name = "encode_huffyuv"
 path = "fuzz_targets/encode_huffyuv.rs"
 test = false
 doc = false
+
+# Round-234: table-build-direct fuzz target. Drives the RLE length-table
+# decoder, the canonical-Huffman code builder, the package-merge
+# length-limited length computation, and the v1.x
+# `(length, code-template)` table constructor directly — bypassing the
+# `parse_bitmapinfoheader` / `decode_frame` / `encode_frame_with_mode`
+# whole-chain entry points the existing targets use. Reaches structurally
+# malformed length tables and pathologically skewed histograms that
+# never appear at the whole-chain entry points, where the BIH parse
+# rejects malformed extradata first (decode-only target) and where the
+# histogram always reflects real residual bytes the encoder just
+# produced (encode-only target).
+[[bin]]
+name = "tables_huffyuv"
+path = "fuzz_targets/tables_huffyuv.rs"
+test = false
+doc = false

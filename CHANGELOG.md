@@ -6,6 +6,62 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round-234: `fuzz/fuzz_targets/tables_huffyuv.rs` — third cargo-fuzz
+  target driving the table-build primitives directly. The previous
+  decode-only (r134) and encode-only (r196) targets reach the
+  table-build surface only via a valid BIH parse — the decode-only
+  target rejects malformed extradata before it lands on
+  `HuffTable::build_from_lengths`, and the encode-only target only
+  ever hands `compute_canonical_lengths` a histogram built from real
+  residual bytes the encoder just produced. Round 234 slices its fuzz
+  buffer five ways with a selector byte and drives each table-build
+  primitive directly:
+  - `drive_rle_decode` — `rle_decode_one_channel` and
+    `rle_decode_three_channels` on arbitrary bytes; on success the
+    output length table must round-trip byte-exact through
+    `rle_encode_one_channel` → `rle_decode_one_channel`.
+  - `drive_rle_encode_roundtrip` — `rle_encode_one_channel` →
+    `rle_decode_one_channel` on a fuzz-derived 256-byte length table
+    coerced into `0..=31` via `byte & 0x1F`. The pair must round-trip
+    byte-exact.
+  - `drive_build_from_lengths` — `HuffTable::build_from_lengths` on a
+    fuzz-derived length table; the call either errors (Kraft
+    inequality) or succeeds with the self-consistent-decode contract:
+    every nonzero-length entry's MSB-aligned code must `decode_one`
+    back to itself.
+  - `drive_compute_canonical_lengths` — the package-merge
+    length-limited length computation on a fuzz-derived 256-entry
+    histogram (built by packing pairs of fuzz bytes into LE `u16`
+    counts); on success the returned length table must build through
+    `HuffTable::build_from_lengths` and decode self-consistently
+    (that's the encoder's documented downstream chain).
+  - `drive_v1x_table_from_pair` — `v1x_table_from_pair` on a
+    fuzz-derived `(lengths, codes)` pair; spec/04 §4.2 permits the
+    v1.x set to be non-canonical, so only the `decode_one` liveness
+    property is asserted (Ok return for every nonzero-length entry's
+    own code window, even if the returned `(symbol, length)` differs
+    from the looked-up entry under a v1.x prefix collision).
+  - Six handcrafted corpus seeds under
+    `fuzz/corpus/tables_huffyuv/` cover all five drivers plus the
+    empty-input early return.
+- Round-234: four `round234_…` invariant unit tests in
+  `src/tables.rs` reproduce the fuzz target's contracts on fixed
+  inputs (the all-zero / single-tier / sparse RLE shapes; three
+  Kraft-equal length distributions plus an eight-symbol uniform
+  alphabet for `build_from_lengths`; four histogram shapes —
+  uniform, single-symbol, two-symbol, skewed — for
+  `compute_canonical_lengths`; the proprietary's v1.x set-A pair for
+  `v1x_table_from_pair`). Runs on every `cargo test`; the fuzz
+  harness only runs on the daily CI schedule. Lib test count: 188 →
+  192.
+- Round-234: `tables_huffyuv` registered in `fuzz/Cargo.toml` and
+  auto-discovered by the daily reusable fuzz workflow. Each of the
+  three targets (`decode_huffyuv` / `encode_huffyuv` /
+  `tables_huffyuv`) now gets ~600 s of the 30-minute total budget per
+  daily run.
+
 ### Changed
 
 - Round-227: macropixel-step YUY2 histogram + verify bodies. Two

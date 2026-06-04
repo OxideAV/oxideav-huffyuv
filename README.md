@@ -5,7 +5,32 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 227 — macropixel-step YUY2 histogram + verify bodies.**
+**Round 234 — third cargo-fuzz target on the table-build primitives.**
+Previous fuzz coverage (`decode_huffyuv` r134, `encode_huffyuv` r196)
+reached the table-build code only through valid BIH parse paths — the
+decode-only target rejects malformed extradata before it lands on
+`HuffTable::build_from_lengths`, and the encode-only target only ever
+hands `compute_canonical_lengths` a histogram built from real residual
+bytes the encoder just produced. Round 234 adds `tables_huffyuv`,
+slicing the fuzz buffer five ways to drive each table-build primitive
+directly: `rle_decode_one_channel` + `rle_decode_three_channels` on
+arbitrary bytes; `rle_encode_one_channel` → `rle_decode_one_channel`
+round-trip on fuzz-derived length tables coerced into `0..=31`;
+`HuffTable::build_from_lengths` on arbitrary length tables with the
+self-consistent-decode contract (every nonzero-length entry's
+MSB-aligned code must `decode_one` back to itself); the
+package-merge `compute_canonical_lengths` on arbitrary 256-entry
+histograms with the documented downstream-build contract; and
+`v1x_table_from_pair` on arbitrary `(lengths, codes)` pairs with the
+`decode_one` liveness contract (spec/04 §4.2 permits the v1.x set to
+be non-canonical, so only liveness is asserted). Six handcrafted
+corpus seeds cover all five drivers + the empty-input early return.
+Daily fuzz CI now splits the existing 30-minute budget three ways at
+~600 s per target. Lib-side companion: four `round234_…` invariant
+unit tests in `tables.rs` reproduce the contracts on fixed inputs so
+they run on every `cargo test`, not only on the nightly fuzz
+schedule. Lib test count: 188 → 192. **Round 227 — macropixel-step
+YUY2 histogram + verify bodies.**
 Encoder-side companion to the r214 decode-loop + r221 emit-loop
 rewrites. Two more YUY2-body iterators still ran per-byte `match
 byte_idx & 3` slot dispatch:

@@ -937,4 +937,200 @@ mod tests {
         sorted.sort();
         assert_eq!(sorted, vec![0, 1, 2, 3]);
     }
+
+    // ─────── Round-234 invariants pinned by the tables_huffyuv fuzz target ───────
+    //
+    // These tests pin the four contracts the round-234 cargo-fuzz target
+    // `fuzz/fuzz_targets/tables_huffyuv.rs` asserts on every iteration
+    // against arbitrary input bytes. Reproducing the contracts here as
+    // unit tests gives us a regression guard that runs on every `cargo
+    // test` invocation (the fuzz harness only runs on the daily CI
+    // schedule) and documents what the harness is checking when reading
+    // the source.
+
+    #[test]
+    fn round234_rle_encode_decode_roundtrips_every_coerced_table() {
+        // For every length table whose entries land in `0..=31` (the
+        // domain `rle_encode_one_channel` accepts), the encode→decode
+        // pair must round-trip byte-exact. We sample three structurally
+        // distinct shapes the fuzz harness's coerce-mod-32 pattern
+        // produces: all-zero (zero-symbol table), a single-tier
+        // distribution (every symbol same length), and the spec/04
+        // §3.2 set-A-style sparse distribution.
+        let all_zero = [0u8; 256];
+        let mut encoded = Vec::new();
+        rle_encode_one_channel(&all_zero, &mut encoded).unwrap();
+        let mut cursor: &[u8] = &encoded;
+        assert_eq!(rle_decode_one_channel(&mut cursor).unwrap(), all_zero);
+
+        let mut single_tier = [0u8; 256];
+        for (i, slot) in single_tier.iter_mut().enumerate() {
+            *slot = if i < 16 { 4 } else { 0 };
+        }
+        encoded.clear();
+        rle_encode_one_channel(&single_tier, &mut encoded).unwrap();
+        let mut cursor: &[u8] = &encoded;
+        assert_eq!(rle_decode_one_channel(&mut cursor).unwrap(), single_tier);
+
+        let mut sparse = [0u8; 256];
+        sparse[0] = 1;
+        sparse[1] = 2;
+        sparse[2] = 3;
+        sparse[3] = 4;
+        sparse[100] = 17;
+        sparse[200] = 8;
+        sparse[255] = 31;
+        encoded.clear();
+        rle_encode_one_channel(&sparse, &mut encoded).unwrap();
+        let mut cursor: &[u8] = &encoded;
+        assert_eq!(rle_decode_one_channel(&mut cursor).unwrap(), sparse);
+    }
+
+    #[test]
+    fn round234_build_from_lengths_self_consistent_decode() {
+        // Every nonzero-length entry in a successfully-built `HuffTable`
+        // must decode via `decode_one` from its own MSB-aligned code
+        // window back to itself. This is the codec's downstream
+        // contract — the fuzz harness checks it on every successful
+        // `build_from_lengths` call.
+        //
+        // We pin three Kraft-equal shapes: a uniform 4-symbol alphabet,
+        // a mixed-length tiering (2/3/3/4/4/4/4), and one of the
+        // proprietary's classic blobs.
+        for lengths in [
+            // Uniform 4-symbol alphabet (Kraft sum = 4 * 1/4 = 1).
+            {
+                let mut l = [0u8; 256];
+                l[0] = 2;
+                l[1] = 2;
+                l[2] = 2;
+                l[3] = 2;
+                l
+            },
+            // Mixed-length tiering (Kraft sum = 1/2 + 1/4 + 2*1/8 = 1).
+            {
+                let mut l = [0u8; 256];
+                l[0] = 1;
+                l[1] = 2;
+                l[2] = 3;
+                l[3] = 3;
+                l
+            },
+            // Eight-symbol uniform alphabet (Kraft sum = 8 * 1/8 = 1).
+            {
+                let mut l = [0u8; 256];
+                for slot in l.iter_mut().take(8) {
+                    *slot = 3;
+                }
+                l
+            },
+            // Deeper tiering reaching length 4
+            // (Kraft sum = 1/2 + 1/4 + 1/8 + 2*1/16 = 1).
+            {
+                let mut l = [0u8; 256];
+                l[0] = 1;
+                l[1] = 2;
+                l[2] = 3;
+                l[3] = 4;
+                l[4] = 4;
+                l
+            },
+        ] {
+            let table = HuffTable::build_from_lengths(&lengths).expect("Kraft equality");
+            for (sym, e) in table.entries.iter().enumerate() {
+                if e.length == 0 {
+                    continue;
+                }
+                let (decoded_sym, decoded_len) = decode_one(&table, e.code).unwrap();
+                assert_eq!(decoded_sym as usize, sym);
+                assert_eq!(decoded_len, e.length);
+            }
+        }
+    }
+
+    #[test]
+    fn round234_compute_canonical_lengths_builds_through_build_from_lengths() {
+        // `compute_canonical_lengths(histogram)` is the encoder's
+        // entry point on the CustomV2 extradata path. The downstream
+        // chain is `HuffTable::build_from_lengths(<the returned table>)`
+        // — if that chain ever errors on a real histogram, the encoder
+        // crashes. The fuzz harness asserts the chain holds on every
+        // successful `compute_canonical_lengths` call.
+        //
+        // We pin a few shapes: uniform, single-symbol (degenerate),
+        // two-symbol (the round-6 single-symbol fix), and a skewed
+        // distribution where symbol 0 vastly outweighs the rest.
+        for histogram in [
+            {
+                let mut h = [0u32; 256];
+                for slot in h.iter_mut().take(16) {
+                    *slot = 1;
+                }
+                h
+            },
+            {
+                let mut h = [0u32; 256];
+                h[42] = 1000;
+                h
+            },
+            {
+                let mut h = [0u32; 256];
+                h[0] = 7;
+                h[1] = 3;
+                h
+            },
+            {
+                let mut h = [0u32; 256];
+                h[0] = 1_000_000;
+                for slot in h.iter_mut().take(8).skip(1) {
+                    *slot = 1;
+                }
+                h
+            },
+        ] {
+            let lengths = compute_canonical_lengths(&histogram).expect("package-merge");
+            for &l in lengths.iter() {
+                assert!(l <= 31);
+            }
+            let table = HuffTable::build_from_lengths(&lengths)
+                .expect("compute_canonical_lengths output must build");
+            for (sym, e) in table.entries.iter().enumerate() {
+                if e.length == 0 {
+                    continue;
+                }
+                let (decoded_sym, decoded_len) = decode_one(&table, e.code).unwrap();
+                assert_eq!(decoded_sym as usize, sym);
+                assert_eq!(decoded_len, e.length);
+            }
+        }
+    }
+
+    #[test]
+    fn round234_v1x_table_from_pair_decode_is_live_on_own_code_window() {
+        // `v1x_table_from_pair(lengths, codes)` builds the v1.x
+        // precomputed-codes table without enforcing Kraft equality
+        // (spec/04 §4.2 allows non-canonical layouts). The fuzz harness
+        // therefore only asserts the weaker liveness property: for every
+        // nonzero-length entry, `decode_one(table, entry.code)` returns
+        // `Ok` (no panic / OOB / overflow). We pin one such build on
+        // the proprietary's v1.x set-A pair to confirm the contract
+        // holds on the spec-canonical input.
+        let mut lengths = [0u8; 256];
+        let set_a = blobs::v1x_lengths_set_a();
+        let mut cursor: &[u8] = set_a;
+        let decoded = rle_decode_one_channel(&mut cursor).unwrap();
+        lengths.copy_from_slice(&decoded);
+
+        let codes_raw = blobs::v1x_codes_set_a();
+        let mut codes = [0u8; 256];
+        codes.copy_from_slice(codes_raw);
+
+        let table = v1x_table_from_pair(&lengths, &codes).expect("v1.x set A builds");
+        for e in table.entries.iter() {
+            if e.length == 0 {
+                continue;
+            }
+            let _ = decode_one(&table, e.code).expect("v1.x decode_one liveness");
+        }
+    }
 }
