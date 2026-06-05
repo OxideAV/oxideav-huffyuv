@@ -8,6 +8,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-239: pixel-step RGB24 Huffman-encode body in
+  `emit_bitstream_parts`. The pre-r239 loop ran `match i % 3` on every
+  body byte to pick the slot AND a `method.decorrelate()` branch on
+  every iteration — two per-byte branches the optimiser could not
+  eliminate because the iterator state changed every step. Round 239
+  hoists both decisions out of the loop: the slot triple is resolved
+  once at function entry by the `(s_pos0, s_pos1, s_pos2)` binding
+  (paired by `method.decorrelate()`), then the body steps three bytes
+  per outer iteration with the slot resolved at compile time —
+  `lookup_code(s_pos0) → write_msb → lookup_code(s_pos1) → write_msb →
+  lookup_code(s_pos2) → write_msb` straight-line per wire pixel. spec/03
+  §1.1 pins RGB24 at exactly three Huffman codewords per pixel (the
+  §3.2/§3.3 spec/02 correction); §1.2 fixes the position → slot mapping
+  at `(slot1, slot2, slot3)` for no-decorrelate methods (B / G / R)
+  and `(slot2, slot1, slot3)` for decorrelate methods (G / B−G / R−G).
+  `body.len()` is always a multiple of 3 in the in-spec input space
+  (the body is `(n_pixels − 1) × 3` bytes per `rgb24_residuals`), so
+  the pixel-step body covers every emit byte; a 1..=2-byte scalar
+  fall-through is kept for defence-in-depth against future pixel-family
+  extensions, mirroring the r221 / r227 YUY2 fall-throughs. Encoder
+  analogue of r221's YUY2 pixel-step body, applied to the §1.2 three-
+  byte RGB24 wire cycle. Wire-identical to round 234 — locked by nine
+  new `round239_rgb24_emit_pixel_step_tests` covering: four
+  pixel-step-boundary round-trips at widths 1 / 2 / 4 / 8 (`Left` +
+  `ClassicV2`); one `PredictOld` variant locking the alternate
+  no-decorr method entry; one `LeftDecorr` + one `GradientDecorr`
+  round-trip locking the decorr-pair slot triple; one V1xCompat
+  round-trip locking the content-identical `(A, A, A)` triple; and a
+  `*_matches_per_byte_reference` witness diffing the production emit
+  bit stream against an inlined copy of the pre-r239 per-byte slot
+  dispatch body across `Left` / `LeftDecorr` / `GradientDecorr` under
+  `CustomV2` (content-distinct slot tables, so a slot mix-up surfaces
+  as a Huffman-code mismatch on the wire even before the round-trip
+  predictor pass). Lib test count: 192 → 201.
+
 - Round-234: `fuzz/fuzz_targets/tables_huffyuv.rs` — third cargo-fuzz
   target driving the table-build primitives directly. The previous
   decode-only (r134) and encode-only (r196) targets reach the

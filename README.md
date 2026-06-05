@@ -5,7 +5,38 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 234 — third cargo-fuzz target on the table-build primitives.**
+**Round 239 — pixel-step RGB24 Huffman-encode body.** The encoder's
+RGB24 emit loop in `emit_bitstream_parts` is rewritten from a per-byte
+`match i % 3` slot dispatch (plus a per-iteration
+`method.decorrelate()` branch — two per-byte branches the optimiser
+could not eliminate because the iterator state changed every step)
+into a pixel-step body that resolves the three slot pointers once at
+function entry by the `(s_pos0, s_pos1, s_pos2)` binding (paired by
+`method.decorrelate()`) and emits three codes per outer iteration
+straight-line — `lookup_code(s_pos0) → write_msb →
+lookup_code(s_pos1) → write_msb → lookup_code(s_pos2) → write_msb` per
+wire pixel. spec/03 §1.1 pins RGB24 at exactly three Huffman codewords
+per pixel (the §3.2/§3.3 spec/02 correction); §1.2 fixes the position
+→ slot mapping at `(slot1, slot2, slot3)` for no-decorrelate methods
+(B / G / R) and `(slot2, slot1, slot3)` for decorrelate methods (G /
+B−G / R−G). `body.len()` is always a multiple of 3 in the in-spec
+input space (the body is `(n_pixels − 1) × 3` bytes per
+`rgb24_residuals`), so the pixel-step body covers every emit byte; a
+1..=2-byte scalar fall-through is kept for defence-in-depth, mirroring
+the r221 / r227 YUY2 fall-throughs. Encoder analogue of r221's YUY2
+emit rewrite, applied to the §1.2 three-byte RGB24 wire cycle.
+Wire-identical to round 234 — nine new
+`round239_rgb24_emit_pixel_step_tests` lock the rewrite: four
+pixel-step-boundary round-trips at widths 1 / 2 / 4 / 8 (`Left` +
+`ClassicV2`), one `PredictOld` (alternate no-decorr entry), one
+`LeftDecorr` + one `GradientDecorr` (the decorr-pair slot triple), one
+V1xCompat (the content-identical `(A, A, A)` triple), and a
+`*_matches_per_byte_reference` witness diffing the production emit
+bit stream against an inlined copy of the pre-r239 per-byte slot
+dispatch across `Left` / `LeftDecorr` / `GradientDecorr` under
+`CustomV2` (content-distinct tables, so a slot mix-up surfaces as a
+Huffman-code mismatch on the wire even before the round-trip predictor
+pass). Lib test count: 192 → 201. **Round 234 — third cargo-fuzz target on the table-build primitives.**
 Previous fuzz coverage (`decode_huffyuv` r134, `encode_huffyuv` r196)
 reached the table-build code only through valid BIH parse paths — the
 decode-only target rejects malformed extradata before it lands on
@@ -767,6 +798,47 @@ test-only `[dev-dependencies] oxideav-avi`.
   that diffs the production decode against an inlined copy of the
   pre-r214 per-byte slot-dispatch loop across Left / Gradient /
   Median predictors. Lib test count: 164 → 170.
+
+## What works (Round 239)
+
+- **`emit_bitstream_parts` RGB24 pixel-step body.** The pre-r239 loop
+  ran `match i % 3` on every body byte to pick the slot AND a
+  `method.decorrelate()` branch on every iteration — for a 1920×1080
+  RGB24 frame that's ~6.2 M per-byte branches with two reload-and-
+  resolve sequences on the critical path of every `lookup_code` +
+  `write_msb` call. Round 239 hoists both decisions out of the loop:
+  the slot triple is resolved once at function entry by the
+  `(s_pos0, s_pos1, s_pos2)` binding (paired by
+  `method.decorrelate()`), then the inner body is a fixed straight-
+  line three-`lookup_code` / three-`write_msb` sequence per wire
+  pixel. spec/03 §1.1 invariants used: RGB24 carries exactly three
+  Huffman codewords per pixel (the §3.2/§3.3 spec/02 correction);
+  spec/03 §1.2 invariants used: position +0 / +1 / +2 → `(slot1,
+  slot2, slot3)` for `Left` / `PredictOld`; → `(slot2, slot1, slot3)`
+  for `LeftDecorr` / `GradientDecorr`. Encoder-side analogue of round
+  221's YUY2 pixel-step rewrite, applied to the §1.2 three-byte RGB24
+  wire cycle.
+- **Wire-identical to round 234** — the new step body emits the
+  identical bit stream for every RGB24 input that
+  `body.len() % 3 == 0` covers (the in-spec input space; the
+  `rgb24_residuals` body length is `(n_pixels − 1) × 3` by
+  construction). A 1..=2-byte scalar fall-through preserves the prior
+  per-byte semantics for any future layout that lands the body on a
+  non-pixel boundary. Nine new `round239_rgb24_emit_pixel_step_tests`
+  cover: (a) `Left` + `ClassicV2` round-trips at widths 1 / 2 / 4 / 8
+  bracketing the pixel-step boundary, (b) one `PredictOld` variant
+  locking the alternate no-decorr method entry, (c) one `LeftDecorr`
+  + one `GradientDecorr` round-trip locking the decorrelate-pair slot
+  triple, (d) one V1xCompat round-trip locking the content-identical
+  `(A, A, A)` triple (a step-body bookkeeping bug that mixed up the
+  three positions could still survive on content-identical tables, so
+  the round-trip pins that case explicitly), and (e) a
+  `*_matches_per_byte_reference` witness that diffs the production
+  emit bit stream against an inlined copy of the pre-r239 per-byte
+  slot dispatch body across `Left` / `LeftDecorr` / `GradientDecorr`
+  under `CustomV2` (content-distinct slot tables, so a slot mix-up
+  surfaces as a Huffman-code mismatch on the wire even before the
+  round-trip predictor pass). Lib test count: 192 → 201.
 
 ## Out of scope (deferred)
 

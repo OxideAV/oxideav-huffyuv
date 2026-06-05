@@ -1333,23 +1333,64 @@ fn emit_bitstream_parts(
             }
         }
         PixelFamily::Rgb24 => {
-            for (i, &sym) in body.iter().enumerate() {
+            // Round-239: pixel-step RGB24 Huffman-encode body. spec/03
+            // §1.1 (the §3.2/§3.3 spec/02 correction) pins RGB24 at
+            // exactly three Huffman codewords per pixel — the wire body
+            // walks a fixed 3-byte cycle whose slot mapping comes from
+            // spec/03 §1.2:
+            //
+            //   no decorr: pos +0 (B) → slot1   +1 (G) → slot2   +2 (R) → slot3
+            //   decorr   : pos +0 (G) → slot2   +1 (B−G) → slot1  +2 (R−G) → slot3
+            //
+            // The pre-r239 loop ran `match i % 3 { … }` on every body
+            // byte to pick the slot — a per-byte branch the optimiser
+            // could not eliminate because `i` was tied to the iterator
+            // state, plus a second branch on `method.decorrelate()`
+            // every iteration even though the answer never changes
+            // mid-frame. Round 239 hoists both decisions out of the
+            // loop: the slot triple is resolved once at function entry
+            // by the `(s_pos0, s_pos1, s_pos2)` binding (paired by
+            // `method.decorrelate()`), then the body steps three bytes
+            // per outer iteration with the slot resolved at compile
+            // time — same shape the r221 YUY2 emit rewrite landed on the
+            // §1.2 four-byte cycle.
+            //
+            // `body.len()` is always a multiple of 3 in the in-spec
+            // input space: `rgb24_residuals` builds the body as
+            // `(n_pixels − 1) × 3` bytes (one wire pixel = 3 codes per
+            // §1.1), so `body.len() % 3 == 0`. We keep a 1..=2-byte
+            // scalar fall-through for defence-in-depth against future
+            // pixel-family extensions, same shape as the r221 / r227
+            // YUY2 fall-throughs.
+            let (s_pos0, s_pos1, s_pos2) = if method.decorrelate() {
+                (slot2, slot1, slot3)
+            } else {
+                (slot1, slot2, slot3)
+            };
+            let body_aligned = (body.len() / 3) * 3;
+            let mut i = 0usize;
+            while i < body_aligned {
+                let (c0, l0) = lookup_code(s_pos0, body[i])?;
+                writer.write_msb(c0, l0);
+                let (c1, l1) = lookup_code(s_pos1, body[i + 1])?;
+                writer.write_msb(c1, l1);
+                let (c2, l2) = lookup_code(s_pos2, body[i + 2])?;
+                writer.write_msb(c2, l2);
+                i += 3;
+            }
+            // Scalar fall-through for any 1..=2 trailing bytes
+            // (unreachable for valid RGB24 inputs; kept for
+            // robustness).
+            while i < body.len() {
                 let in_pixel = i % 3;
-                let slot = if method.decorrelate() {
-                    match in_pixel {
-                        0 => slot2,
-                        1 => slot1,
-                        _ => slot3,
-                    }
-                } else {
-                    match in_pixel {
-                        0 => slot1,
-                        1 => slot2,
-                        _ => slot3,
-                    }
+                let slot = match in_pixel {
+                    0 => s_pos0,
+                    1 => s_pos1,
+                    _ => s_pos2,
                 };
-                let (code, length) = lookup_code(slot, sym)?;
+                let (code, length) = lookup_code(slot, body[i])?;
                 writer.write_msb(code, length);
+                i += 1;
             }
         }
         PixelFamily::Rgb32 => {
@@ -1934,5 +1975,219 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
         let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
         let decoded = decode_frame(&cfg, &frame).expect("decode");
         assert_eq!(decoded.pixels, pixels);
+    }
+}
+
+#[cfg(test)]
+mod round239_rgb24_emit_pixel_step_tests {
+    //! Round-239 regression guard. The encoder's RGB24 Huffman-emit
+    //! loop in [`emit_bitstream_parts`] was rewritten from a per-byte
+    //! `match i % 3` slot dispatch (plus a per-iteration
+    //! `method.decorrelate()` branch) into a pixel-step body that
+    //! resolves the three slot pointers once at function entry and
+    //! emits three codes per outer iteration.
+    //!
+    //! spec/03 §1.1 pins RGB24 at exactly three Huffman codewords per
+    //! pixel (the §3.2/§3.3 spec/02 correction); §1.2 + the table at
+    //! the end of §1.2 fixes the position → slot mapping at:
+    //!
+    //! - no-decorr methods (`Left`, `PredictOld`): pos +0 (B) → slot1;
+    //!   pos +1 (G) → slot2; pos +2 (R) → slot3.
+    //! - decorr methods (`LeftDecorr`, `GradientDecorr`): pos +0 (G) →
+    //!   slot2; pos +1 (B−G) → slot1; pos +2 (R−G) → slot3.
+    //!
+    //! Coverage:
+    //!
+    //! - **Encode-then-decode round-trips** across the four legal RGB24
+    //!   methods (`Left`, `PredictOld`, `LeftDecorr`, `GradientDecorr`)
+    //!   at widths bracketing the pixel-step boundary (1 / 2 / 4 / 8).
+    //!   The in-spec input space is already `body.len() % 3 == 0`
+    //!   because the rgb24 body is `(n_pixels − 1) × 3` bytes, but
+    //!   explicit small-width coverage exercises the new step body
+    //!   against minimal pixel counts.
+    //! - **Wire-byte witness** — the production emit is diffed against
+    //!   an inlined copy of the pre-r239 per-byte slot dispatch body
+    //!   across `Left` / `LeftDecorr` / `GradientDecorr` predictors,
+    //!   using `CustomV2` so the three slot tables are content-distinct
+    //!   (a slot mix-up would surface as a Huffman-code mismatch on the
+    //!   wire even before the round-trip predictor pass).
+    //! - **V1xCompat path** — exercises the same step body against the
+    //!   `(A, A, A)` v1.x precomputed-code triple (spec/04 §4.1) so
+    //!   the rewrite is locked against both content-distinct and
+    //!   content-identical slot triples.
+    //!
+    //! Wire-identical to round 234 — every pre-existing RGB24
+    //! round-trip + the AVI-lockstep RGB24 tests stay green.
+    use super::*;
+    use crate::decoder::decode_frame;
+
+    fn synth_rgb24(width: usize, height: usize) -> Vec<u8> {
+        // Deterministic xorshift32 ramp; same pattern shape as the
+        // r214 / r221 YUY2 helpers but inlined here so this module
+        // stays self-contained.
+        let mut s: u32 = 0xCAFE_F00D;
+        let n = width * height * 3;
+        let mut out = vec![0u8; n];
+        for px in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *px = s as u8;
+        }
+        out
+    }
+
+    fn rt_rgb24(width: u32, height: u32, method: Method, mode: ExtradataMode) {
+        let pixels = synth_rgb24(width as usize, height as usize);
+        let (bih, frame) =
+            encode_frame_with_mode(PixelFamily::Rgb24, method, width, height, &pixels, mode)
+                .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let decoded = decode_frame(&cfg, &frame).expect("decode");
+        assert_eq!(decoded.pixels, pixels);
+    }
+
+    #[test]
+    fn round239_rgb24_left_classic_width_1() {
+        // width=1, height=3 → n_pixels=3, body=(3-1)×3=6 bytes. Two
+        // pixel-step iterations; minimum non-trivial body.
+        rt_rgb24(1, 3, Method::Left, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round239_rgb24_left_classic_width_2() {
+        rt_rgb24(2, 3, Method::Left, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round239_rgb24_left_classic_width_4() {
+        rt_rgb24(4, 4, Method::Left, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round239_rgb24_left_classic_width_8() {
+        // Wider raster — exercises the step body across multiple rows
+        // (the slot mapping is wire-pixel-modular, not row-modular, so
+        // this also pins the rewrite against any future attempt to
+        // re-introduce row-aware state inside the step body).
+        rt_rgb24(8, 4, Method::Left, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round239_rgb24_predict_old_classic() {
+        // `PredictOld` is the spec/01 §3.1 signed `−2` method byte —
+        // shares the no-decorrelate slot triple with `Left`; this test
+        // pins the rewrite against the alternate no-decorr method
+        // entry.
+        rt_rgb24(4, 4, Method::PredictOld, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round239_rgb24_left_decorr_classic() {
+        // Switches to the (slot2, slot1, slot3) decorr triple; a
+        // mis-resolved triple would corrupt the round-trip.
+        rt_rgb24(4, 4, Method::LeftDecorr, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round239_rgb24_gradient_decorr_classic() {
+        rt_rgb24(4, 4, Method::GradientDecorr, ExtradataMode::ClassicV2);
+    }
+
+    #[test]
+    fn round239_rgb24_left_v1x_compat() {
+        // V1xCompat: slot1 = slot2 = slot3 = set A (spec/04 §4.1).
+        // Content-identical triple — the step body must still walk the
+        // three positions correctly even when all three tables are
+        // the same instance.
+        rt_rgb24(4, 4, Method::Left, ExtradataMode::V1xCompat);
+    }
+
+    /// Reference body: the pre-r239 per-byte slot-dispatch emit loop,
+    /// inlined verbatim. Compared against the production emit over a
+    /// deterministic body stream to lock the rewrite at byte equality.
+    fn ref_emit_rgb24_per_byte_loop(
+        method: Method,
+        body: &[u8],
+        slot1: &HuffTable,
+        slot2: &HuffTable,
+        slot3: &HuffTable,
+    ) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        for (i, &sym) in body.iter().enumerate() {
+            let in_pixel = i % 3;
+            let slot = if method.decorrelate() {
+                match in_pixel {
+                    0 => slot2,
+                    1 => slot1,
+                    _ => slot3,
+                }
+            } else {
+                match in_pixel {
+                    0 => slot1,
+                    1 => slot2,
+                    _ => slot3,
+                }
+            };
+            let (code, length) = lookup_code(slot, sym).expect("ref lookup");
+            writer.write_msb(code, length);
+        }
+        writer.finish()
+    }
+
+    #[test]
+    fn round239_rgb24_emit_matches_per_byte_reference() {
+        // Encode under CustomV2 so the three slot tables are
+        // content-distinct (per-channel Huffman-built from the actual
+        // residual histograms — a slot mix-up between the production
+        // step body and the reference per-byte body would surface as a
+        // Huffman-code mismatch in the emitted bit stream before any
+        // round-trip predictor pass.
+        //
+        // We can't call `emit_bitstream_parts` directly on a forged
+        // body without rebuilding the tables, so the witness compares
+        // the production frame's emitted bits (everything after the
+        // 4-byte seed) to the reference per-byte emit driven by the
+        // same residuals body + the same tables. Both must be
+        // byte-identical.
+        for (w, h, method) in [
+            (4u32, 4u32, Method::Left),
+            (4, 4, Method::LeftDecorr),
+            (4, 4, Method::GradientDecorr),
+        ] {
+            let pixels = synth_rgb24(w as usize, h as usize);
+            // Production frame: contains the seed + the production
+            // emit-pass output.
+            let (_, frame) = encode_frame_with_mode(
+                PixelFamily::Rgb24,
+                method,
+                w,
+                h,
+                &pixels,
+                ExtradataMode::CustomV2,
+            )
+            .expect("encode");
+            // Re-derive the residuals body + the per-channel tables the
+            // encoder built for this frame so we can run the reference
+            // per-byte emit against the same inputs.
+            let residuals =
+                compute_residuals(PixelFamily::Rgb24, method, w, h, &pixels).expect("residuals");
+            let (h1, h2, h3) = histogramise(PixelFamily::Rgb24, method, &residuals.body);
+            let len1 = compute_canonical_lengths(&h1).expect("lens1");
+            let len2 = compute_canonical_lengths(&h2).expect("lens2");
+            let len3 = compute_canonical_lengths(&h3).expect("lens3");
+            let s1 = HuffTable::build_from_lengths(&len1).expect("t1");
+            let s2 = HuffTable::build_from_lengths(&len2).expect("t2");
+            let s3 = HuffTable::build_from_lengths(&len3).expect("t3");
+            let ref_bits = ref_emit_rgb24_per_byte_loop(method, &residuals.body, &s1, &s2, &s3);
+            // The production frame begins with the 4-byte uncompressed
+            // seed; the emitted bit stream follows.
+            let prod_bits = &frame[4..];
+            assert_eq!(
+                prod_bits, ref_bits.as_slice(),
+                "round-239 step body must emit bit-identical wire bytes to the pre-r239 per-byte slot dispatch (method = {:?})",
+                method
+            );
+        }
     }
 }
