@@ -8,6 +8,46 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-242: pixel-step RGB24 histogram body in `histogramise`. The
+  pre-r242 loop ran `match i % 3` on every body byte to pick the slot
+  AND a `method.decorrelate()` branch on every iteration — two
+  per-byte branches the optimiser could not eliminate because `i` was
+  the iterator state and the answer to `method.decorrelate()` never
+  changes mid-frame. Round 242 hoists both decisions out of the loop:
+  the per-position histogram triple is resolved once at function entry
+  by the `(h_pos0, h_pos1, h_pos2)` binding (paired by
+  `method.decorrelate()`), then the body steps three bytes per outer
+  iteration with the slot resolved at compile time — three indexed
+  counter increments per wire pixel. spec/03 §1.1 pins RGB24 at
+  exactly three Huffman codewords per pixel (the §3.2/§3.3 spec/02
+  correction); §1.2 fixes the position → slot mapping at
+  `(slot1, slot2, slot3)` for no-decorrelate methods (B / G / R) and
+  `(slot2, slot1, slot3)` for decorrelate methods (G / B−G / R−G).
+  `body.len()` is always a multiple of 3 in the in-spec input space
+  (the body is `(n_pixels − 1) × 3` bytes per `rgb24_residuals`), so
+  the pixel-step body covers every count byte; a 1..=2-byte scalar
+  fall-through is kept for defence-in-depth, mirroring the
+  r221 / r227 / r239 fall-throughs. Histogram-side companion to
+  r239's RGB24 emit rewrite (and mirror of r227's YUY2 histogram
+  macropixel-step body, applied to the §1.2 three-byte RGB24 wire
+  cycle). Wire-identical to round 239 — seven new
+  `round242_rgb24_histogram_pixel_step_tests` lock the rewrite:
+  one `*_matches_per_byte_reference` witness drives Left /
+  LeftDecorr / GradientDecorr at widths 1 / 2 / 4 / 8 and diffs the
+  production histograms against an inlined copy of the pre-r242
+  per-byte body element-by-element (and asserts the per-slot count
+  total equals `body.len()`); two synthetic-body witnesses
+  (no-decorr triple and decorr triple) drive a `0..96` body that
+  densely covers every residue position with distinct values so a
+  slot mix-up surfaces as counts attributed to the wrong histogram;
+  four end-to-end CustomV2 round-trips at widths 1 / 2 / 4 / 8
+  across `Left` / `LeftDecorr` / `GradientDecorr` exercise the
+  histogram → canonical-length → emit chain (CustomV2 builds the
+  per-slot length tables straight from `histogramise`, so any
+  histogram drift would change the emitted lengths and break the
+  round-trip). Lib test count: 201 → 208.
+
+
 - Round-239: pixel-step RGB24 Huffman-encode body in
   `emit_bitstream_parts`. The pre-r239 loop ran `match i % 3` on every
   body byte to pick the slot AND a `method.decorrelate()` branch on

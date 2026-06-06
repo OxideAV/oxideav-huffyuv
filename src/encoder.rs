@@ -1037,22 +1037,60 @@ fn histogramise(
             }
         }
         PixelFamily::Rgb24 => {
-            // body is laid out 3 bytes per pixel in wire order.
-            for (i, &b) in body.iter().enumerate() {
-                let in_pixel = i % 3;
+            // Round-242: pixel-step RGB24 histogram body. spec/03 §1.1
+            // pins RGB24 at exactly three Huffman codewords per pixel
+            // (the §3.2/§3.3 spec/02 correction); §1.2 fixes the
+            // position → slot mapping at:
+            //
+            //   no decorr: pos +0 (B) → slot1   +1 (G) → slot2   +2 (R) → slot3
+            //   decorr   : pos +0 (G) → slot2   +1 (B−G) → slot1  +2 (R−G) → slot3
+            //
+            // The pre-r242 loop ran `match i % 3` on every body byte
+            // AND a `method.decorrelate()` branch every iteration — two
+            // per-byte branches the optimiser could not eliminate
+            // because `i` was the iterator state and the answer to
+            // `method.decorrelate()` never changes mid-frame. Round 242
+            // hoists both decisions out of the loop: the per-position
+            // histogram triple is resolved once at function entry by
+            // the `(h_pos0, h_pos1, h_pos2)` binding (paired by
+            // `method.decorrelate()`), then the body steps three bytes
+            // per outer iteration with the slot resolved at compile
+            // time — three indexed counter increments per wire pixel.
+            // Histogram-side companion to r239's RGB24 emit rewrite
+            // (and mirror of r227's YUY2 histogram macropixel-step
+            // body, applied to the §1.2 three-byte RGB24 wire cycle).
+            //
+            // `body.len()` is always a multiple of 3 in the in-spec
+            // input space (the body is `(n_pixels − 1) × 3` bytes per
+            // `rgb24_residuals`), so the pixel-step body covers every
+            // count byte. A 1..=2-byte scalar fall-through is kept for
+            // defence-in-depth against future pixel-family extensions,
+            // mirroring the r221 / r227 / r239 fall-throughs.
+            let (h_pos0, h_pos1, h_pos2): (&mut [u32; 256], &mut [u32; 256], &mut [u32; 256]) =
                 if method.decorrelate() {
-                    match in_pixel {
-                        0 => h2[b as usize] += 1, // G
-                        1 => h1[b as usize] += 1, // B-G
-                        _ => h3[b as usize] += 1, // R-G
-                    }
+                    (&mut h2, &mut h1, &mut h3)
                 } else {
-                    match in_pixel {
-                        0 => h1[b as usize] += 1,
-                        1 => h2[b as usize] += 1,
-                        _ => h3[b as usize] += 1,
-                    }
+                    (&mut h1, &mut h2, &mut h3)
+                };
+            let body_aligned = (body.len() / 3) * 3;
+            let mut i = 0usize;
+            while i < body_aligned {
+                h_pos0[body[i] as usize] += 1;
+                h_pos1[body[i + 1] as usize] += 1;
+                h_pos2[body[i + 2] as usize] += 1;
+                i += 3;
+            }
+            // Scalar fall-through for any 1..=2 trailing bytes
+            // (unreachable for valid RGB24 inputs; kept for
+            // robustness).
+            while i < body.len() {
+                let in_pixel = i % 3;
+                match in_pixel {
+                    0 => h_pos0[body[i] as usize] += 1,
+                    1 => h_pos1[body[i] as usize] += 1,
+                    _ => h_pos2[body[i] as usize] += 1,
                 }
+                i += 1;
             }
         }
         PixelFamily::Rgb32 => {
@@ -2189,5 +2227,263 @@ mod round239_rgb24_emit_pixel_step_tests {
                 method
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod round242_rgb24_histogram_pixel_step_tests {
+    //! Round-242 regression guard. The encoder's RGB24 histogram body
+    //! (`histogramise`) was rewritten from a per-byte `match i % 3`
+    //! slot dispatch (plus a per-iteration `method.decorrelate()`
+    //! branch) into a pixel-step body that resolves the three
+    //! per-position histogram references once at function entry and
+    //! counts three bytes per outer iteration.
+    //!
+    //! Histogram-side companion to round 239's RGB24 emit rewrite (and
+    //! mirror of round 227's YUY2 histogram macropixel-step body
+    //! applied to the §1.2 three-byte RGB24 wire cycle).
+    //!
+    //! spec/03 §1.1 pins RGB24 at exactly three Huffman codewords per
+    //! pixel (the §3.2/§3.3 spec/02 correction); §1.2 fixes the
+    //! position → slot mapping at:
+    //!
+    //! - no-decorr methods (`Left`, `PredictOld`): pos +0 (B) → slot1;
+    //!   pos +1 (G) → slot2; pos +2 (R) → slot3.
+    //! - decorr methods (`LeftDecorr`, `GradientDecorr`): pos +0 (G) →
+    //!   slot2; pos +1 (B−G) → slot1; pos +2 (R−G) → slot3.
+    //!
+    //! Coverage:
+    //!
+    //! - **Per-byte witness** — the production histogram triple is
+    //!   diffed element-by-element against an inlined copy of the
+    //!   pre-r242 per-byte slot-dispatch body over both real residual
+    //!   bodies (taken from `compute_frame_residuals`) and a synthetic
+    //!   `0..96` body that densely covers every residue position. Any
+    //!   slot mix-up inside the step body would surface as counts
+    //!   attributed to the wrong histogram.
+    //! - **Histogram total sanity** — `h1 + h2 + h3` summed across all
+    //!   256 buckets must equal `body.len()` (every body byte counted
+    //!   exactly once). This catches a step body that drops or
+    //!   double-counts bytes even if the slot attribution happens to
+    //!   match the reference on a particular fixture.
+    //! - **End-to-end CustomV2 round-trips** at widths 1 / 2 / 4 / 8
+    //!   across `Left` / `LeftDecorr` / `GradientDecorr`: the CustomV2
+    //!   path builds the per-slot length tables straight from
+    //!   `histogramise`, so any histogram drift would change the
+    //!   emitted lengths and break the round-trip.
+    //!
+    //! Wire-identical to round 239 — every pre-existing RGB24 round-
+    //! trip + the AVI-lockstep RGB24 tests stay green.
+
+    use super::*;
+
+    fn synth_rgb24(width: usize, height: usize) -> Vec<u8> {
+        // Deterministic xorshift32 ramp — same shape as the r239 helper
+        // but inlined here so this module stays self-contained.
+        let mut s: u32 = 0xDEAD_BEEF;
+        let n = width * height * 3;
+        let mut out = vec![0u8; n];
+        for px in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *px = s as u8;
+        }
+        out
+    }
+
+    /// Reference body: the pre-r242 per-byte slot-dispatch histogram
+    /// inlined verbatim. Output must match `histogramise(Rgb24, method,
+    /// ...)` element-by-element across all three histograms.
+    fn ref_histogramise_rgb24_per_byte(
+        method: Method,
+        body: &[u8],
+    ) -> ([u32; 256], [u32; 256], [u32; 256]) {
+        let mut h1 = [0u32; 256];
+        let mut h2 = [0u32; 256];
+        let mut h3 = [0u32; 256];
+        for (i, &b) in body.iter().enumerate() {
+            let in_pixel = i % 3;
+            if method.decorrelate() {
+                match in_pixel {
+                    0 => h2[b as usize] += 1, // G
+                    1 => h1[b as usize] += 1, // B-G
+                    _ => h3[b as usize] += 1, // R-G
+                }
+            } else {
+                match in_pixel {
+                    0 => h1[b as usize] += 1,
+                    1 => h2[b as usize] += 1,
+                    _ => h3[b as usize] += 1,
+                }
+            }
+        }
+        (h1, h2, h3)
+    }
+
+    #[test]
+    fn round242_rgb24_histogram_matches_per_byte_reference() {
+        // Drive the residual pipeline across Left / LeftDecorr /
+        // GradientDecorr at widths 1 / 2 / 4 / 8. For each frame, take
+        // the combined_body the encoder feeds to histogramise and
+        // compare the production histograms against the per-byte
+        // reference.
+        for &(w, h) in &[(1u32, 3u32), (2, 3), (4, 4), (8, 4)] {
+            for &method in &[Method::Left, Method::LeftDecorr, Method::GradientDecorr] {
+                let pixels = synth_rgb24(w as usize, h as usize);
+                let frame = compute_frame_residuals(PixelFamily::Rgb24, method, w, h, &pixels)
+                    .expect("residuals");
+                let (h1_prod, h2_prod, h3_prod) =
+                    histogramise(PixelFamily::Rgb24, method, &frame.combined_body);
+                let (h1_ref, h2_ref, h3_ref) =
+                    ref_histogramise_rgb24_per_byte(method, &frame.combined_body);
+                assert_eq!(
+                    h1_prod, h1_ref,
+                    "round242 slot1 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                assert_eq!(
+                    h2_prod, h2_ref,
+                    "round242 slot2 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                assert_eq!(
+                    h3_prod, h3_ref,
+                    "round242 slot3 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                // Sanity: histograms must sum to body.len() (every body
+                // byte is counted exactly once).
+                let total: u64 = h1_prod
+                    .iter()
+                    .chain(h2_prod.iter())
+                    .chain(h3_prod.iter())
+                    .map(|&c| c as u64)
+                    .sum();
+                assert_eq!(
+                    total,
+                    frame.combined_body.len() as u64,
+                    "round242 histogram total != body.len() @ {}x{} {:?}",
+                    w,
+                    h,
+                    method
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round242_rgb24_histogram_synth_body_matches_per_byte_reference_no_decorr() {
+        // Direct check against a synthetic body that exercises every
+        // residue position. Uses a 96-byte body (= 32 wire pixels) so
+        // the slot positions are densely covered with distinct values
+        // — a slot mix-up inside the step body would surface as counts
+        // attributed to the wrong histogram. No-decorr triple:
+        // (slot1, slot2, slot3) at (+0, +1, +2).
+        let body: Vec<u8> = (0u8..96).collect();
+        let (h1_prod, h2_prod, h3_prod) = histogramise(PixelFamily::Rgb24, Method::Left, &body);
+        let (h1_ref, h2_ref, h3_ref) = ref_histogramise_rgb24_per_byte(Method::Left, &body);
+        assert_eq!(h1_prod, h1_ref);
+        assert_eq!(h2_prod, h2_ref);
+        assert_eq!(h3_prod, h3_ref);
+
+        // Fixed expectations: bytes at i = 0, 3, 6, ..., 93 fall on +0
+        // (slot1 under no-decorr); i = 1, 4, 7, ..., 94 fall on +1
+        // (slot2); i = 2, 5, 8, ..., 95 fall on +2 (slot3). Each value
+        // appears exactly once at its assigned position.
+        for v in (0u8..96).step_by(3) {
+            assert_eq!(
+                h1_prod[v as usize], 1,
+                "no-decorr slot1 should hold byte {v} exactly once",
+            );
+        }
+        for v in (1u8..96).step_by(3) {
+            assert_eq!(
+                h2_prod[v as usize], 1,
+                "no-decorr slot2 should hold byte {v} exactly once",
+            );
+        }
+        for v in (2u8..96).step_by(3) {
+            assert_eq!(
+                h3_prod[v as usize], 1,
+                "no-decorr slot3 should hold byte {v} exactly once",
+            );
+        }
+    }
+
+    #[test]
+    fn round242_rgb24_histogram_synth_body_matches_per_byte_reference_decorr() {
+        // Same synthetic body, decorr triple: (slot2, slot1, slot3) at
+        // (+0, +1, +2). A slot-swap regression between no-decorr and
+        // decorr would surface as the slot1/slot2 columns landing in
+        // the wrong histogram.
+        let body: Vec<u8> = (0u8..96).collect();
+        let (h1_prod, h2_prod, h3_prod) =
+            histogramise(PixelFamily::Rgb24, Method::LeftDecorr, &body);
+        let (h1_ref, h2_ref, h3_ref) = ref_histogramise_rgb24_per_byte(Method::LeftDecorr, &body);
+        assert_eq!(h1_prod, h1_ref);
+        assert_eq!(h2_prod, h2_ref);
+        assert_eq!(h3_prod, h3_ref);
+
+        // Fixed expectations for the decorr triple: pos +0 → slot2,
+        // pos +1 → slot1, pos +2 → slot3.
+        for v in (0u8..96).step_by(3) {
+            assert_eq!(
+                h2_prod[v as usize], 1,
+                "decorr slot2 should hold pos-+0 byte {v} exactly once",
+            );
+        }
+        for v in (1u8..96).step_by(3) {
+            assert_eq!(
+                h1_prod[v as usize], 1,
+                "decorr slot1 should hold pos-+1 byte {v} exactly once",
+            );
+        }
+        for v in (2u8..96).step_by(3) {
+            assert_eq!(
+                h3_prod[v as usize], 1,
+                "decorr slot3 should hold pos-+2 byte {v} exactly once",
+            );
+        }
+    }
+
+    fn rt_rgb24_custom(width: u32, height: u32, method: Method) {
+        use crate::decoder::decode_frame;
+        let pixels = synth_rgb24(width as usize, height as usize);
+        let (bih, frame) = encode_frame_with_mode(
+            PixelFamily::Rgb24,
+            method,
+            width,
+            height,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let decoded = decode_frame(&cfg, &frame).expect("decode");
+        assert_eq!(decoded.pixels, pixels);
+    }
+
+    #[test]
+    fn round242_rgb24_custom_v2_roundtrip_width_1() {
+        // width=1, height=3 → n_pixels=3, body=(3-1)×3=6 bytes. Two
+        // pixel-step iterations; minimum non-trivial body.
+        rt_rgb24_custom(1, 3, Method::Left);
+    }
+
+    #[test]
+    fn round242_rgb24_custom_v2_roundtrip_width_2() {
+        rt_rgb24_custom(2, 3, Method::LeftDecorr);
+    }
+
+    #[test]
+    fn round242_rgb24_custom_v2_roundtrip_width_4() {
+        rt_rgb24_custom(4, 4, Method::GradientDecorr);
+    }
+
+    #[test]
+    fn round242_rgb24_custom_v2_roundtrip_width_8() {
+        // Wider raster — exercises the step body across multiple rows.
+        rt_rgb24_custom(8, 4, Method::Left);
     }
 }
