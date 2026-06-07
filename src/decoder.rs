@@ -579,14 +579,67 @@ fn inverse_yuy2_median(out: &mut [u8], row_bytes: usize) {
     // rows ≥ 2. spec/03 §2.3 trace: L at -2, A at -row_stride,
     // AL at -row_stride - 2. With `row1_left_end >= row_bytes + 8`,
     // every lookback below is in-bounds.
+    //
+    // Round-255: rewrite as a half-macropixel (2-byte) step body to
+    // expose instruction-level parallelism between the two independent
+    // median computations within each step, mirroring the predict-side
+    // r253 macropixel-step rewrite shape but at half the unroll factor
+    // (the inverse predictor reads L from the same `out` buffer it
+    // writes to, so the L source at intra-step offset +2 / +3 would
+    // alias the writes at intra-step offset +0 / +1 — a 4-byte unroll
+    // would introduce a read-after-write within the unrolled body).
+    //
+    // At a 2-byte step, both L sources within the step
+    // (`out[pos - 2]`, `out[pos - 1]`) are read from positions
+    // finalised before the step began — the previous step's writes
+    // (or the LEFT-region bytes, for the very first step at
+    // `pos = row_bytes + 8`). The two `gradient_predictor → median3
+    // → wrapping_add` chains for the step's two output bytes are
+    // therefore independent and the compiler is free to schedule
+    // them across functional units.
+    //
+    // `row1_left_end = (row_bytes + 8).min(len)` is always a multiple
+    // of 2 for in-spec YUY2 input (row_bytes = 2 × width ⇒ row_bytes
+    // ≡ 0 mod 2, plus the +8 keeps the alignment), so the 2-byte
+    // step body covers every wire byte in the median region. A 1-byte
+    // scalar fall-through is kept for defence-in-depth, mirroring the
+    // r221 / r227 / r239 / r242 / r245 / r250 / r253 fall-throughs.
+    //
+    // Bit-identical to the pre-r255 per-byte body — regression-guarded
+    // by `round255_inverse_yuy2_median_step_*` tests below.
     debug_assert!(row1_left_end >= row_bytes + 2);
-    for pos in row1_left_end..len {
+    let body_end = len - ((len - row1_left_end) & 1);
+    let mut pos = row1_left_end;
+    while pos < body_end {
+        // Two independent per-byte median adds per outer step. Each
+        // pair reads from disjoint reference offsets and writes to
+        // disjoint output offsets; the writes do not feed back into
+        // the reads within the same step.
+        let l0 = out[pos - 2];
+        let a0 = out[pos - row_bytes];
+        let al0 = out[pos - row_bytes - 2];
+        let l1 = out[pos - 1];
+        let a1 = out[pos + 1 - row_bytes];
+        let al1 = out[pos - row_bytes - 1];
+        let g0 = l0.wrapping_add(a0).wrapping_sub(al0);
+        let g1 = l1.wrapping_add(a1).wrapping_sub(al1);
+        let p0 = crate::predict::median3(l0, a0, g0);
+        let p1 = crate::predict::median3(l1, a1, g1);
+        out[pos] = out[pos].wrapping_add(p0);
+        out[pos + 1] = out[pos + 1].wrapping_add(p1);
+        pos += 2;
+    }
+    // Tail (0..=1 bytes after the last whole 2-byte step). In practice
+    // in-spec YUY2 input keeps `len − row1_left_end` even, so this
+    // loop runs zero times; kept for robustness.
+    while pos < len {
         let l = out[pos - 2];
         let a = out[pos - row_bytes];
         let al = out[pos - row_bytes - 2];
         let g = l.wrapping_add(a).wrapping_sub(al);
         let predictor = crate::predict::median3(l, a, g);
         out[pos] = out[pos].wrapping_add(predictor);
+        pos += 1;
     }
 }
 
@@ -922,6 +975,209 @@ mod round214_yuy2_decode_macropixel_tests {
             // And the production decoder must also round-trip.
             let prod = decode_frame(&cfg, &frame).expect("decode");
             assert_eq!(prod.pixels, pixels, "production decode must round-trip");
+        }
+    }
+}
+
+#[cfg(test)]
+mod round255_inverse_yuy2_median_step_tests {
+    //! Round-255 regression guard. The decoder's
+    //! [`super::inverse_yuy2_median`] median-region body was rewritten
+    //! from a per-byte add loop into a half-macropixel (2-byte) step
+    //! body, mirroring r253's predict-side macropixel-step rewrite shape
+    //! at half the unroll factor.
+    //!
+    //! The inverse predictor reads `L` from the same `out` buffer it
+    //! writes to. A 4-byte unroll like r253's predict-side body would
+    //! introduce read-after-write aliasing (intra-step offset +2 / +3
+    //! reads `out[pos] / out[pos + 1]`, which are the writes from
+    //! intra-step offset +0 / +1). The 2-byte step body avoids this:
+    //! both L sources within a step (`out[pos - 2]`, `out[pos - 1]`)
+    //! are finalised before the step begins, so the two median chains
+    //! within a step are independent and the compiler can schedule
+    //! them across functional units. Successive 2-byte steps still
+    //! carry the natural sequential L dependency the median predictor
+    //! requires per spec/03 §2.3.
+    //!
+    //! These tests pin the rewrite at byte-equality against an inlined
+    //! copy of the pre-r255 per-byte body, cover the modular-wrap edge,
+    //! pin the `(len − row1_left_end) % 2 == 0` alignment invariant the
+    //! step body relies on, exercise the 1-byte scalar tail
+    //! fall-through, and run the encoder→decoder roundtrip across the
+    //! same YUY2 widths the r253 forward tests cover (so any drift
+    //! between forward and inverse predictor would surface as a
+    //! roundtrip mismatch even before the per-byte witness fires).
+    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::header::{Method, PixelFamily, StreamConfig};
+    use crate::predict::median3;
+
+    /// Inlined copy of the pre-r255 decoder median body, used as the
+    /// per-byte reference oracle. Identical semantics to the
+    /// production code path before the 2-byte step rewrite.
+    fn ref_inverse_yuy2_median_per_byte(out: &mut [u8], row_bytes: usize) {
+        let len = out.len();
+        if len <= 4 {
+            return;
+        }
+        let row0_end = row_bytes.min(len);
+        crate::predict::inverse_yuy2_left_macropixel(out, 4, row0_end);
+        if len <= row_bytes {
+            return;
+        }
+        let row1_left_end = (row_bytes + 8).min(len);
+        crate::predict::inverse_yuy2_left_macropixel(out, row_bytes, row1_left_end);
+        if row1_left_end >= len {
+            return;
+        }
+        for pos in row1_left_end..len {
+            let l = out[pos - 2];
+            let a = out[pos - row_bytes];
+            let al = out[pos - row_bytes - 2];
+            let g = l.wrapping_add(a).wrapping_sub(al);
+            let predictor = median3(l, a, g);
+            out[pos] = out[pos].wrapping_add(predictor);
+        }
+    }
+
+    /// Deterministic byte stream — the median-region body is exercised
+    /// regardless of input statistics because every input byte feeds
+    /// into the lookback chain on subsequent rows.
+    fn synth_residuals(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn round255_inverse_yuy2_median_matches_per_byte_reference() {
+        // The 2-byte step body must produce byte-identical output to
+        // the pre-r255 per-byte loop across the YUY2 widths the r253
+        // forward body covers: narrow widths where row_bytes < 8 (the
+        // LEFT exemption extends past row 1 into row 2), the
+        // bench-reference 320×16 raster, and intermediate sizes.
+        for (w, h) in [
+            (2usize, 18usize),
+            (4, 4),
+            (8, 6),
+            (16, 3),
+            (160, 8),
+            (320, 16),
+        ] {
+            let row_bytes = w * 2;
+            let n = row_bytes * h;
+            let buf = synth_residuals(n, 0xCAFE_BABE);
+            let mut a = buf.clone();
+            let mut b = buf;
+            ref_inverse_yuy2_median_per_byte(&mut a, row_bytes);
+            super::inverse_yuy2_median(&mut b, row_bytes);
+            assert_eq!(
+                a, b,
+                "2-byte step body must match per-byte reference (w={w}, h={h})"
+            );
+        }
+    }
+
+    #[test]
+    fn round255_inverse_yuy2_median_modular_wrap() {
+        // Force mod-256 wraps inside the gradient and the final add by
+        // priming the entire buffer with 0xFE / 0xFF / 0x01 / 0x02
+        // values that overflow when added in the predictor chain.
+        let row_bytes = 16;
+        let h = 6;
+        let n = row_bytes * h;
+        let mut buf = Vec::with_capacity(n);
+        for i in 0..n {
+            buf.push(match i & 3 {
+                0 => 0xFEu8,
+                1 => 0xFFu8,
+                2 => 0x01u8,
+                _ => 0x02u8,
+            });
+        }
+        let mut a = buf.clone();
+        let mut b = buf;
+        ref_inverse_yuy2_median_per_byte(&mut a, row_bytes);
+        super::inverse_yuy2_median(&mut b, row_bytes);
+        assert_eq!(a, b, "modular wrap path must match per-byte reference");
+    }
+
+    #[test]
+    fn round255_inverse_yuy2_median_boundary_row1_step_alignment() {
+        // Pin the alignment invariants the 2-byte step body relies on:
+        // - `row1_left_end = (row_bytes + 8).min(len)` must be a
+        //   multiple of 2 for in-spec YUY2 input (row_bytes = 2 * width
+        //   with width even ⇒ row_bytes ≡ 0 mod 2; the +8 keeps the
+        //   alignment).
+        // - `(len - row1_left_end) % 2 == 0` ⇒ the scalar 1-byte tail
+        //   fall-through runs zero times for every in-spec width.
+        for w in [2usize, 4, 8, 16, 160, 320] {
+            let row_bytes = w * 2;
+            let h = 4;
+            let len = row_bytes * h;
+            let row1_left_end = (row_bytes + 8).min(len);
+            assert_eq!(
+                row1_left_end & 1,
+                0,
+                "row1_left_end must be even for in-spec YUY2 (w={w})"
+            );
+            assert_eq!(
+                (len - row1_left_end) & 1,
+                0,
+                "(len - row1_left_end) must be even for in-spec YUY2 (w={w})"
+            );
+        }
+    }
+
+    #[test]
+    fn round255_inverse_yuy2_median_scalar_tail_safety() {
+        // Force the 1-byte scalar fall-through by constructing an
+        // out-of-spec buffer where (len - row1_left_end) is odd. Even
+        // though in-spec YUY2 widths keep this region even, the tail
+        // loop must remain memory-safe and produce the same output as
+        // the per-byte reference body — this is the defence-in-depth
+        // claim the rewrite makes.
+        let row_bytes = 16;
+        let h = 5;
+        let len = row_bytes * h - 1; // one byte short of full row
+        let buf = synth_residuals(len, 0xDEAD_BEEF);
+        let mut a = buf.clone();
+        let mut b = buf;
+        ref_inverse_yuy2_median_per_byte(&mut a, row_bytes);
+        super::inverse_yuy2_median(&mut b, row_bytes);
+        assert_eq!(a, b, "scalar tail fall-through must match reference");
+    }
+
+    #[test]
+    fn round255_inverse_yuy2_median_encoder_roundtrip() {
+        // End-to-end witness: encode → decode must round-trip
+        // bit-exactly across the same widths the r253 forward tests
+        // cover. The production decoder now routes the median region
+        // through the 2-byte step body — any drift between the forward
+        // predict and the inverse would surface here.
+        for (w, h) in [(2u32, 18u32), (4, 6), (8, 5), (16, 3)] {
+            // Synthesise pixels and roundtrip through ClassicV2 Median.
+            let pixels = synth_residuals((w as usize) * (h as usize) * 2, 0x1234_5678);
+            let (bih, frame) = encode_frame_with_mode(
+                PixelFamily::Yuy2,
+                Method::Median,
+                w,
+                h,
+                &pixels,
+                ExtradataMode::ClassicV2,
+            )
+            .expect("encode");
+            let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+            let decoded = super::decode_frame(&cfg, &frame).expect("decode");
+            assert_eq!(
+                decoded.pixels, pixels,
+                "round-trip must be bit-exact (w={w}, h={h})"
+            );
         }
     }
 }

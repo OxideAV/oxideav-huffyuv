@@ -8,6 +8,55 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-255: half-macropixel (2-byte) step body for the YUY2 inverse
+  MEDIAN region in `decoder::inverse_yuy2_median`. The pre-r255
+  median region was a per-byte loop that re-issued three
+  uniform-offset lookbacks (`L = out[pos − 2]`, `A = out[pos −
+  row_bytes]`, `AL = out[pos − row_bytes − 2]`) and a
+  `gradient_predictor → median3 → wrapping_add` chain on every byte
+  position one at a time. The inverse direction reads `L` from the
+  same `out` buffer it writes to, so a full 4-byte unroll (as r253
+  applied to the encoder's forward MEDIAN body) would introduce
+  read-after-write aliasing within the unrolled step: intra-step
+  offset +2 / +3 reads `out[pos] / out[pos + 1]`, which are the
+  writes from intra-step offset +0 / +1. At a 2-byte step, both
+  `L` sources within the step (`out[pos − 2]`, `out[pos − 1]`) are
+  read from positions finalised before the step began (the previous
+  step's writes, or the LEFT-region bytes for the very first step
+  at `pos = row_bytes + 8`), so the two `gradient_predictor →
+  median3 → wrapping_add` chains within the step are independent and
+  the compiler is free to schedule them across functional units.
+  `row1_left_end = (row_bytes + 8).min(len)` is always a multiple
+  of 2 for in-spec YUY2 input (row_bytes = 2 × width ⇒ row_bytes ≡
+  0 mod 2; the +8 keeps the alignment), so the 2-byte step body
+  covers every wire byte in the median region; a 1-byte scalar
+  fall-through is kept for defence-in-depth (mirroring the r221 /
+  r227 / r239 / r242 / r245 / r250 / r253 fall-throughs).
+  Decoder-side companion to r253's encoder forward MEDIAN
+  macropixel-step rewrite, applied to the same §2.3 four-byte YUY2
+  median rhythm but at half the unroll factor to respect the
+  natural sequential `L` dependency the inverse predictor carries
+  per spec/03 §2.3. Wire-identical to round 253 — five new
+  `round255_inverse_yuy2_median_step_tests` lock the rewrite: a
+  `*_matches_per_byte_reference` witness diffs the production
+  output against an inlined copy of the pre-r255 per-byte body
+  across YUY2 widths 2 / 4 / 8 / 16 / 160 / 320 (covering the
+  narrow `row_bytes < 8` regime where the LEFT exemption extends
+  past row 1, the bench-reference 320×16 raster, and several
+  intermediate sizes); a `*_modular_wrap` fixture forces mod-256
+  wraps inside the gradient and the final add on every iteration;
+  a `*_boundary_row1_step_alignment` fixture pins the
+  `row1_left_end % 2 == 0` and `(len − row1_left_end) % 2 == 0`
+  invariants the step body relies on; a `*_scalar_tail_safety`
+  fixture exercises the 1-byte scalar fall-through against an
+  out-of-spec odd-length buffer (the in-spec body is multiple-of-2
+  so the tail is defence-in-depth only); and an
+  `*_encoder_roundtrip` fixture chains
+  `encode_frame_with_mode → decode_frame` and asserts bit-exact
+  pixel reconstruction across the same widths the r253 forward
+  tests cover (so any forward / inverse drift would surface as a
+  roundtrip mismatch). Lib test count: 228 → 233.
+
 - Round-253: macropixel-step body for the YUY2 forward MEDIAN
   predict region in `predict::forward_median_subtract`. The
   pre-r253 median region was a per-byte loop that re-issued three
