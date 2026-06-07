@@ -5,7 +5,49 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
-**Round 245 — pixel-step RGB32 Huffman-encode body.** The encoder's
+**Round 250 — pixel-step RGB32 histogram body.** The encoder's RGB32
+histogram pass in `histogramise` is rewritten from a per-byte
+`match i % 4` slot dispatch (plus a per-iteration
+`method.decorrelate()` branch — two per-byte branches the optimiser
+could not eliminate because the iterator state changed every step)
+into a pixel-step body that resolves the three per-position histogram
+references once at function entry by the `(h_pos0, h_pos1, h_pos2)`
+binding (paired by `method.decorrelate()`) and counts four bytes per
+outer iteration straight-line — `h_pos0[+0] += 1 → h_pos1[+1] += 1 →
+h_pos2[+2] += 1 → h_pos2[+3] += 1` per wire pixel. spec/03 §1.3 pins
+RGB32 at exactly four Huffman codewords per pixel; §1.2 fixes the
+position → slot mapping at `(slot1, slot2, slot3, slot3)` for
+no-decorrelate methods (B / G / R / A) and `(slot2, slot1, slot3,
+slot3)` for decorrelate methods (G / B−G / R−G / A). Alpha shares the
+slot-3 codebook per the §1.2 evidence at `@0x10001b21` (no-decorr A
+emit) and `@0x10001c6d` (decorr A emit) — so the +3 (alpha) position
+re-uses `h_pos2`, accumulating into slot 3 alongside the +2 (R / R−G)
+column. `body.len()` is always a multiple of 4 in the in-spec input
+space (the body is `(n_pixels − 1) × 4` bytes per `rgb32_residuals`),
+so the pixel-step body covers every count byte; a 1..=3-byte scalar
+fall-through is kept for defence-in-depth, mirroring the
+r221 / r227 / r239 / r242 / r245 fall-throughs. Histogram-side
+companion to r245's RGB32 emit rewrite, applied to the same §1.3
+four-byte RGB32 wire cycle (and a direct mirror of r242's RGB24
+histogram pixel-step body, applied to the alpha-extended cycle).
+Wire-identical to round 245 — six new
+`round250_rgb32_histogram_pixel_step_tests` lock the rewrite: one
+`*_matches_per_byte_reference` witness drives Left / LeftDecorr /
+GradientDecorr at widths 1 / 2 / 4 / 8, diffing the production
+histograms against an inlined copy of the pre-r250 per-byte body
+element-by-element (and asserting the per-slot count total equals
+`body.len()`); two synthetic-body witnesses (no-decorr quadruple and
+decorr quadruple) drive a `0..128` body that densely covers every
+residue position across 32 wire pixels with distinct values so a slot
+mix-up surfaces as counts attributed to the wrong histogram; one
+alpha-shares-slot-3 aggregation fixture lays the same value at +2 and
++3 within each pixel and verifies slot 3's bucket accumulates two
+increments per pixel; and two end-to-end CustomV2 round-trips at
+widths 1 / 2 / 4 / 8 across `Left` / `LeftDecorr` / `GradientDecorr`
+exercise the histogram → canonical-length → emit chain (CustomV2
+builds the per-slot length tables straight from `histogramise`, so any
+histogram drift would change the emitted lengths and break the
+round-trip). Lib test count: 217 → 223. **Round 245 — pixel-step RGB32 Huffman-encode body.** The encoder's
 RGB32 emit loop in `emit_bitstream_parts` is rewritten from a per-byte
 `match i % 4` slot dispatch (plus a per-iteration
 `method.decorrelate()` branch — two per-byte branches the optimiser

@@ -1094,24 +1094,89 @@ fn histogramise(
             }
         }
         PixelFamily::Rgb32 => {
-            // body is laid out 4 bytes per pixel in wire order.
-            for (i, &b) in body.iter().enumerate() {
-                let in_pixel = i % 4;
+            // Round-250: pixel-step RGB32 histogram body. spec/03 §1.3
+            // pins RGB32 at exactly four Huffman codewords per pixel —
+            // the wire body walks a fixed 4-byte cycle whose slot
+            // mapping comes from spec/03 §1.2 (table at the end of §1.2
+            // + alpha-shares-slot-3 evidence at `@0x10001b21` and
+            // `@0x10001c6d` in §1.2):
+            //
+            //   no decorr: pos +0 (B)   → slot1   +1 (G) → slot2
+            //              pos +2 (R)   → slot3   +3 (A) → slot3
+            //   decorr   : pos +0 (G)   → slot2   +1 (B−G) → slot1
+            //              pos +2 (R−G) → slot3   +3 (A) → slot3
+            //
+            // The pre-r250 loop ran `match i % 4` on every body byte to
+            // pick the histogram AND a `method.decorrelate()` branch
+            // every iteration — two per-byte branches the optimiser
+            // could not eliminate because `i` was the iterator state
+            // and the answer to `method.decorrelate()` never changes
+            // mid-frame. Round 250 hoists both decisions out of the
+            // loop: the per-position histogram quadruple is resolved
+            // once at function entry by the `(h_pos0, h_pos1, h_pos2,
+            // h_pos3)` binding (paired by `method.decorrelate()`),
+            // then the body steps four bytes per outer iteration with
+            // the slot resolved at compile time — four indexed counter
+            // increments per wire pixel. Histogram-side companion to
+            // r245's RGB32 emit rewrite (and direct mirror of r242's
+            // RGB24 histogram pixel-step body, applied to the §1.3
+            // four-byte RGB32 wire cycle).
+            //
+            // `body.len()` is always a multiple of 4 in the in-spec
+            // input space (the body is `(n_pixels − 1) × 4` bytes per
+            // `rgb32_residuals`), so the pixel-step body covers every
+            // count byte. A 1..=3-byte scalar fall-through is kept for
+            // defence-in-depth against future pixel-family extensions,
+            // mirroring the r221 / r227 / r239 / r242 / r245 fall-
+            // throughs.
+            //
+            // Slot 3 receives two positions per pixel (pos +2 and pos
+            // +3) — both the R / R−G residual and the A residual
+            // share the slot-3 codebook per §1.2. The binding is
+            // written `(_, _, &mut h3, &mut h3)` for the pos +2 / pos
+            // +3 pair, but Rust's borrow checker treats `&mut h3,
+            // &mut h3` as two simultaneous mutable borrows of the same
+            // array — which is rejected even though every body
+            // iteration only writes one of the two references. We
+            // sidestep that by binding the +3 (alpha) position to a
+            // single `h3` reference via a raw `h3[…]` write in the
+            // body block, and reserving the position-quadruple for the
+            // three histograms that don't alias.
+            let (h_pos0, h_pos1, h_pos2): (&mut [u32; 256], &mut [u32; 256], &mut [u32; 256]) =
                 if method.decorrelate() {
-                    match in_pixel {
-                        0 => h2[b as usize] += 1, // G
-                        1 => h1[b as usize] += 1, // B-G
-                        2 => h3[b as usize] += 1, // R-G
-                        _ => h3[b as usize] += 1, // A → slot3
-                    }
+                    // pos +0 (G) → slot2, pos +1 (B−G) → slot1,
+                    // pos +2 (R−G) → slot3.
+                    (&mut h2, &mut h1, &mut h3)
                 } else {
-                    match in_pixel {
-                        0 => h1[b as usize] += 1,
-                        1 => h2[b as usize] += 1,
-                        2 => h3[b as usize] += 1,
-                        _ => h3[b as usize] += 1, // A → slot3
-                    }
+                    // pos +0 (B) → slot1, pos +1 (G) → slot2,
+                    // pos +2 (R) → slot3.
+                    (&mut h1, &mut h2, &mut h3)
+                };
+            let body_aligned = body.len() & !3;
+            let mut i = 0usize;
+            while i < body_aligned {
+                h_pos0[body[i] as usize] += 1;
+                h_pos1[body[i + 1] as usize] += 1;
+                // pos +2 and pos +3 both feed slot 3 — `h_pos2` is the
+                // slot-3 binding for pos +2, and pos +3 (alpha) also
+                // increments slot 3 via the same `h_pos2` reference
+                // (alpha shares the slot-3 codebook per §1.2).
+                h_pos2[body[i + 2] as usize] += 1;
+                h_pos2[body[i + 3] as usize] += 1;
+                i += 4;
+            }
+            // Scalar fall-through for any 1..=3 trailing bytes
+            // (unreachable for valid RGB32 inputs; kept for
+            // robustness).
+            while i < body.len() {
+                let in_pixel = i % 4;
+                match in_pixel {
+                    0 => h_pos0[body[i] as usize] += 1,
+                    1 => h_pos1[body[i] as usize] += 1,
+                    // pos +2 (R / R−G) and pos +3 (A) both → slot 3.
+                    _ => h_pos2[body[i] as usize] += 1,
                 }
+                i += 1;
             }
         }
     }
@@ -2754,6 +2819,348 @@ mod round245_rgb32_emit_pixel_step_tests {
                 "round-245 step body must emit bit-identical wire bytes to the pre-r245 per-byte slot dispatch (method = {:?})",
                 method
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod round250_rgb32_histogram_pixel_step_tests {
+    //! Round-250 regression guard. The encoder's RGB32 histogram body
+    //! (`histogramise`) was rewritten from a per-byte `match i % 4`
+    //! slot dispatch (plus a per-iteration `method.decorrelate()`
+    //! branch) into a pixel-step body that resolves the four
+    //! per-position histogram references once at function entry and
+    //! counts four bytes per outer iteration.
+    //!
+    //! Histogram-side companion to round 245's RGB32 emit rewrite (and
+    //! direct mirror of round 242's RGB24 histogram pixel-step body
+    //! applied to the §1.3 four-byte RGB32 wire cycle).
+    //!
+    //! spec/03 §1.3 pins RGB32 at exactly four Huffman codewords per
+    //! pixel; §1.2 (table at end of §1.2 + the alpha-shares-slot-3
+    //! evidence at `@0x10001b21` and `@0x10001c6d`) fixes the position
+    //! → slot mapping at:
+    //!
+    //! - no-decorr methods (`Left`, `PredictOld`): pos +0 (B) → slot1;
+    //!   pos +1 (G) → slot2; pos +2 (R) → slot3; pos +3 (A) → slot3.
+    //! - decorr methods (`LeftDecorr`, `GradientDecorr`): pos +0 (G) →
+    //!   slot2; pos +1 (B−G) → slot1; pos +2 (R−G) → slot3; pos +3 (A)
+    //!   → slot3.
+    //!
+    //! Coverage:
+    //!
+    //! - **Per-byte witness** — the production histogram triple is
+    //!   diffed element-by-element against an inlined copy of the
+    //!   pre-r250 per-byte slot-dispatch body over both real residual
+    //!   bodies (taken from `compute_frame_residuals`) and a synthetic
+    //!   `0..128` body that densely covers every residue position
+    //!   across 32 wire pixels. Any slot mix-up inside the step body —
+    //!   including a swap between the pos +2 (R / R−G) and pos +3 (A)
+    //!   slot-3 increments — would surface as counts attributed to the
+    //!   wrong histogram.
+    //! - **Histogram total sanity** — `h1 + h2 + h3` summed across all
+    //!   256 buckets must equal `body.len()` (every body byte counted
+    //!   exactly once). This catches a step body that drops or
+    //!   double-counts bytes even if the slot attribution happens to
+    //!   match the reference on a particular fixture.
+    //! - **Alpha-shares-slot-3 aggregation** — pos +2 and pos +3 both
+    //!   feed slot 3 per §1.2; a dedicated test fixture lays the same
+    //!   value at both positions and verifies slot 3's bucket
+    //!   accumulates two increments per pixel.
+    //! - **End-to-end CustomV2 round-trips** at widths 1 / 2 / 4 / 8
+    //!   across `Left` / `LeftDecorr` / `GradientDecorr`: the CustomV2
+    //!   path builds the per-slot length tables straight from
+    //!   `histogramise`, so any histogram drift would change the
+    //!   emitted lengths and break the round-trip.
+    //!
+    //! Wire-identical to round 245 — every pre-existing RGB32 round-
+    //! trip + the AVI-lockstep RGB32 tests stay green.
+
+    use super::*;
+
+    fn synth_rgb32(width: usize, height: usize) -> Vec<u8> {
+        // Deterministic xorshift32 ramp — same shape as the r239 / r242
+        // helpers but inlined here so this module stays self-contained.
+        let mut s: u32 = 0xDEAD_BEEF;
+        let n = width * height * 4;
+        let mut out = vec![0u8; n];
+        for px in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *px = s as u8;
+        }
+        out
+    }
+
+    /// Reference body: the pre-r250 per-byte slot-dispatch histogram
+    /// inlined verbatim. Output must match `histogramise(Rgb32, method,
+    /// ...)` element-by-element across all three histograms.
+    fn ref_histogramise_rgb32_per_byte(
+        method: Method,
+        body: &[u8],
+    ) -> ([u32; 256], [u32; 256], [u32; 256]) {
+        let mut h1 = [0u32; 256];
+        let mut h2 = [0u32; 256];
+        let mut h3 = [0u32; 256];
+        for (i, &b) in body.iter().enumerate() {
+            let in_pixel = i % 4;
+            if method.decorrelate() {
+                match in_pixel {
+                    0 => h2[b as usize] += 1, // G
+                    1 => h1[b as usize] += 1, // B-G
+                    2 => h3[b as usize] += 1, // R-G
+                    _ => h3[b as usize] += 1, // A → slot3
+                }
+            } else {
+                match in_pixel {
+                    0 => h1[b as usize] += 1,
+                    1 => h2[b as usize] += 1,
+                    2 => h3[b as usize] += 1,
+                    _ => h3[b as usize] += 1, // A → slot3
+                }
+            }
+        }
+        (h1, h2, h3)
+    }
+
+    #[test]
+    fn round250_rgb32_histogram_matches_per_byte_reference() {
+        // Drive the residual pipeline across Left / LeftDecorr /
+        // GradientDecorr at widths 1 / 2 / 4 / 8. For each frame, take
+        // the combined_body the encoder feeds to histogramise and
+        // compare the production histograms against the per-byte
+        // reference.
+        for &(w, h) in &[(1u32, 3u32), (2, 3), (4, 4), (8, 4)] {
+            for &method in &[Method::Left, Method::LeftDecorr, Method::GradientDecorr] {
+                let pixels = synth_rgb32(w as usize, h as usize);
+                let frame = compute_frame_residuals(PixelFamily::Rgb32, method, w, h, &pixels)
+                    .expect("residuals");
+                let (h1_prod, h2_prod, h3_prod) =
+                    histogramise(PixelFamily::Rgb32, method, &frame.combined_body);
+                let (h1_ref, h2_ref, h3_ref) =
+                    ref_histogramise_rgb32_per_byte(method, &frame.combined_body);
+                assert_eq!(
+                    h1_prod, h1_ref,
+                    "round250 slot1 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                assert_eq!(
+                    h2_prod, h2_ref,
+                    "round250 slot2 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                assert_eq!(
+                    h3_prod, h3_ref,
+                    "round250 slot3 histogram drift @ {}x{} {:?}",
+                    w, h, method
+                );
+                // Sanity: histograms must sum to body.len() (every body
+                // byte is counted exactly once — the alpha-shares-
+                // slot-3 mapping means slot 3 receives two positions
+                // per pixel, but each body byte still contributes to
+                // exactly one histogram).
+                let total: u64 = h1_prod
+                    .iter()
+                    .chain(h2_prod.iter())
+                    .chain(h3_prod.iter())
+                    .map(|&c| c as u64)
+                    .sum();
+                assert_eq!(
+                    total,
+                    frame.combined_body.len() as u64,
+                    "round250 histogram total != body.len() @ {}x{} {:?}",
+                    w,
+                    h,
+                    method
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round250_rgb32_histogram_synth_body_matches_per_byte_reference_no_decorr() {
+        // Direct check against a synthetic body that exercises every
+        // residue position. Uses a 128-byte body (= 32 wire pixels) so
+        // the slot positions are densely covered with distinct values
+        // — a slot mix-up inside the step body would surface as counts
+        // attributed to the wrong histogram. No-decorr quadruple:
+        // (slot1, slot2, slot3, slot3) at (+0, +1, +2, +3).
+        let body: Vec<u8> = (0u8..128).collect();
+        let (h1_prod, h2_prod, h3_prod) = histogramise(PixelFamily::Rgb32, Method::Left, &body);
+        let (h1_ref, h2_ref, h3_ref) = ref_histogramise_rgb32_per_byte(Method::Left, &body);
+        assert_eq!(h1_prod, h1_ref);
+        assert_eq!(h2_prod, h2_ref);
+        assert_eq!(h3_prod, h3_ref);
+
+        // Fixed expectations: bytes at i = 0, 4, 8, …, 124 fall on +0
+        // (slot1 under no-decorr); i = 1, 5, 9, …, 125 fall on +1
+        // (slot2); i = 2, 6, 10, …, 126 fall on +2 (slot3); i = 3, 7,
+        // 11, …, 127 fall on +3 (slot3 — alpha shares slot 3 per
+        // §1.2). Each value appears exactly once at its assigned
+        // position.
+        for v in (0u8..128).step_by(4) {
+            assert_eq!(
+                h1_prod[v as usize], 1,
+                "no-decorr slot1 should hold byte {v} exactly once",
+            );
+        }
+        for v in (1u8..128).step_by(4) {
+            assert_eq!(
+                h2_prod[v as usize], 1,
+                "no-decorr slot2 should hold byte {v} exactly once",
+            );
+        }
+        // Slot 3 receives bytes from BOTH +2 (R) and +3 (A) — values
+        // 2, 3, 6, 7, 10, 11, … each occur exactly once in `body` and
+        // each one lands in slot 3.
+        for v in (2u8..128).step_by(4) {
+            assert_eq!(
+                h3_prod[v as usize], 1,
+                "no-decorr slot3 should hold pos-+2 byte {v} exactly once",
+            );
+        }
+        for v in (3u8..128).step_by(4) {
+            assert_eq!(
+                h3_prod[v as usize], 1,
+                "no-decorr slot3 should hold pos-+3 (alpha) byte {v} exactly once",
+            );
+        }
+    }
+
+    #[test]
+    fn round250_rgb32_histogram_synth_body_matches_per_byte_reference_decorr() {
+        // Same synthetic body, decorr quadruple: (slot2, slot1, slot3,
+        // slot3) at (+0, +1, +2, +3). A slot-swap regression between
+        // no-decorr and decorr would surface as the slot1/slot2
+        // columns landing in the wrong histogram.
+        let body: Vec<u8> = (0u8..128).collect();
+        let (h1_prod, h2_prod, h3_prod) =
+            histogramise(PixelFamily::Rgb32, Method::LeftDecorr, &body);
+        let (h1_ref, h2_ref, h3_ref) = ref_histogramise_rgb32_per_byte(Method::LeftDecorr, &body);
+        assert_eq!(h1_prod, h1_ref);
+        assert_eq!(h2_prod, h2_ref);
+        assert_eq!(h3_prod, h3_ref);
+
+        // Fixed expectations for the decorr quadruple: pos +0 → slot2
+        // (G), pos +1 → slot1 (B−G), pos +2 → slot3 (R−G), pos +3 →
+        // slot3 (A).
+        for v in (0u8..128).step_by(4) {
+            assert_eq!(
+                h2_prod[v as usize], 1,
+                "decorr slot2 should hold pos-+0 byte {v} exactly once",
+            );
+        }
+        for v in (1u8..128).step_by(4) {
+            assert_eq!(
+                h1_prod[v as usize], 1,
+                "decorr slot1 should hold pos-+1 byte {v} exactly once",
+            );
+        }
+        for v in (2u8..128).step_by(4) {
+            assert_eq!(
+                h3_prod[v as usize], 1,
+                "decorr slot3 should hold pos-+2 byte {v} exactly once",
+            );
+        }
+        for v in (3u8..128).step_by(4) {
+            assert_eq!(
+                h3_prod[v as usize], 1,
+                "decorr slot3 should hold pos-+3 (alpha) byte {v} exactly once",
+            );
+        }
+    }
+
+    #[test]
+    fn round250_rgb32_histogram_alpha_shares_slot3_counts_aggregate() {
+        // Spec/03 §1.2's alpha-shares-slot-3 mapping means slot 3
+        // accumulates counts from BOTH +2 (R / R−G) and +3 (A) within
+        // a single pixel — not separate columns. Construct a body
+        // where pos +2 and pos +3 hold the *same* value within each
+        // pixel and verify slot 3's bucket for that value reflects two
+        // increments per pixel.
+        //
+        // Body layout (8 wire pixels = 32 bytes):
+        //   pixel n: [n*4 + 0] = n+1   (pos +0 → slot1)
+        //            [n*4 + 1] = n+1   (pos +1 → slot2)
+        //            [n*4 + 2] = 100   (pos +2 → slot3)
+        //            [n*4 + 3] = 100   (pos +3 → slot3)
+        //
+        // Expectation: h3[100] == 16 (two per pixel × 8 pixels).
+        // h1[n+1] == 1 for n ∈ 0..8, h2[n+1] == 1 for n ∈ 0..8.
+        let mut body = Vec::with_capacity(32);
+        for n in 0u8..8 {
+            body.push(n + 1);
+            body.push(n + 1);
+            body.push(100);
+            body.push(100);
+        }
+        let (h1_prod, h2_prod, h3_prod) = histogramise(PixelFamily::Rgb32, Method::Left, &body);
+        let (h1_ref, h2_ref, h3_ref) = ref_histogramise_rgb32_per_byte(Method::Left, &body);
+        assert_eq!(h1_prod, h1_ref);
+        assert_eq!(h2_prod, h2_ref);
+        assert_eq!(h3_prod, h3_ref);
+
+        assert_eq!(
+            h3_prod[100], 16,
+            "slot 3 must accumulate from both +2 and +3 within a pixel"
+        );
+        for n in 0u8..8 {
+            assert_eq!(h1_prod[(n + 1) as usize], 1);
+            assert_eq!(h2_prod[(n + 1) as usize], 1);
+        }
+        let total: u64 = h1_prod
+            .iter()
+            .chain(h2_prod.iter())
+            .chain(h3_prod.iter())
+            .map(|&c| c as u64)
+            .sum();
+        assert_eq!(total, body.len() as u64);
+    }
+
+    /// Shared CustomV2 round-trip helper — mirrors the `rt_rgb32`
+    /// pattern in `round245_rgb32_emit_pixel_step_tests` but pinned to
+    /// `ExtradataMode::CustomV2` so the histogram → length-table →
+    /// emit pipeline is the one being exercised.
+    fn rt_rgb32_customv2(width: u32, height: u32, method: Method) {
+        let pixels = synth_rgb32(width as usize, height as usize);
+        let (bih, frame) = encode_frame_with_mode(
+            PixelFamily::Rgb32,
+            method,
+            width,
+            height,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let decoded = crate::decoder::decode_frame(&cfg, &frame).expect("decode");
+        assert_eq!(
+            decoded.pixels, pixels,
+            "round250 CustomV2 round-trip drift @ {}x{} {:?}",
+            width, height, method
+        );
+    }
+
+    #[test]
+    fn round250_rgb32_histogram_customv2_roundtrips_left() {
+        // The CustomV2 extradata path derives per-channel length tables
+        // straight from `histogramise`, so any histogram drift would
+        // change the emitted lengths and break the round-trip. Width
+        // sweep 1 / 2 / 4 / 8 covers the pixel-step body's boundary
+        // cases (= 0 and = 1 inner iteration per row plus multi-pixel
+        // rows).
+        for &(w, h) in &[(1u32, 3u32), (2, 3), (4, 4), (8, 4)] {
+            rt_rgb32_customv2(w, h, Method::Left);
+        }
+    }
+
+    #[test]
+    fn round250_rgb32_histogram_customv2_roundtrips_decorr_methods() {
+        for &(w, h) in &[(1u32, 3u32), (2, 3), (4, 4), (8, 4)] {
+            for &method in &[Method::LeftDecorr, Method::GradientDecorr] {
+                rt_rgb32_customv2(w, h, method);
+            }
         }
     }
 }

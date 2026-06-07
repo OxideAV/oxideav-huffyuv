@@ -8,6 +8,49 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-250: pixel-step RGB32 histogram body in `histogramise`. The
+  pre-r250 loop ran `match i % 4` on every body byte to pick the
+  histogram AND a `method.decorrelate()` branch on every iteration —
+  two per-byte branches the optimiser could not eliminate because
+  `i` was the iterator state and the answer to
+  `method.decorrelate()` never changes mid-frame. Round 250 hoists
+  both decisions out of the loop: the per-position histogram
+  references are resolved once at function entry by the
+  `(h_pos0, h_pos1, h_pos2)` binding (paired by
+  `method.decorrelate()`), then the body steps four bytes per outer
+  iteration with the slot resolved at compile time — `h_pos0[+0]
+  += 1 → h_pos1[+1] += 1 → h_pos2[+2] += 1 → h_pos2[+3] += 1` per
+  wire pixel. spec/03 §1.3 pins RGB32 at exactly four Huffman
+  codewords per pixel; §1.2 fixes the position → slot mapping at
+  `(slot1, slot2, slot3, slot3)` for no-decorrelate methods
+  (B / G / R / A) and `(slot2, slot1, slot3, slot3)` for decorrelate
+  methods (G / B−G / R−G / A). Alpha shares the slot-3 codebook per
+  the §1.2 evidence at `@0x10001b21` (no-decorr A emit) and
+  `@0x10001c6d` (decorr A emit) — so the +3 (alpha) position
+  re-uses `h_pos2`, accumulating into slot 3 alongside the +2
+  (R / R−G) column. `body.len()` is always a multiple of 4 in the
+  in-spec input space (the body is `(n_pixels − 1) × 4` bytes per
+  `rgb32_residuals`), so the pixel-step body covers every count
+  byte; a 1..=3-byte scalar fall-through is kept for
+  defence-in-depth, mirroring the r221 / r227 / r239 / r242 / r245
+  fall-throughs. Histogram-side companion to r245's RGB32 emit
+  rewrite, applied to the same §1.3 four-byte RGB32 wire cycle (and
+  a direct mirror of r242's RGB24 histogram pixel-step body,
+  extended to the alpha position). Wire-identical to round 245 —
+  six new `round250_rgb32_histogram_pixel_step_tests` lock the
+  rewrite: a per-byte witness diffs the production histograms
+  against an inlined copy of the pre-r250 per-byte body over real
+  residual bodies + a `0..128` synthetic body that densely covers
+  every residue position across 32 wire pixels; a no-decorr-vs-
+  decorr quadruple pair pins the slot1/slot2 column swap; an alpha-
+  shares-slot-3 aggregation fixture lays the same value at +2 and
+  +3 within each pixel and verifies slot 3 accumulates two
+  increments per pixel; and two end-to-end CustomV2 round-trip
+  sweeps at widths 1 / 2 / 4 / 8 across
+  Left / LeftDecorr / GradientDecorr exercise the histogram →
+  canonical-length → emit chain. Lib test count: 217 → 223.
+
+
 - Round-245: pixel-step RGB32 Huffman-encode body in
   `emit_bitstream_parts`. The pre-r245 loop ran `match i % 4` on every
   body byte to pick the slot AND a `method.decorrelate()` branch on
