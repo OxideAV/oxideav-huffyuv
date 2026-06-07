@@ -8,6 +8,48 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-245: pixel-step RGB32 Huffman-encode body in
+  `emit_bitstream_parts`. The pre-r245 loop ran `match i % 4` on every
+  body byte to pick the slot AND a `method.decorrelate()` branch on
+  every iteration — two per-byte branches the optimiser could not
+  eliminate because the iterator state changed every step. Round 245
+  hoists both decisions out of the loop: the slot quadruple is
+  resolved once at function entry by the `(s_pos0, s_pos1, s_pos2,
+  s_pos3)` binding (paired by `method.decorrelate()`), then the body
+  steps four bytes per outer iteration with the slot resolved at
+  compile time — `lookup_code(s_pos0) → write_msb →
+  lookup_code(s_pos1) → write_msb → lookup_code(s_pos2) → write_msb →
+  lookup_code(s_pos3) → write_msb` straight-line per wire pixel.
+  spec/03 §1.3 pins RGB32 at exactly four Huffman codewords per pixel;
+  §1.2 fixes the position → slot mapping at `(slot1, slot2, slot3,
+  slot3)` for no-decorrelate methods (B / G / R / A) and `(slot2,
+  slot1, slot3, slot3)` for decorrelate methods (G / B−G / R−G / A).
+  Alpha shares the slot-3 codebook per the §1.2 evidence at
+  `@0x10001b21` (no-decorr A emit) and `@0x10001c6d` (decorr A emit).
+  `body.len()` is always a multiple of 4 in the in-spec input space
+  (the body is `(n_pixels − 1) × 4` bytes per `rgb32_residuals`), so
+  the pixel-step body covers every emit byte; a 1..=3-byte scalar
+  fall-through is kept for defence-in-depth, mirroring the
+  r221 / r227 / r239 fall-throughs. Encoder analogue of r239's RGB24
+  emit rewrite, applied to the §1.3 four-byte RGB32 wire cycle (and a
+  direct mirror of the r221 YUY2 macropixel-step body on the §1.2
+  four-byte YUY2 cycle). Wire-identical to round 242 — nine new
+  `round245_rgb32_emit_pixel_step_tests` lock the rewrite: eight
+  pixel-step-boundary round-trips covering Left at widths 1 / 2 / 4 /
+  8 under `ClassicV2`, `PredictOld` (alternate no-decorr entry),
+  `LeftDecorr` + `GradientDecorr` (the decorr-pair slot quadruple),
+  and `V1xCompat` (the content-identical `(A, A, A)` triple, plus the
+  alpha-shares-slot-3 reuse degenerating to a third reference to the
+  single table); and a `*_matches_per_byte_reference` witness diffs
+  the production emit bit stream against an inlined copy of the
+  pre-r245 per-byte slot dispatch across `Left` / `LeftDecorr` /
+  `GradientDecorr` under `CustomV2` (content-distinct tables, so a
+  slot mix-up surfaces as a Huffman-code mismatch on the wire even
+  before the round-trip predictor pass — and the alpha-shares-slot3
+  reuse means the witness also covers the "two positions, one table"
+  case spec/03 §1.2 calls out). Lib test count: 208 → 217.
+
+
 - Round-242: pixel-step RGB24 histogram body in `histogramise`. The
   pre-r242 loop ran `match i % 3` on every body byte to pick the slot
   AND a `method.decorrelate()` branch on every iteration — two
