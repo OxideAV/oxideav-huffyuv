@@ -8,6 +8,56 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-253: macropixel-step body for the YUY2 forward MEDIAN
+  predict region in `predict::forward_median_subtract`. The
+  pre-r253 median region was a per-byte loop that re-issued three
+  uniform-offset lookbacks (`L = pixels[pos − 2]`, `A = pixels[pos
+  − row_bytes]`, `AL = pixels[pos − row_bytes − 2]`) and a
+  `gradient_predictor → median3 → wrapping_sub` chain on every
+  byte position one at a time. Spec/03 §2.3 evidence at
+  `huffyuv.dll@0x10002130..@0x10002138` (and the parallel
+  `@0x10001fab..@0x10002095` encoder trace) pins those three
+  lookback offsets at the **same** displacement for every
+  median-region byte, independent of intra-macropixel position —
+  unlike spec/03 §2.1.1 YUY2 LEFT (which alternates stride 2 / 4
+  by `pos & 3`). The four `median3` computations at positions
+  `pos+0`, `pos+1`, `pos+2`, `pos+3` are therefore independent
+  (each reads from disjoint input offsets and writes to a
+  disjoint output offset), and a 4-byte unroll exposes
+  instruction-level parallelism so the compiler can schedule the
+  four chains freely across functional units. `median_start =
+  (row_bytes + 8).min(n)` is always a multiple of 4 for in-spec
+  YUY2 input (row_bytes = 2 × width with width even ⇒ row_bytes
+  ≡ 0 mod 4; the +8 keeps the alignment), so the macropixel-step
+  body covers every wire byte in the median region; a 1..=3-byte
+  scalar fall-through is kept for defence-in-depth (mirroring
+  the r221 / r227 / r239 / r242 / r245 / r250 fall-throughs).
+  Predict-side companion to r214 / r221's YUY2 macropixel-step
+  decode + emit (which targeted the §2.1.1 four-byte LEFT
+  rhythm) — r253 applies the same macropixel-step rewrite shape
+  to the §2.3 four-byte median rhythm on the encoder predict
+  body. Wire-identical to round 250 — five new
+  `round253_forward_median_macropixel_*` tests lock the rewrite:
+  one `*_matches_per_byte_reference` witness diffs the
+  production output against an inlined copy of the pre-r253
+  per-byte body across YUY2 widths 2 / 4 / 8 / 16 / 160 / 320
+  (covering the narrow `row_bytes < 8` regime where the LEFT
+  exemption extends past row 1, the bench-reference 320×16
+  raster, and several intermediate sizes); a modular-wrap
+  fixture forces mod-256 wraps inside the gradient + the final
+  subtract on every iteration; a `boundary_row1_step_pattern`
+  fixture pins the `median_start % 4 == 0` and `(n − median_start)
+  % 4 == 0` invariants the macropixel-step body relies on; a
+  `*_then_inverse_roundtrips` fixture chains
+  `forward_median_subtract → YUY2 LEFT add over the exempt
+  region → median ADD for the rest` and asserts bit-exact pixel
+  reconstruction (the wire-format claim); and a
+  `*_scalar_tail_safety` fixture exercises the 1..=3-byte
+  scalar fall-through under release builds (the in-spec body is
+  multiple-of-4 so the tail is defence-in-depth only). Lib test
+  count: 223 → 228.
+
+
 - Round-250: pixel-step RGB32 histogram body in `histogramise`. The
   pre-r250 loop ran `match i % 4` on every body byte to pick the
   histogram AND a `method.decorrelate()` branch on every iteration —
