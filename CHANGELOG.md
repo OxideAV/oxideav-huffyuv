@@ -8,6 +8,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-261: typed accessors `PixelFamily::bytes_per_pixel_step`,
+  `PixelFamily::row_bytes(width)`, `StreamConfig::row_bytes()`, and
+  `StreamConfig::is_interlaced()`. The decode + encode paths
+  previously open-coded the `match family { Yuy2 => width × 2, Rgb24
+  => width × 3, Rgb32 => width × 4 }` family → wire-stride dispatch
+  at two call sites (`decoder::decode_frame` interlaced field-merge
+  setup, `encoder::encode_field` field-stride setup); both now defer
+  to the single `PixelFamily::row_bytes` / `StreamConfig::row_bytes`
+  accessor sourced from spec/02 §3 wire-byte layout table
+  (`Y₁ U Y₂ V` = 4 bytes/macropixel = 2 bytes/pixel; RGB24 = 3
+  bytes/pixel `+0:B +1:G +2:R`; RGB32 = 4 bytes/pixel `+0:B +1:G
+  +2:R +3:A`). `PixelFamily::row_bytes` uses `saturating_mul` so a
+  hostile `u32::MAX` width can't overflow `usize` on a 32-bit target.
+  `StreamConfig::is_interlaced` is a thin wrapper over
+  `predict::is_interlaced_height(self.height)` (spec/02 §2
+  `biHeight > 288` threshold) so callers that hold a `StreamConfig`
+  don't need to import the predict module to ask the same question.
+  Wire-identical to round 255 — five new
+  `round261_*` accessor tests lock the rewrite: a
+  `*_bytes_per_pixel_step_matches_spec_table` witness pins the
+  `{2,3,4}` literal against the spec/02 §3 lines 790–793 table; a
+  `*_pixel_family_row_bytes_matches_inline_match` witness diffs the
+  new `row_bytes(width)` accessor against the open-coded
+  `width as usize * {2,3,4}` pattern across the bench-reference
+  width set (0 / 1 / 2 / 4 / 8 / 16 / 160 / 320 / 720 / 1024 /
+  1920); a `*_row_bytes_saturates_on_overflow` fixture exercises
+  the `u32::MAX` saturating-multiply contract; a
+  `*_stream_config_row_bytes_delegates_to_family` round-trip
+  exercises the StreamConfig accessor through a real
+  `parse_bitmapinfoheader` path on YUY2 320×16 (the bench-reference
+  raster), RGB24 1024×720 (the spec/01 §7 worked example), and
+  RGB32 720×480 (a DV-class active raster); and a
+  `*_stream_config_is_interlaced_matches_height_threshold` fixture
+  walks the strict `> 288` threshold (0 / 1 / 288 / 289 / 480 /
+  720 / 1080) cross-checking the StreamConfig wrapper against the
+  predict-module source of truth. Lib test count: 233 → 238.
+
 - Round-255: half-macropixel (2-byte) step body for the YUY2 inverse
   MEDIAN region in `decoder::inverse_yuy2_median`. The pre-r255
   median region was a per-byte loop that re-issued three

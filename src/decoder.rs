@@ -97,11 +97,10 @@ fn decode_frame_interlaced(
     } else {
         None
     };
-    let row_bytes = match config.family {
-        PixelFamily::Yuy2 => config.width as usize * 2,
-        PixelFamily::Rgb24 => config.width as usize * 3,
-        PixelFamily::Rgb32 => config.width as usize * 4,
-    };
+    // Round-261: single source of truth (`StreamConfig::row_bytes`)
+    // for the family → wire-stride dispatch; spec/02 §3 wire-byte
+    // layout table.
+    let row_bytes = config.row_bytes();
     let merged = if let Some(bot) = bot_frame {
         interleave_fields(&top_frame.pixels, &bot.pixels, row_bytes, h)
     } else {

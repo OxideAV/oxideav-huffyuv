@@ -256,11 +256,10 @@ fn compute_frame_residuals(
             combined_body: r.body,
         });
     }
-    let row_bytes = match family {
-        PixelFamily::Yuy2 => width as usize * 2,
-        PixelFamily::Rgb24 => width as usize * 3,
-        PixelFamily::Rgb32 => width as usize * 4,
-    };
+    // Round-261: single source of truth (`PixelFamily::row_bytes`)
+    // for the family → wire-stride dispatch; spec/02 §3 wire-byte
+    // layout table.
+    let row_bytes = family.row_bytes(width);
     let h = height as usize;
     let top_h = h.div_ceil(2) as u32;
     let bot_h = (h / 2) as u32;

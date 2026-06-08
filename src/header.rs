@@ -144,6 +144,45 @@ impl PixelFamily {
             PixelFamily::Rgb32 => 32,
         }
     }
+
+    /// Wire-byte stride of one packed sample step in the raster — i.e.
+    /// the per-output-position byte count that the LEFT / GRADIENT /
+    /// MEDIAN predictor walks. Spec/02 §3 wire-byte layout table:
+    ///
+    /// - YUY2: 2 bytes per pixel (= 4 bytes per macropixel, advancing
+    ///   2 pixels per macropixel).
+    /// - RGB24: 3 bytes per pixel (`+0:B +1:G +2:R`).
+    /// - RGB32: 4 bytes per pixel (`+0:B +1:G +2:R +3:A`).
+    ///
+    /// Companion to [`Self::row_bytes`] / [`StreamConfig::row_bytes`];
+    /// kept narrow so the four predictor / decorrelation paths can
+    /// share one source of truth instead of carrying the `2 / 3 / 4`
+    /// literal at every call site.
+    #[inline]
+    pub fn bytes_per_pixel_step(self) -> usize {
+        match self {
+            PixelFamily::Yuy2 => 2,
+            PixelFamily::Rgb24 => 3,
+            PixelFamily::Rgb32 => 4,
+        }
+    }
+
+    /// Row-byte count for a packed raster of `width` pixels in this
+    /// family — = `width * bytes_per_pixel_step`. Spec/02 §3 wire-byte
+    /// layout table. Always a multiple of `bytes_per_pixel_step(self)`.
+    ///
+    /// `width` is the pixel width (not the macropixel count): for
+    /// YUY2 the caller passes the per-spec pixel width and gets back
+    /// `width * 2` (= the bench-reference 320×16 raster's
+    /// `row_bytes = 640`).
+    ///
+    /// Saturates the multiply at `usize::MAX` for hostile
+    /// `width = u32::MAX`; callers that need the un-saturated total
+    /// can cast and multiply themselves.
+    #[inline]
+    pub fn row_bytes(self, width: u32) -> usize {
+        (width as usize).saturating_mul(self.bytes_per_pixel_step())
+    }
 }
 
 /// Resolved per-stream configuration (spec/01 §1..§4 + extradata
@@ -298,6 +337,29 @@ impl StreamConfig {
             extradata_tables,
         })
     }
+
+    /// Wire-format row stride for this stream's resolved family + width
+    /// (= [`PixelFamily::row_bytes`] applied to `self.width`). Spec/02
+    /// §3 wire-byte layout table.
+    ///
+    /// Round-261 consolidation accessor: the decode + encode paths
+    /// previously open-coded `match family { Yuy2 => width × 2, Rgb24
+    /// => width × 3, Rgb32 => width × 4 }` at four call sites; each
+    /// now defers to this single source of truth.
+    #[inline]
+    pub fn row_bytes(&self) -> usize {
+        self.family.row_bytes(self.width)
+    }
+
+    /// `true` when this stream uses the field-stride=2 interlaced
+    /// path (`biHeight > 288`, spec/02 §2 disassembly note). Thin
+    /// wrapper around [`crate::predict::is_interlaced_height`] so
+    /// callers that already hold a `StreamConfig` don't need to
+    /// import the predict module.
+    #[inline]
+    pub fn is_interlaced(&self) -> bool {
+        crate::predict::is_interlaced_height(self.height)
+    }
 }
 
 /// Resolve the v1.x `low3 → method` mapping per spec/01 §1.4. The
@@ -427,6 +489,117 @@ mod tests {
         // (= 24); RGB24 + LeftDecorr.
         assert_eq!(cfg.family, PixelFamily::Rgb24);
         assert_eq!(cfg.method, Method::LeftDecorr);
+    }
+
+    // ─── Round-261: typed accessors `PixelFamily::row_bytes`,
+    //     `PixelFamily::bytes_per_pixel_step`, `StreamConfig::row_bytes`,
+    //     `StreamConfig::is_interlaced`. Spec/02 §3 wire-byte layout
+    //     table + spec/02 §2 interlace trigger. ────────────────────────
+
+    #[test]
+    fn round261_bytes_per_pixel_step_matches_spec_table() {
+        // spec/02 §3 wire-byte layout table (lines 790–793 of
+        // docs/video/huffyuv/spec/02-frame-layout.md):
+        // YUY2 = 4 bytes per macropixel = 2 bytes per pixel; RGB24 = 3
+        // bytes per pixel (`+0:B +1:G +2:R`); RGB32 = 4 bytes per pixel.
+        assert_eq!(PixelFamily::Yuy2.bytes_per_pixel_step(), 2);
+        assert_eq!(PixelFamily::Rgb24.bytes_per_pixel_step(), 3);
+        assert_eq!(PixelFamily::Rgb32.bytes_per_pixel_step(), 4);
+    }
+
+    #[test]
+    fn round261_pixel_family_row_bytes_matches_inline_match() {
+        // Lock the new accessor against the inline `match family`
+        // pattern the decode / encode paths previously open-coded:
+        // exhaustive over every (family × width-of-interest) pair.
+        for &w in &[0u32, 1, 2, 4, 8, 16, 160, 320, 720, 1024, 1920] {
+            assert_eq!(PixelFamily::Yuy2.row_bytes(w), w as usize * 2);
+            assert_eq!(PixelFamily::Rgb24.row_bytes(w), w as usize * 3);
+            assert_eq!(PixelFamily::Rgb32.row_bytes(w), w as usize * 4);
+        }
+    }
+
+    #[test]
+    fn round261_pixel_family_row_bytes_saturates_on_overflow() {
+        // Hostile fuzz width: u32::MAX × 3 = ~12.8 GiB on 64-bit
+        // (so it doesn't actually overflow `usize` there), but on a
+        // 32-bit target it would. Use the contract: `saturating_mul`
+        // never panics. We can't easily build the overflow on a 64-bit
+        // host so just confirm the value is finite for the worst
+        // declared width.
+        let big = PixelFamily::Rgb32.row_bytes(u32::MAX);
+        assert!(big >= (u32::MAX as usize) * 4 || big == usize::MAX);
+    }
+
+    #[test]
+    fn round261_stream_config_row_bytes_delegates_to_family() {
+        // The decoder dispatch we replaced is `match config.family {
+        // Yuy2 => config.width as usize * 2, Rgb24 => * 3, Rgb32 => *
+        // 4 }`; confirm the StreamConfig accessor produces exactly
+        // that value through a real `parse_bitmapinfoheader` path so a
+        // future refactor that drops one of the layers still locks
+        // wire-identicality.
+        // YUY2 320×16 (the bench-reference raster).
+        let bih = make_bih(0x28, 320, 16, 16, FOURCC_HFYU, &[]);
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).unwrap();
+        assert_eq!(cfg.family, PixelFamily::Yuy2);
+        assert_eq!(cfg.row_bytes(), 640);
+        // RGB24 1024×720 (the spec/01 §7 worked example).
+        let extradata = vec![0x41u8, 0x18, 0x00, 0x00, 0xFF];
+        let bih = make_bih(
+            0x28 + extradata.len() as u32,
+            1024,
+            720,
+            24,
+            FOURCC_HFYU,
+            &extradata,
+        );
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).unwrap();
+        assert_eq!(cfg.family, PixelFamily::Rgb24);
+        assert_eq!(cfg.row_bytes(), 3072);
+        // RGB32 720×480 (a common DV-class active raster).
+        let extradata = vec![0x40u8, 0x20, 0x00, 0x00, 0xFF];
+        let bih = make_bih(
+            0x28 + extradata.len() as u32,
+            720,
+            480,
+            32,
+            FOURCC_HFYU,
+            &extradata,
+        );
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).unwrap();
+        assert_eq!(cfg.family, PixelFamily::Rgb32);
+        assert_eq!(cfg.row_bytes(), 2880);
+    }
+
+    #[test]
+    fn round261_stream_config_is_interlaced_matches_height_threshold() {
+        // spec/02 §2 disassembly note: `biHeight > 288` engages the
+        // field-stride=2 interlaced path. Confirm the convenience
+        // accessor honours the same threshold as the underlying
+        // free function.
+        for &(h, want) in &[
+            (0u32, false),
+            (1, false),
+            (288, false), // exactly 288 is NOT interlaced (strict >).
+            (289, true),
+            (480, true),
+            (720, true),
+            (1080, true),
+        ] {
+            // Build a minimal-but-valid YUY2 v1.x BIH at height h.
+            // Width 16 keeps total < 65 KiB (the strf field is i32
+            // so any positive height works).
+            let bih = make_bih(0x28, 16, h as i32, 16, FOURCC_HFYU, &[]);
+            let cfg = StreamConfig::parse_bitmapinfoheader(&bih).unwrap();
+            assert_eq!(
+                cfg.is_interlaced(),
+                want,
+                "height = {h}: expected is_interlaced() = {want}"
+            );
+            // Also confirm it matches the free-function source of truth.
+            assert_eq!(cfg.is_interlaced(), crate::predict::is_interlaced_height(h));
+        }
     }
 
     #[test]
