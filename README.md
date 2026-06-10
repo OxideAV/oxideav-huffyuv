@@ -5,6 +5,41 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
+**Round 277 — wire-position (slot, store-offset) binding hoist on
+the RGB24 / RGB32 Huffman-decode loops.** The pre-r277
+`decoder::decode_rgb24_field` / `decode_rgb32_field` loops
+re-evaluated the loop-invariant `if decorrelate` branch on every
+pixel and re-resolved the three (RGB24) / four (RGB32) slot
+pointers + BGR store offsets inside each arm — for a 1920×1080
+RGB24 frame that's ~2.07 M per-pixel branches with two
+reload-and-resolve sequences on the critical path of every
+`decode_one`. Round 277 resolves the binding once at function
+entry: spec/03 §1.4 pins the per-pixel wire codeword order at
+`B, G, R` (no decorr) / `G, B−G, R−G` (decorr) with RGB32
+appending the alpha code at wire position +3 in both modes, and
+§1.2 fixes the table assignment at (slot1, slot2, slot3[, slot3])
+/ (slot2, slot1, slot3[, slot3]) — alpha shares the slot-3
+codebook and is never decorrelated (§2.4 Validator note), so the
++2 / +3 wire positions are mode-independent and only the first
+two positions carry the `(s_w0, o_w0, s_w1, o_w1)` binding. The
+loop bodies become fixed straight-line three- / four-decode /
+-store sequences with no per-pixel branch — the decode-side
+analogue of the r239 (RGB24) / r245 (RGB32) encoder emit-loop
+bindings, completing the r214 (YUY2 decode) / r239 / r245 hoist
+series on the two remaining RGB decode loops. Wire-identical to
+round 262 — nine new `round277_rgb_decode_binding_tests` lock the
+rewrite: two `*_matches_per_pixel_branch_reference` witnesses
+diff the production decode against an inlined copy of the
+pre-r277 branch-in-loop body per family across Left / LeftDecorr
+/ GradientDecorr under CustomV2 (content-distinct slot tables, so
+a binding mix-up desynchronises the bit cursor before the
+predictor pass); no-decorr / decorr / PredictOld round-trips at
+widths 1 / 2 / 4 / 8 exercise both binding arms across ClassicV2
++ CustomV2; and V1xCompat round-trips pin the store-offset half
+of the binding through the content-identical `(A, A, A)` RGB
+triple (where a slot mix-up cannot surface as a code mismatch).
+Lib test count: 245 → 254.
+
 **Round 262 — per-family stride call sites migrated to the typed
 `row_bytes` accessor.** Round 261 introduced
 `PixelFamily::bytes_per_pixel_step` / `PixelFamily::row_bytes` /

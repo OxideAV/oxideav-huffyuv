@@ -377,41 +377,46 @@ fn decode_rgb24_field(
     let bit_data = &frame_bytes[4..];
     let mut reader = BitReader::new(bit_data);
 
-    // For each subsequent pixel, the codeword count + slot order
-    // depends on whether decorrelation is enabled (spec/03 §1.4):
-    //   - non-decorr:  3 codes per pixel: B (slot1), G (slot2), R (slot3)
-    //   - decorr:      3 codes per pixel: G (slot2), B-G (slot1), R-G (slot3)
-    // The reconstructed buffer always stores 3-byte BGR.
+    // Round-277: wire-position (slot, store-offset) binding hoist.
+    // The pre-r277 loop re-evaluated the loop-invariant `decorrelate`
+    // branch on every pixel and re-resolved the three slot pointers +
+    // store offsets inside each arm — a per-pixel branch the optimiser
+    // couldn't fold away on the critical path of every `decode_one`.
+    // spec/03 §1.4 pins the per-pixel wire codeword order at
+    // `B, G, R` (no decorr) / `G, B−G, R−G` (decorr), and §1.2 fixes
+    // the table assignment per wire position at (slot1, slot2, slot3)
+    // / (slot2, slot1, slot3) respectively. The reconstructed buffer
+    // always stores 3-byte BGR, so each wire position also carries a
+    // fixed store offset:
+    //   - no decorr: +0 (B → slot1), +1 (G → slot2), +2 (R → slot3)
+    //   - decorr:    +1 (G → slot2), +0 (B−G → slot1), +2 (R−G → slot3)
+    // (decorrelated values are stored in BGR layout — B = B−G,
+    // G, R = R−G — and the decorrelation inverse runs after the
+    // predictor pass below.) Resolve both bindings once at entry;
+    // the loop body becomes a fixed straight-line three-decode /
+    // three-store sequence with no per-pixel branch — the decode-side
+    // analogue of the r239 encoder emit-loop binding (same §1.4
+    // three-code RGB24 wire cycle, same hoist shape), completing the
+    // r214 (YUY2 decode) / r239 (RGB24 emit) / r245 (RGB32 emit)
+    // series on the RGB24 decode loop.
+    let (s_w0, o_w0, s_w1, o_w1) = if decorrelate {
+        (&tables.slot2, 1usize, &tables.slot1, 0usize)
+    } else {
+        (&tables.slot1, 0usize, &tables.slot2, 1usize)
+    };
+    // Wire position +2 (R or R−G) → slot3, store +2 in both modes.
     let n_pixels = width_us * height_us;
     for px in 1..n_pixels {
         let bgr_off = px * 3;
-        if decorrelate {
-            // G first.
-            let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
-            reader.consume_bits(lg as u32)?;
-            // B-G next.
-            let (bg, lb) = decode_one(&tables.slot1, reader.peek_window())?;
-            reader.consume_bits(lb as u32)?;
-            // R-G last.
-            let (rg, lr) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits(lr as u32)?;
-            // Store decorrelated values in BGR layout: B = (B-G), G,
-            // R = (R-G). The decorrelation transform inverse runs
-            // after the predictor pass below.
-            pixels[bgr_off] = bg;
-            pixels[bgr_off + 1] = g;
-            pixels[bgr_off + 2] = rg;
-        } else {
-            let (b, lb) = decode_one(&tables.slot1, reader.peek_window())?;
-            reader.consume_bits(lb as u32)?;
-            let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
-            reader.consume_bits(lg as u32)?;
-            let (r, lr) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits(lr as u32)?;
-            pixels[bgr_off] = b;
-            pixels[bgr_off + 1] = g;
-            pixels[bgr_off + 2] = r;
-        }
+        let (v0, l0) = decode_one(s_w0, reader.peek_window())?;
+        reader.consume_bits(l0 as u32)?;
+        pixels[bgr_off + o_w0] = v0;
+        let (v1, l1) = decode_one(s_w1, reader.peek_window())?;
+        reader.consume_bits(l1 as u32)?;
+        pixels[bgr_off + o_w1] = v1;
+        let (v2, l2) = decode_one(&tables.slot3, reader.peek_window())?;
+        reader.consume_bits(l2 as u32)?;
+        pixels[bgr_off + 2] = v2;
     }
 
     let consumed = 4 + reader.bytes_consumed();
@@ -480,39 +485,42 @@ fn decode_rgb32_field(
     let mut reader = BitReader::new(bit_data);
     let n_pixels = width_us * height_us;
 
+    // Round-277: wire-position (slot, store-offset) binding hoist —
+    // RGB32 companion to the RGB24 rewrite above. spec/03 §1.4 pins
+    // the per-pixel wire codeword order at `B, G, R, A` (no decorr) /
+    // `G, B−G, R−G, A` (decorr); §1.2 fixes the table assignment at
+    // (slot1, slot2, slot3, slot3) / (slot2, slot1, slot3, slot3)
+    // respectively — alpha shares the slot-3 codebook in both modes
+    // and is never decorrelated (spec/03 §2.4 Validator note), so the
+    // +2 and +3 wire positions are mode-independent and only the
+    // first two positions need the binding:
+    //   - no decorr: +0 (B → slot1), +1 (G → slot2)
+    //   - decorr:    +1 (G → slot2), +0 (B−G → slot1)
+    // The loop body becomes a fixed straight-line four-decode /
+    // four-store sequence with no per-pixel branch — the decode-side
+    // analogue of the r245 encoder emit-loop binding (same §1.4
+    // four-code RGB32 wire cycle, same hoist shape).
+    let (s_w0, o_w0, s_w1, o_w1) = if decorrelate {
+        (&tables.slot2, 1usize, &tables.slot1, 0usize)
+    } else {
+        (&tables.slot1, 0usize, &tables.slot2, 1usize)
+    };
     for px in 1..n_pixels {
         let off = px * 4;
-        if decorrelate {
-            // wire order: G, B-G, R-G, A. Slot mapping: G→slot2,
-            // B-G→slot1, R-G→slot3, A→slot3 (alpha shares slot-3
-            // codebook per spec/03 §1.2).
-            let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
-            reader.consume_bits(lg as u32)?;
-            let (bg, lb) = decode_one(&tables.slot1, reader.peek_window())?;
-            reader.consume_bits(lb as u32)?;
-            let (rg, lr) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits(lr as u32)?;
-            let (a, la) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits(la as u32)?;
-            pixels[off] = bg;
-            pixels[off + 1] = g;
-            pixels[off + 2] = rg;
-            pixels[off + 3] = a;
-        } else {
-            let (b, lb) = decode_one(&tables.slot1, reader.peek_window())?;
-            reader.consume_bits(lb as u32)?;
-            let (g, lg) = decode_one(&tables.slot2, reader.peek_window())?;
-            reader.consume_bits(lg as u32)?;
-            let (r, lr) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits(lr as u32)?;
-            // A residual reuses slot-3 codebook (spec/03 §1.2).
-            let (a, la) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits(la as u32)?;
-            pixels[off] = b;
-            pixels[off + 1] = g;
-            pixels[off + 2] = r;
-            pixels[off + 3] = a;
-        }
+        let (v0, l0) = decode_one(s_w0, reader.peek_window())?;
+        reader.consume_bits(l0 as u32)?;
+        pixels[off + o_w0] = v0;
+        let (v1, l1) = decode_one(s_w1, reader.peek_window())?;
+        reader.consume_bits(l1 as u32)?;
+        pixels[off + o_w1] = v1;
+        // Wire position +2 (R or R−G) → slot3, store +2.
+        let (v2, l2) = decode_one(&tables.slot3, reader.peek_window())?;
+        reader.consume_bits(l2 as u32)?;
+        pixels[off + 2] = v2;
+        // Wire position +3 (A) reuses the slot-3 codebook, store +3.
+        let (v3, l3) = decode_one(&tables.slot3, reader.peek_window())?;
+        reader.consume_bits(l3 as u32)?;
+        pixels[off + 3] = v3;
     }
 
     let consumed = 4 + reader.bytes_consumed();
@@ -1283,6 +1291,412 @@ mod round262_row_bytes_accessor_tests {
                     "degenerate {family:?} {w}x{h} must be Err"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod round277_rgb_decode_binding_tests {
+    //! Round-277 regression guard. The RGB24 / RGB32 Huffman-decode
+    //! loops were rewritten from a per-pixel `if decorrelate` branch
+    //! (which re-resolved the slot pointers + BGR store offsets
+    //! inside each arm on every pixel) into a wire-position
+    //! (slot, store-offset) binding resolved once at function entry —
+    //! the decode-side analogue of the r239 (RGB24) / r245 (RGB32)
+    //! encoder emit-loop bindings, completing the r214 / r239 / r245
+    //! hoist series on the two remaining RGB decode loops.
+    //!
+    //! Wire-format invariants the rewrite leans on (spec/03 §1.4 +
+    //! §1.2):
+    //!
+    //! - RGB24 no decorr: wire order `B, G, R` → (slot1, slot2,
+    //!   slot3), stored at BGR offsets +0 / +1 / +2.
+    //! - RGB24 decorr: wire order `G, B−G, R−G` → (slot2, slot1,
+    //!   slot3), stored at +1 / +0 / +2.
+    //! - RGB32 appends the A code at wire position +3 in both modes,
+    //!   sharing the slot-3 codebook (alpha is never decorrelated per
+    //!   the §2.4 Validator note), stored at +3.
+    //!
+    //! Coverage:
+    //!
+    //! - **Encode → decode round-trips** at widths 1 / 2 / 4 / 8
+    //!   across the no-decorr (`Left` / `PredictOld`) and decorr
+    //!   (`LeftDecorr` / `GradientDecorr`) bindings, under CustomV2
+    //!   (content-distinct slot tables — a slot mix-up surfaces as a
+    //!   Huffman-code mismatch on the wire), ClassicV2, and V1xCompat
+    //!   (content-identical `(A, A, A)` RGB triple — a slot mix-up
+    //!   survives identical tables, so these pin the *store offsets*
+    //!   through the round-trip instead).
+    //! - **Per-pixel-branch reference witnesses** — an inlined copy
+    //!   of the pre-r277 branch-in-loop body per family, run over the
+    //!   same wire bytes with the same tables, followed by the same
+    //!   predictor + decorrelation inverses; both the reference and
+    //!   the production decode must reconstruct the source exactly.
+
+    use super::*;
+    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::header::Method;
+
+    fn synth(n: usize, seed: u32) -> Vec<u8> {
+        // Deterministic xorshift32 ramp; same shape as the round-214
+        // helper but parameterised on byte count so one helper covers
+        // both RGB families.
+        let mut s: u32 = seed;
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    fn rt(family: PixelFamily, width: u32, height: u32, method: Method, mode: ExtradataMode) {
+        let bpp = match family {
+            PixelFamily::Rgb24 => 3,
+            PixelFamily::Rgb32 => 4,
+            PixelFamily::Yuy2 => unreachable!("round-277 covers the RGB families"),
+        };
+        let pixels = synth((width as usize) * (height as usize) * bpp, 0xC0FF_EE77);
+        let (bih, frame) =
+            encode_frame_with_mode(family, method, width, height, &pixels, mode).expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let decoded = decode_frame(&cfg, &frame).expect("decode");
+        assert_eq!(
+            decoded.pixels, pixels,
+            "{family:?} {width}x{height} {method:?}"
+        );
+    }
+
+    #[test]
+    fn round277_rgb24_no_decorr_binding_widths() {
+        // width=1 → one pixel per row: the per-pixel body fires
+        // height−1 times with every store landing in a distinct row.
+        rt(
+            PixelFamily::Rgb24,
+            1,
+            6,
+            Method::Left,
+            ExtradataMode::ClassicV2,
+        );
+        rt(
+            PixelFamily::Rgb24,
+            2,
+            4,
+            Method::Left,
+            ExtradataMode::CustomV2,
+        );
+        rt(
+            PixelFamily::Rgb24,
+            8,
+            5,
+            Method::Left,
+            ExtradataMode::CustomV2,
+        );
+    }
+
+    #[test]
+    fn round277_rgb24_predict_old_alternate_no_decorr_entry() {
+        // PredictOld shares the no-decorr binding with Left; pins the
+        // alternate method entry into the same (slot, offset) tuple.
+        rt(
+            PixelFamily::Rgb24,
+            4,
+            4,
+            Method::PredictOld,
+            ExtradataMode::ClassicV2,
+        );
+    }
+
+    #[test]
+    fn round277_rgb24_decorr_binding_widths() {
+        // LeftDecorr / GradientDecorr take the swapped-pair binding
+        // (G first on the wire, stored at +1). CustomV2 builds
+        // content-distinct slot tables, so a binding mix-up surfaces
+        // as a wire-level Huffman mismatch before the predictor pass.
+        rt(
+            PixelFamily::Rgb24,
+            1,
+            5,
+            Method::LeftDecorr,
+            ExtradataMode::CustomV2,
+        );
+        rt(
+            PixelFamily::Rgb24,
+            4,
+            4,
+            Method::LeftDecorr,
+            ExtradataMode::ClassicV2,
+        );
+        rt(
+            PixelFamily::Rgb24,
+            8,
+            3,
+            Method::GradientDecorr,
+            ExtradataMode::CustomV2,
+        );
+    }
+
+    #[test]
+    fn round277_rgb24_v1x_content_identical_tables_pin_store_offsets() {
+        // V1xCompat RGB = (A, A, A): all three slots hold the same
+        // table, so a slot mix-up cannot surface as a code mismatch —
+        // this round-trip pins the *store-offset* half of the binding.
+        rt(
+            PixelFamily::Rgb24,
+            4,
+            6,
+            Method::Left,
+            ExtradataMode::V1xCompat,
+        );
+        rt(
+            PixelFamily::Rgb24,
+            4,
+            6,
+            Method::LeftDecorr,
+            ExtradataMode::V1xCompat,
+        );
+    }
+
+    #[test]
+    fn round277_rgb32_no_decorr_binding_widths() {
+        rt(
+            PixelFamily::Rgb32,
+            1,
+            6,
+            Method::Left,
+            ExtradataMode::ClassicV2,
+        );
+        rt(
+            PixelFamily::Rgb32,
+            2,
+            4,
+            Method::Left,
+            ExtradataMode::CustomV2,
+        );
+        rt(
+            PixelFamily::Rgb32,
+            8,
+            5,
+            Method::Left,
+            ExtradataMode::CustomV2,
+        );
+    }
+
+    #[test]
+    fn round277_rgb32_decorr_binding_widths() {
+        rt(
+            PixelFamily::Rgb32,
+            1,
+            5,
+            Method::LeftDecorr,
+            ExtradataMode::CustomV2,
+        );
+        rt(
+            PixelFamily::Rgb32,
+            4,
+            4,
+            Method::GradientDecorr,
+            ExtradataMode::ClassicV2,
+        );
+        rt(
+            PixelFamily::Rgb32,
+            8,
+            3,
+            Method::GradientDecorr,
+            ExtradataMode::CustomV2,
+        );
+    }
+
+    #[test]
+    fn round277_rgb32_v1x_content_identical_tables_pin_store_offsets() {
+        rt(
+            PixelFamily::Rgb32,
+            4,
+            6,
+            Method::Left,
+            ExtradataMode::V1xCompat,
+        );
+        rt(
+            PixelFamily::Rgb32,
+            4,
+            6,
+            Method::GradientDecorr,
+            ExtradataMode::V1xCompat,
+        );
+    }
+
+    /// Reference body: the pre-r277 per-pixel `if decorrelate`
+    /// branch-in-loop RGB24 decode, inlined verbatim. Produces the
+    /// raw pre-predictor sample stream.
+    fn ref_decode_rgb24_per_pixel_branch(
+        decorrelate: bool,
+        width: u32,
+        height: u32,
+        frame_bytes: &[u8],
+        tables: &ThreeTables,
+    ) -> Vec<u8> {
+        let total_bytes = (width as usize) * (height as usize) * 3;
+        let mut pixels = vec![0u8; total_bytes];
+        pixels[0] = frame_bytes[1];
+        pixels[1] = frame_bytes[2];
+        pixels[2] = frame_bytes[3];
+        let mut reader = BitReader::new(&frame_bytes[4..]);
+        let n_pixels = (width as usize) * (height as usize);
+        for px in 1..n_pixels {
+            let bgr_off = px * 3;
+            if decorrelate {
+                let (g, lg) = decode_one(&tables.slot2, reader.peek_window()).expect("decode");
+                reader.consume_bits(lg as u32).expect("consume");
+                let (bg, lb) = decode_one(&tables.slot1, reader.peek_window()).expect("decode");
+                reader.consume_bits(lb as u32).expect("consume");
+                let (rg, lr) = decode_one(&tables.slot3, reader.peek_window()).expect("decode");
+                reader.consume_bits(lr as u32).expect("consume");
+                pixels[bgr_off] = bg;
+                pixels[bgr_off + 1] = g;
+                pixels[bgr_off + 2] = rg;
+            } else {
+                let (b, lb) = decode_one(&tables.slot1, reader.peek_window()).expect("decode");
+                reader.consume_bits(lb as u32).expect("consume");
+                let (g, lg) = decode_one(&tables.slot2, reader.peek_window()).expect("decode");
+                reader.consume_bits(lg as u32).expect("consume");
+                let (r, lr) = decode_one(&tables.slot3, reader.peek_window()).expect("decode");
+                reader.consume_bits(lr as u32).expect("consume");
+                pixels[bgr_off] = b;
+                pixels[bgr_off + 1] = g;
+                pixels[bgr_off + 2] = r;
+            }
+        }
+        pixels
+    }
+
+    /// Reference body: the pre-r277 per-pixel `if decorrelate`
+    /// branch-in-loop RGB32 decode, inlined verbatim.
+    fn ref_decode_rgb32_per_pixel_branch(
+        decorrelate: bool,
+        width: u32,
+        height: u32,
+        frame_bytes: &[u8],
+        tables: &ThreeTables,
+    ) -> Vec<u8> {
+        let total_bytes = (width as usize) * (height as usize) * 4;
+        let mut pixels = vec![0u8; total_bytes];
+        pixels[..4].copy_from_slice(&frame_bytes[..4]);
+        let mut reader = BitReader::new(&frame_bytes[4..]);
+        let n_pixels = (width as usize) * (height as usize);
+        for px in 1..n_pixels {
+            let off = px * 4;
+            if decorrelate {
+                let (g, lg) = decode_one(&tables.slot2, reader.peek_window()).expect("decode");
+                reader.consume_bits(lg as u32).expect("consume");
+                let (bg, lb) = decode_one(&tables.slot1, reader.peek_window()).expect("decode");
+                reader.consume_bits(lb as u32).expect("consume");
+                let (rg, lr) = decode_one(&tables.slot3, reader.peek_window()).expect("decode");
+                reader.consume_bits(lr as u32).expect("consume");
+                let (a, la) = decode_one(&tables.slot3, reader.peek_window()).expect("decode");
+                reader.consume_bits(la as u32).expect("consume");
+                pixels[off] = bg;
+                pixels[off + 1] = g;
+                pixels[off + 2] = rg;
+                pixels[off + 3] = a;
+            } else {
+                let (b, lb) = decode_one(&tables.slot1, reader.peek_window()).expect("decode");
+                reader.consume_bits(lb as u32).expect("consume");
+                let (g, lg) = decode_one(&tables.slot2, reader.peek_window()).expect("decode");
+                reader.consume_bits(lg as u32).expect("consume");
+                let (r, lr) = decode_one(&tables.slot3, reader.peek_window()).expect("decode");
+                reader.consume_bits(lr as u32).expect("consume");
+                let (a, la) = decode_one(&tables.slot3, reader.peek_window()).expect("decode");
+                reader.consume_bits(la as u32).expect("consume");
+                pixels[off] = b;
+                pixels[off + 1] = g;
+                pixels[off + 2] = r;
+                pixels[off + 3] = a;
+            }
+        }
+        pixels
+    }
+
+    /// Shared inverse chain for the witness: the same predictor +
+    /// decorrelation inverses the production decoder applies after
+    /// its Huffman loop.
+    fn apply_rgb_inverses(
+        out: &mut [u8],
+        method: Method,
+        n_channels: usize,
+        row_bytes: usize,
+        height: usize,
+    ) {
+        inverse_left_row(out, n_channels);
+        if matches!(method.predictor(), Predictor::Gradient) {
+            inverse_gradient_post(out, row_bytes, height);
+        }
+        if method.decorrelate() {
+            if n_channels == 3 {
+                inverse_rgb_decorr_bgr(out);
+            } else {
+                inverse_rgb_decorr_bgra(out);
+            }
+        }
+    }
+
+    #[test]
+    fn round277_rgb24_decode_matches_per_pixel_branch_reference() {
+        // CustomV2 so the three slot tables are content-distinct — a
+        // binding mix-up in the production loop desynchronises the
+        // bit cursor and surfaces before the predictor pass.
+        for (w, h, method) in [
+            (4u32, 4u32, Method::Left),
+            (8, 6, Method::LeftDecorr),
+            (8, 6, Method::GradientDecorr),
+        ] {
+            let pixels = synth((w as usize) * (h as usize) * 3, 0xDEAD_4077);
+            let (bih, frame) = encode_frame_with_mode(
+                PixelFamily::Rgb24,
+                method,
+                w,
+                h,
+                &pixels,
+                ExtradataMode::CustomV2,
+            )
+            .expect("encode");
+            let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+            let tables = build_three_tables(&cfg).expect("tables");
+            let mut ref_pixels =
+                ref_decode_rgb24_per_pixel_branch(method.decorrelate(), w, h, &frame, &tables);
+            apply_rgb_inverses(&mut ref_pixels, method, 3, (w as usize) * 3, h as usize);
+            assert_eq!(ref_pixels, pixels, "ref body must round-trip identically");
+            let prod = decode_frame(&cfg, &frame).expect("decode");
+            assert_eq!(prod.pixels, pixels, "production decode must round-trip");
+        }
+    }
+
+    #[test]
+    fn round277_rgb32_decode_matches_per_pixel_branch_reference() {
+        for (w, h, method) in [
+            (4u32, 4u32, Method::Left),
+            (8, 6, Method::LeftDecorr),
+            (8, 6, Method::GradientDecorr),
+        ] {
+            let pixels = synth((w as usize) * (h as usize) * 4, 0xFEED_4077);
+            let (bih, frame) = encode_frame_with_mode(
+                PixelFamily::Rgb32,
+                method,
+                w,
+                h,
+                &pixels,
+                ExtradataMode::CustomV2,
+            )
+            .expect("encode");
+            let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+            let tables = build_three_tables(&cfg).expect("tables");
+            let mut ref_pixels =
+                ref_decode_rgb32_per_pixel_branch(method.decorrelate(), w, h, &frame, &tables);
+            apply_rgb_inverses(&mut ref_pixels, method, 4, (w as usize) * 4, h as usize);
+            assert_eq!(ref_pixels, pixels, "ref body must round-trip identically");
+            let prod = decode_frame(&cfg, &frame).expect("decode");
+            assert_eq!(prod.pixels, pixels, "production decode must round-trip");
         }
     }
 }

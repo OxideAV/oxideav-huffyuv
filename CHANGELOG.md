@@ -37,6 +37,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-277: wire-position (slot, store-offset) binding hoist on
+  the RGB24 / RGB32 Huffman-decode loops
+  (`decoder::decode_rgb24_field` / `decode_rgb32_field`). The
+  pre-r277 loops re-evaluated the loop-invariant `decorrelate`
+  branch on every pixel and re-resolved the slot pointers + BGR
+  store offsets inside each arm; the binding is now resolved once
+  at function entry per the spec/03 §1.4 wire codeword order
+  (`B, G, R` / `G, B−G, R−G`, RGB32 appending the
+  mode-independent slot-3 alpha code) + §1.2 slot mapping, and
+  the loop bodies are fixed straight-line three- / four-decode
+  sequences with no per-pixel branch — the decode-side analogue
+  of the r239 / r245 encoder emit-loop bindings, completing the
+  r214 / r239 / r245 hoist series on the two remaining RGB decode
+  loops. Wire-identical; nine new
+  `round277_rgb_decode_binding_tests` lock the rewrite (two
+  per-pixel-branch reference witnesses under CustomV2
+  content-distinct tables, decorr/no-decorr/PredictOld
+  round-trips at widths 1 / 2 / 4 / 8, and V1xCompat
+  content-identical-table round-trips pinning the store-offset
+  half of the binding). Lib test count: 245 → 254.
 - Round-262: the six remaining per-family open-coded `width ×
   {2,3,4}` wire-stride sites now route through the round-261
   `PixelFamily::row_bytes` accessor (spec/02 §3 wire-byte layout
