@@ -6,6 +6,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fuzz-found (scheduled `tables_huffyuv` run 2026-06-09,
+  crash-8fd2645b…): `HuffTable::build_from_lengths` validated
+  Kraft equality by requiring the 32-bit MSB-aligned code
+  accumulator to wrap to exactly 0 — but a length distribution
+  whose Kraft sum is an exact integer multiple of 1.0 (e.g. four
+  2-bit lengths + two 1-bit lengths = 2.0) wraps the accumulator
+  to 0 more than once and aliased the check, so the build
+  accepted the table and assigned two symbols the same all-zero
+  code (symbol 0 at length 2 and symbol 18 at length 1), breaking
+  the prefix-free decode contract (`decode_one` on symbol 0's own
+  code window returned symbol 18). The build now tallies the
+  Kraft sum exactly in 64-bit fixed point (unit 2⁻³²; a length-L
+  code contributes 2³²⁻ᴸ) and rejects any non-empty table whose
+  tally ≠ 2³², per the spec/03 §3 `sum 2^-L_i == 1` equality
+  invariant. Strictly tightening: every previously-accepted valid
+  table (sum exactly 1.0) still builds; under-subscribed and
+  fractionally over-subscribed tables were already rejected by
+  the old check. New
+  `build_from_lengths_rejects_integer_kraft_oversubscription`
+  regression test pins the minimised fuzz shape (sum 2.0), a sum
+  3.0 variant, and a Kraft-equal control whose every entry still
+  self-consistently decodes. Lib test count: 244 → 245. No
+  reachable wire-path change: v2.x extradata streams with a
+  Kraft-violating length table previously built a corrupt table
+  and mis-decoded; they now error out cleanly at table-build
+  time.
+
 ### Added
 
 - Round-262: the six remaining per-family open-coded `width ×

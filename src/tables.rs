@@ -548,12 +548,19 @@ impl HuffTable {
     /// the binary uses; verified empirically by the spec/04 §2.6
     /// Validator-corrected algorithm).
     pub fn build_from_lengths(lengths: &[u8; 256]) -> Result<Self> {
-        // Validate lengths (spec/03 §3.2.3).
+        // Validate lengths (spec/03 §3.2.3) + tally the exact Kraft
+        // sum in 64-bit fixed point (unit = 2⁻³², so a length-L code
+        // contributes 2³²⁻ᴸ and equality means the tally is exactly
+        // 2³² — spec/03 §3's "sum 2^-L_i == 1" invariant).
+        let mut kraft: u64 = 0;
         for (i, &l) in lengths.iter().enumerate() {
             if l > 31 {
                 return Err(Error::invalid(format!(
                     "code length {l} for symbol {i} exceeds 31-bit ceiling"
                 )));
+            }
+            if l > 0 {
+                kraft += 1u64 << (32 - l as u32);
             }
         }
         let mut entries = [HuffEntry::default(); 256];
@@ -584,14 +591,23 @@ impl HuffTable {
             }
             tier -= 1;
         }
-        // Sanity: when the table is non-trivial, Kraft equality
-        // requires code_acc to wrap exactly to 0. (When the table is
-        // empty — all lengths == 0 — code_acc was never touched.)
-        if max_length > 0 && code_acc != 0 {
+        // Sanity: when the table is non-trivial, Kraft EQUALITY must
+        // hold exactly (spec/03 §3 "sum 2^-L_i == 1"). The exact
+        // 64-bit tally is required here — the pre-fix check tested
+        // only `code_acc != 0` on the 32-bit accumulator, which an
+        // over-subscribed distribution whose Kraft sum is an integer
+        // multiple of 1.0 aliases by wrapping to 0 more than once
+        // (fuzz-found 2026-06-09: four 2-bit lengths + two 1-bit
+        // lengths sum to 2.0, wrap the accumulator twice, and assign
+        // two symbols the same all-zero code — breaking the
+        // prefix-free decode contract). (When the table is empty —
+        // all lengths == 0 — the tally is 0 and no check applies.)
+        if max_length > 0 && kraft != 1u64 << 32 {
             return Err(Error::invalid(
-                "non-canonical length distribution (Kraft inequality not 0)",
+                "non-canonical length distribution (Kraft sum != 1)",
             ));
         }
+        debug_assert!(max_length == 0 || code_acc == 0);
         let primary_lut = build_primary_lut(&entries);
         let overflow_entries = std::sync::Arc::new(build_overflow_entries(&entries));
         Ok(Self {
@@ -1131,6 +1147,62 @@ mod tests {
                 continue;
             }
             let _ = decode_one(&table, e.code).expect("v1.x decode_one liveness");
+        }
+    }
+
+    /// Fuzz-found 2026-06-09 (scheduled `tables_huffyuv` run,
+    /// crash-8fd2645b…): a length table whose Kraft sum is an exact
+    /// integer multiple of 1.0 (here 2.0 — four 2-bit lengths plus
+    /// two 1-bit lengths) wrapped the 32-bit code accumulator to 0
+    /// more than once, so the pre-fix `code_acc != 0` equality check
+    /// passed and the build assigned two symbols the same all-zero
+    /// code (symbol 0 at length 2 and symbol 18 at length 1), breaking
+    /// the prefix-free decode contract (`decode_one` on symbol 0's
+    /// window returned symbol 18). spec/03 §3 requires Kraft EQUALITY
+    /// (`sum 2^-L_i == 1`); the build now tallies the sum exactly in
+    /// 64-bit fixed point and rejects anything ≠ 2³².
+    #[test]
+    fn build_from_lengths_rejects_integer_kraft_oversubscription() {
+        // The minimised fuzz shape: symbols 0..=3 at length 2,
+        // symbols 18 and 20 at length 1 → Kraft sum 4×¼ + 2×½ = 2.0.
+        let mut lengths = [0u8; 256];
+        for slot in lengths.iter_mut().take(4) {
+            *slot = 2;
+        }
+        lengths[18] = 1;
+        lengths[20] = 1;
+        assert!(
+            HuffTable::build_from_lengths(&lengths).is_err(),
+            "Kraft sum 2.0 must be rejected, not aliased to equality"
+        );
+
+        // Kraft sum 3.0 (twelve 2-bit lengths) — same aliasing class.
+        let mut lengths3 = [0u8; 256];
+        for slot in lengths3.iter_mut().take(12) {
+            *slot = 2;
+        }
+        assert!(
+            HuffTable::build_from_lengths(&lengths3).is_err(),
+            "Kraft sum 3.0 must be rejected"
+        );
+
+        // Control: exact Kraft equality still builds, and every
+        // nonzero-length symbol self-consistently decodes from its
+        // own MSB-aligned code window (the contract the fuzz target
+        // asserts).
+        let mut ok = [0u8; 256];
+        for slot in ok.iter_mut().take(4) {
+            *slot = 2; // 4 × ¼ = 1.0
+        }
+        let table = HuffTable::build_from_lengths(&ok).expect("Kraft-equal table must build");
+        for (sym, e) in table.entries.iter().enumerate() {
+            if e.length == 0 {
+                continue;
+            }
+            let (decoded_sym, decoded_len) =
+                decode_one(&table, e.code).expect("self-consistent decode");
+            assert_eq!(decoded_sym as usize, sym);
+            assert_eq!(decoded_len, e.length);
         }
     }
 }
