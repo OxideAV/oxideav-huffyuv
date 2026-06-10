@@ -667,7 +667,10 @@ fn compact_field_rows(
 fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Result<Residuals> {
     let w = width as usize;
     let h = height as usize;
-    let row_bytes = w * 2;
+    // Round-262: family → wire-stride via the round-261 accessor
+    // (spec/02 §3 wire-byte layout table: Y₁ U Y₂ V per 2 px = 4
+    // bytes per macropixel = width × 2).
+    let row_bytes = PixelFamily::Yuy2.row_bytes(width);
     if pixels.len() != row_bytes * h {
         return Err(Error::invalid(format!(
             "encoder: YUY2 pixel-buffer size {} ≠ expected {}",
@@ -722,7 +725,10 @@ fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Res
 fn rgb24_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Result<Residuals> {
     let w = width as usize;
     let h = height as usize;
-    let row_bytes = w * 3;
+    // Round-262: family → wire-stride via the round-261 accessor
+    // (spec/02 §3 wire-byte layout table: 3 bytes per pixel,
+    // `+0:B +1:G +2:R`).
+    let row_bytes = PixelFamily::Rgb24.row_bytes(width);
     if pixels.len() != row_bytes * h {
         return Err(Error::invalid(format!(
             "encoder: RGB24 pixel-buffer size {} ≠ expected {}",
@@ -847,7 +853,10 @@ fn rgb24_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
 fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Result<Residuals> {
     let w = width as usize;
     let h = height as usize;
-    let row_bytes = w * 4;
+    // Round-262: family → wire-stride via the round-261 accessor
+    // (spec/02 §3 wire-byte layout table: 4 bytes per pixel,
+    // `+0:B +1:G +2:R +3:A`).
+    let row_bytes = PixelFamily::Rgb32.row_bytes(width);
     if pixels.len() != row_bytes * h {
         return Err(Error::invalid(format!(
             "encoder: RGB32 pixel-buffer size {} ≠ expected {}",
@@ -3160,6 +3169,113 @@ mod round250_rgb32_histogram_pixel_step_tests {
             for &method in &[Method::LeftDecorr, Method::GradientDecorr] {
                 rt_rgb32_customv2(w, h, method);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod round262_residuals_row_bytes_accessor_tests {
+    //! Round-262 regression guard. The three per-family residual
+    //! builders (`yuy2_residuals` / `rgb24_residuals` /
+    //! `rgb32_residuals`) each opened with their own open-coded
+    //! `width × {2, 3, 4}` wire-stride; round 262 routes all three
+    //! through the round-261 single source of truth
+    //! (`PixelFamily::row_bytes`, spec/02 §3 wire-byte layout
+    //! table) — the encoder-side companion to the decoder field
+    //! migration in the same round. Wire-identical: same family →
+    //! stride mapping, one origin.
+    //!
+    //! Coverage:
+    //!
+    //! - **Size-contract pin** — each builder accepts exactly a
+    //!   `family.row_bytes(width) × height`-byte pixel buffer and
+    //!   rejects ±1-byte buffers, so a stride drift would flip the
+    //!   accept/reject boundary.
+    //! - **Body-length pin** — the produced residual body length
+    //!   follows the spec/03 §1.1 / §1.3 codes-per-pixel counts
+    //!   expressed through `bytes_per_pixel_step`: YUY2 carries
+    //!   `row_bytes × h − 4` body bytes after the 4-byte seed
+    //!   macropixel; RGB24 / RGB32 carry
+    //!   `(n_pixels − 1) × bytes_per_pixel_step` (3 / 4 codewords
+    //!   per pixel after the uncompressed first pixel).
+
+    use super::*;
+
+    fn synth(n: usize, mut s: u32) -> Vec<u8> {
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn round262_residuals_size_contract_matches_family_row_bytes() {
+        let cases: [(PixelFamily, Method, u32, u32); 3] = [
+            (PixelFamily::Yuy2, Method::Left, 4, 3),
+            (PixelFamily::Rgb24, Method::Left, 5, 2),
+            (PixelFamily::Rgb32, Method::Left, 3, 4),
+        ];
+        for (family, method, w, h) in cases {
+            let exact = family.row_bytes(w) * h as usize;
+            let good = synth(exact, 0xBEEF_CAFE);
+            let call = |buf: &[u8]| match family {
+                PixelFamily::Yuy2 => yuy2_residuals(method, w, h, buf),
+                PixelFamily::Rgb24 => rgb24_residuals(method, w, h, buf),
+                PixelFamily::Rgb32 => rgb32_residuals(method, w, h, buf),
+            };
+            assert!(
+                call(&good).is_ok(),
+                "{family:?}: row_bytes-sized buffer must be accepted"
+            );
+            assert!(
+                call(&good[..exact - 1]).is_err(),
+                "{family:?}: one-short buffer must be rejected"
+            );
+            let long = synth(exact + 1, 0xBEEF_CAFE);
+            assert!(
+                call(&long).is_err(),
+                "{family:?}: one-long buffer must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn round262_residual_body_len_follows_bytes_per_pixel_step() {
+        // YUY2 4×3: body = row_bytes × h − 4 seed bytes.
+        let yw = 4u32;
+        let yh = 3u32;
+        let ypix = synth(PixelFamily::Yuy2.row_bytes(yw) * yh as usize, 0x1357_9BDF);
+        let yres = yuy2_residuals(Method::Left, yw, yh, &ypix).expect("yuy2");
+        assert_eq!(
+            yres.body.len(),
+            PixelFamily::Yuy2.row_bytes(yw) * yh as usize - 4
+        );
+        // RGB24 / RGB32: body = (n_pixels − 1) × step (spec/03 §1.1 /
+        // §1.3 codes-per-pixel after the uncompressed first pixel).
+        for (family, method) in [
+            (PixelFamily::Rgb24, Method::Left),
+            (PixelFamily::Rgb24, Method::LeftDecorr),
+            (PixelFamily::Rgb32, Method::Left),
+            (PixelFamily::Rgb32, Method::GradientDecorr),
+        ] {
+            let (w, h) = (5u32, 3u32);
+            let pix = synth(family.row_bytes(w) * h as usize, 0x2468_ACE0);
+            let res = match family {
+                PixelFamily::Rgb24 => rgb24_residuals(method, w, h, &pix),
+                PixelFamily::Rgb32 => rgb32_residuals(method, w, h, &pix),
+                PixelFamily::Yuy2 => unreachable!(),
+            }
+            .expect("residuals");
+            let n_pixels = (w * h) as usize;
+            assert_eq!(
+                res.body.len(),
+                (n_pixels - 1) * family.bytes_per_pixel_step(),
+                "{family:?}/{method:?}: body length must be (n_pixels − 1) × step"
+            );
         }
     }
 }

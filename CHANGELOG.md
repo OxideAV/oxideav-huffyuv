@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-262: the six remaining per-family open-coded `width ×
+  {2,3,4}` wire-stride sites now route through the round-261
+  `PixelFamily::row_bytes` accessor (spec/02 §3 wire-byte layout
+  table) — `decoder::decode_yuy2_field` /
+  `decoder::decode_rgb24_field` / `decoder::decode_rgb32_field`
+  on the decode side and `encoder::yuy2_residuals` /
+  `encoder::rgb24_residuals` / `encoder::rgb32_residuals` on the
+  encode side. Each function is family-specific, so the call
+  names the family variant explicitly
+  (`PixelFamily::Yuy2.row_bytes(width)` etc.) and the inlined
+  `{2,3,4}` literal disappears from the call site; the family →
+  stride mapping now has exactly one origin (the r261 accessor,
+  pinned against the spec table by the r261
+  `*_bytes_per_pixel_step_matches_spec_table` witness). The
+  accessor's `saturating_mul` is strictly safer than the prior
+  plain multiply on 32-bit targets (a hostile `u32::MAX` width
+  saturates instead of overflowing); on 64-bit the product
+  `u32::MAX × 4` always fits, so behaviour is identical for every
+  reachable input. Wire-identical to round 261 — six new
+  `round262_*` tests lock the migration: three
+  `round262_{yuy2,rgb24,rgb32}_decoded_raster_len_matches_family_row_bytes`
+  round-trips pin the decoded raster length at
+  `family.row_bytes(width) × height` AND bit-exact content per
+  family (Left + a second method each: Median / LeftDecorr /
+  GradientDecorr); a
+  `round262_degenerate_dims_still_rejected_post_accessor` sweep
+  re-pins the fuzz-found `total_bytes < {3,4}` degenerate-raster
+  rejection across all three families × (0×4 / 4×0 / 0×0) now
+  that the stride comes from the saturating accessor; a
+  `round262_residuals_size_contract_matches_family_row_bytes`
+  fixture drives each residual builder with exact /
+  one-short / one-long pixel buffers and asserts the
+  accept/reject boundary sits exactly at
+  `family.row_bytes(width) × height`; and a
+  `round262_residual_body_len_follows_bytes_per_pixel_step`
+  fixture pins the residual body lengths to the spec/03 §1.1 /
+  §1.3 codes-per-pixel counts expressed through
+  `bytes_per_pixel_step` (YUY2: `row_bytes × h − 4` after the
+  seed macropixel; RGB24 / RGB32: `(n_pixels − 1) × {3,4}` across
+  no-decorr + decorr methods). Lib test count: 238 → 244.
+
 - Round-261: typed accessors `PixelFamily::bytes_per_pixel_step`,
   `PixelFamily::row_bytes(width)`, `StreamConfig::row_bytes()`, and
   `StreamConfig::is_interlaced()`. The decode + encode paths

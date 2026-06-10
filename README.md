@@ -5,6 +5,34 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
+**Round 262 — per-family stride call sites migrated to the typed
+`row_bytes` accessor.** Round 261 introduced
+`PixelFamily::bytes_per_pixel_step` / `PixelFamily::row_bytes` /
+`StreamConfig::row_bytes` / `StreamConfig::is_interlaced` as the
+single source of truth for the spec/02 §3 wire-byte layout
+dispatch and migrated the two `match family`-shaped call sites.
+Round 262 finishes the sweep: the six remaining per-family
+open-coded `width × {2,3,4}` sites — `decoder::decode_yuy2_field`
+/ `decode_rgb24_field` / `decode_rgb32_field` and
+`encoder::yuy2_residuals` / `rgb24_residuals` / `rgb32_residuals`
+— now call `PixelFamily::<Family>.row_bytes(width)` directly, so
+the family → stride mapping has exactly one origin (pinned
+against the spec/02 §3 table by the r261
+`*_bytes_per_pixel_step_matches_spec_table` witness). The
+accessor's `saturating_mul` is strictly safer than the prior
+plain multiply on 32-bit targets; on 64-bit the behaviour is
+identical for every reachable input. Wire-identical to round 261
+— six new `round262_*` tests lock the migration: three per-family
+encode → decode round-trips pin the decoded raster length at
+`family.row_bytes(width) × height` and bit-exact content; a
+degenerate-dimension sweep re-pins the fuzz-found
+`total_bytes < {3,4}` rejection across all three families ×
+(0×4 / 4×0 / 0×0); a size-contract fixture drives each residual
+builder with exact / one-short / one-long buffers; and a
+body-length fixture ties the residual body sizes to the
+spec/03 §1.1 / §1.3 codes-per-pixel counts expressed through
+`bytes_per_pixel_step`. Lib test count: 238 → 244.
+
 **Round 255 — half-macropixel (2-byte) step body for the YUY2
 inverse MEDIAN region.** The pre-r255 median region in
 `decoder::inverse_yuy2_median` was a per-byte loop that re-issued

@@ -213,7 +213,10 @@ fn decode_yuy2_field(
     if width_us % 2 != 0 {
         return Err(Error::invalid("YUY2 width must be even"));
     }
-    let row_bytes = width_us * 2; // Y₁ U Y₂ V per 2 px = 4 bytes per pair × (width/2) pairs = width × 2.
+    // Round-262: family → wire-stride via the round-261 accessor
+    // (spec/02 §3 wire-byte layout table: Y₁ U Y₂ V per 2 px = 4
+    // bytes per macropixel = width × 2).
+    let row_bytes = PixelFamily::Yuy2.row_bytes(width);
     let total_bytes = row_bytes * height_us;
     // A degenerate frame (zero width or height) leaves the output
     // raster too small to even hold the 4-byte uncompressed seed pixel
@@ -343,7 +346,10 @@ fn decode_rgb24_field(
 ) -> Result<(DecodedFrame, usize)> {
     let width_us = width as usize;
     let height_us = height as usize;
-    let row_bytes = width_us * 3;
+    // Round-262: family → wire-stride via the round-261 accessor
+    // (spec/02 §3 wire-byte layout table: 3 bytes per pixel,
+    // `+0:B +1:G +2:R`).
+    let row_bytes = PixelFamily::Rgb24.row_bytes(width);
     let total_bytes = row_bytes * height_us;
     // A degenerate frame (zero width or height) leaves the output
     // raster too small to hold the first 3-byte BGR pixel written
@@ -447,7 +453,10 @@ fn decode_rgb32_field(
 ) -> Result<(DecodedFrame, usize)> {
     let width_us = width as usize;
     let height_us = height as usize;
-    let row_bytes = width_us * 4;
+    // Round-262: family → wire-stride via the round-261 accessor
+    // (spec/02 §3 wire-byte layout table: 4 bytes per pixel,
+    // `+0:B +1:G +2:R +3:A`).
+    let row_bytes = PixelFamily::Rgb32.row_bytes(width);
     let total_bytes = row_bytes * height_us;
     // A degenerate frame (zero width or height) leaves the output
     // raster too small to hold the first 4-byte BGRA pixel written
@@ -1177,6 +1186,103 @@ mod round255_inverse_yuy2_median_step_tests {
                 decoded.pixels, pixels,
                 "round-trip must be bit-exact (w={w}, h={h})"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod round262_row_bytes_accessor_tests {
+    //! Round-262 regression guard. The three per-family field
+    //! decoders (`decode_yuy2_field` / `decode_rgb24_field` /
+    //! `decode_rgb32_field`) each opened with their own open-coded
+    //! `width × {2, 3, 4}` wire-stride; round 262 routes all three
+    //! through the round-261 single source of truth
+    //! (`PixelFamily::row_bytes`, spec/02 §3 wire-byte layout
+    //! table). Wire-identical: same family → stride mapping, one
+    //! origin instead of four (r261's two call sites + these).
+    //!
+    //! Coverage:
+    //!
+    //! - **Raster-length pin** — a full encode → decode round-trip
+    //!   per family asserts the decoded raster is exactly
+    //!   `family.row_bytes(width) × height` bytes AND bit-exact
+    //!   against the input, so a stride drift inside any of the
+    //!   three decoders would surface as a length or content
+    //!   mismatch.
+    //! - **Degenerate-dimension guard** — the `total_bytes < {3,4}`
+    //!   rejection (fuzz-found, see `degenerate_dims_tests`) must
+    //!   keep firing now that `row_bytes` comes from the saturating
+    //!   accessor (zero width / height still yields a too-small
+    //!   raster → `Err`, never a panic).
+
+    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::header::{Method, PixelFamily, StreamConfig};
+
+    fn synth(n: usize, mut s: u32) -> Vec<u8> {
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    fn rt_pin_raster_len(family: PixelFamily, method: Method, w: u32, h: u32) {
+        let pixels = synth(family.row_bytes(w) * h as usize, 0xC0FF_EE11);
+        let (bih, frame) =
+            encode_frame_with_mode(family, method, w, h, &pixels, ExtradataMode::ClassicV2)
+                .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let decoded = super::decode_frame(&cfg, &frame).expect("decode");
+        assert_eq!(
+            decoded.pixels.len(),
+            cfg.family.row_bytes(cfg.width) * cfg.height as usize,
+            "decoded raster length must equal family.row_bytes(width) × height"
+        );
+        assert_eq!(decoded.pixels, pixels, "round-trip must be bit-exact");
+    }
+
+    #[test]
+    fn round262_yuy2_decoded_raster_len_matches_family_row_bytes() {
+        rt_pin_raster_len(PixelFamily::Yuy2, Method::Left, 4, 3);
+        rt_pin_raster_len(PixelFamily::Yuy2, Method::Median, 8, 5);
+    }
+
+    #[test]
+    fn round262_rgb24_decoded_raster_len_matches_family_row_bytes() {
+        rt_pin_raster_len(PixelFamily::Rgb24, Method::Left, 3, 4);
+        rt_pin_raster_len(PixelFamily::Rgb24, Method::LeftDecorr, 5, 2);
+    }
+
+    #[test]
+    fn round262_rgb32_decoded_raster_len_matches_family_row_bytes() {
+        rt_pin_raster_len(PixelFamily::Rgb32, Method::Left, 3, 4);
+        rt_pin_raster_len(PixelFamily::Rgb32, Method::GradientDecorr, 4, 3);
+    }
+
+    #[test]
+    fn round262_degenerate_dims_still_rejected_post_accessor() {
+        // Zero width saturates to a zero row stride in the accessor;
+        // the `total_bytes < {3,4}` guards must still reject before
+        // any raster write (Err, never panic).
+        let frame = [0u8; 64];
+        for family in [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32] {
+            for (w, h) in [(0u32, 4u32), (4, 0), (0, 0)] {
+                let c = StreamConfig {
+                    family,
+                    method: Method::Left,
+                    width: w,
+                    height: h,
+                    has_extradata: false,
+                    extradata_tables: Vec::new(),
+                };
+                assert!(
+                    super::decode_frame(&c, &frame).is_err(),
+                    "degenerate {family:?} {w}x{h} must be Err"
+                );
+            }
         }
     }
 }
