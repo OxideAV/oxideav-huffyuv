@@ -848,8 +848,10 @@ test-only `[dev-dependencies] oxideav-avi`.
 ## What works (Round 174)
 
 - **Criterion bench harness** (`benches/decode.rs`, `benches/encode.rs`,
-  `benches/roundtrip.rs`) covering 22 representative
-  `(family, method, extradata-mode, raster)` scenarios — chosen to
+  `benches/roundtrip.rs`) covering 32 representative
+  `(family, method, extradata-mode, raster)` scenarios (round 174 stood
+  up 22; round 286 extended to the full predictor + interlaced + family
+  matrix) — chosen to
   mirror the README's "measured" headline numbers from rounds 3, 7,
   91, 95, 100, 103, and 115 so future optimisation rounds can read a
   regression directly off the criterion delta. Inputs synthesised on
