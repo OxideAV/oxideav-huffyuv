@@ -858,13 +858,19 @@ test-only `[dev-dependencies] oxideav-avi`.
   third-party samples). Wired via `[dev-dependencies] criterion =
   "0.5"` + three `[[bench]] harness = false` entries; the lib test
   surface (146 tests) is unchanged.
-- **Coverage**:
-  - **decode** (7): YUY2 320×240 LEFT/Gradient/Median ClassicV2,
-    YUY2 1280×720 LEFT ClassicV2, YUY2 320×240 LEFT V1xCompat, RGB24
-    320×240 LeftDecorr ClassicV2, RGB32 320×240 GradientDecorr
-    ClassicV2.
-  - **encode** (10): eight fixed-method ClassicV2 / V1xCompat
-    scenarios that the README headline numbers covered, plus two
+- **Coverage** (extended round 286 to full predictor + interlaced +
+  family symmetry; ranked hotspot table now in `BENCHMARKS.md`):
+  - **decode** (11): all six on-wire methods at YUY2 320×240
+    (`predict_old` / LEFT / Gradient / Median ClassicV2 + LEFT
+    V1xCompat), YUY2 1280×720 LEFT (interlaced), a 320×288
+    progressive / 320×320 interlaced LEFT pair that isolates the
+    `decode_frame_interlaced` field-split cost, RGB24 320×240 +
+    320×320 (interlaced) LeftDecorr ClassicV2, and RGB32 320×240
+    GradientDecorr ClassicV2.
+  - **encode** (16): symmetric v1.x / v2.x across YUY2 / RGB24 /
+    RGB32 (fixed Left / Gradient / Median / LeftDecorr /
+    GradientDecorr ClassicV2 + Left V1xCompat per family where
+    legal), a YUY2 320×320 interlaced encode row, plus two
     `MethodSelection::Auto` + CustomV2 scenarios (YUY2 / RGB24).
   - **roundtrip** (5): end-to-end encode → parse-BIH → decode
     pipeline health checks.

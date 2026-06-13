@@ -37,6 +37,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-286 (bench-only; `src/` byte-identical): extended the
+  Criterion suite for full predictor + interlaced + family
+  coverage and added `BENCHMARKS.md` with a ranked hotspot table
+  naming the next PROFILE-OPT target. `benches/decode.rs` now
+  covers all six on-wire methods (adds `predict_old`) plus a
+  320×288-progressive / 320×320-interlaced Left pair (and an
+  RGB24-LeftDecorr interlaced row) that isolates the
+  `decode_frame_interlaced` field-split overhead from the
+  raster-size delta. `benches/encode.rs` closes the RGB32 gap the
+  decode/roundtrip benches already had (Left / LeftDecorr /
+  GradientDecorr v2.x + Left v1.x) and adds an RGB24 v1.x and a
+  YUY2 interlaced encode row, giving a symmetric v1.x / v2.x ×
+  YUY2 / RGB24 / RGB32 matrix. Headline finding: decode is the
+  whole-pipeline floor at a flat ~100–123 MiB/s across all six
+  predictors (predictor-independent ⇒ the per-symbol Huffman read
+  in `decoder::decode_*_field`, not the `inverse_*_post` pass,
+  governs decode throughput), making it the primary profile-opt
+  target; the encode-side `encode_frame_auto` package-merge
+  selector is the secondary target at ~3–3.5× the cost of
+  fixed-method encode. No `src/` change.
+
 - Round-277: wire-position (slot, store-offset) binding hoist on
   the RGB24 / RGB32 Huffman-decode loops
   (`decoder::decode_rgb24_field` / `decode_rgb32_field`). The

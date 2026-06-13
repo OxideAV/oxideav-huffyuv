@@ -8,6 +8,19 @@
 //! `&pixels` slice (the encoder doesn't mutate its input), so the
 //! bench is steady-state allocation-bound rather than memcpy-bound.
 //!
+//! The symmetric-encode matrix spans all three pixel families
+//! (YUY2 / RGB24 / RGB32) across both extradata generations:
+//!
+//!   - **v2.x** (`ClassicV2`): per-stream classic Huffman length
+//!     tables; the default on-wire shape.
+//!   - **v1.x** (`V1xCompat`): the precomputed-codebook fallback
+//!     (`biSize == 0x28`), which writes the residual stream against
+//!     the v1.x code templates instead of building a per-frame table.
+//!
+//! The RGB32 rows close the gap the decode/roundtrip benches already
+//! covered — before this round the encode bench had no RGB32 scenario
+//! at all, so an RGB32-specific encoder optimisation had no baseline.
+//!
 //! Run with:
 //!     cargo bench -p oxideav-huffyuv --bench encode
 
@@ -207,6 +220,80 @@ fn bench_rgb24_320x240_gradient_decorr_classic(c: &mut Criterion) {
     );
 }
 
+fn bench_rgb24_320x240_left_v1x(c: &mut Criterion) {
+    bench_fixed(
+        c,
+        "encode_rgb24_320x240_left_v1x",
+        PixelFamily::Rgb24,
+        Method::Left,
+        320,
+        240,
+        ExtradataMode::V1xCompat,
+    );
+}
+
+fn bench_rgb32_320x240_left_classic(c: &mut Criterion) {
+    bench_fixed(
+        c,
+        "encode_rgb32_320x240_left_classic",
+        PixelFamily::Rgb32,
+        Method::Left,
+        320,
+        240,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_rgb32_320x240_left_decorr_classic(c: &mut Criterion) {
+    bench_fixed(
+        c,
+        "encode_rgb32_320x240_left_decorr_classic",
+        PixelFamily::Rgb32,
+        Method::LeftDecorr,
+        320,
+        240,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_rgb32_320x240_gradient_decorr_classic(c: &mut Criterion) {
+    bench_fixed(
+        c,
+        "encode_rgb32_320x240_gradient_decorr_classic",
+        PixelFamily::Rgb32,
+        Method::GradientDecorr,
+        320,
+        240,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_rgb32_320x240_left_v1x(c: &mut Criterion) {
+    bench_fixed(
+        c,
+        "encode_rgb32_320x240_left_v1x",
+        PixelFamily::Rgb32,
+        Method::Left,
+        320,
+        240,
+        ExtradataMode::V1xCompat,
+    );
+}
+
+fn bench_yuy2_320x320_left_interlaced(c: &mut Criterion) {
+    // height 320 > 288 engages the encoder field-split path
+    // (compact_field_rows for both fields + concatenated bodies).
+    bench_fixed(
+        c,
+        "encode_yuy2_320x320_left_interlaced",
+        PixelFamily::Yuy2,
+        Method::Left,
+        320,
+        320,
+        ExtradataMode::ClassicV2,
+    );
+}
+
 fn bench_yuy2_320x240_auto_custom(c: &mut Criterion) {
     // Round-7 auto-selector residual-reuse headline scenario (CustomV2
     // exercises the package-merge length builder per candidate).
@@ -241,6 +328,12 @@ criterion_group!(
     bench_rgb24_320x240_left_classic,
     bench_rgb24_320x240_left_decorr_classic,
     bench_rgb24_320x240_gradient_decorr_classic,
+    bench_rgb24_320x240_left_v1x,
+    bench_rgb32_320x240_left_classic,
+    bench_rgb32_320x240_left_decorr_classic,
+    bench_rgb32_320x240_gradient_decorr_classic,
+    bench_rgb32_320x240_left_v1x,
+    bench_yuy2_320x320_left_interlaced,
     bench_yuy2_320x240_auto_custom,
     bench_rgb24_320x240_auto_custom,
 );

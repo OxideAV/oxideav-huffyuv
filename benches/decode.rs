@@ -34,6 +34,27 @@
 //!   - **rgb32_320x240_gradient_decorr_classic**: RGB32 GradientDecorr
 //!     — exercises `inverse_rgb_decorr_bgra` + the gradient post-pass
 //!     end-to-end (alpha-NOT-decorrelated per spec/03 §2.4).
+//!   - **yuy2_320x240_predict_old_classic**: ClassicV2 `predict_old`
+//!     (signed `-2`, the 6th legal method; spec/01 §1.4) — completes
+//!     the per-predictor decode-LUT matrix so all six on-wire methods
+//!     have a measured baseline.
+//!
+//! ## Interlaced coverage (spec/02 §2, `biHeight > 288`)
+//!
+//! The 720p `yuy2_1280x720_left_classic` scenario above already
+//! crosses the `is_interlaced_height` threshold, but a 320×320 pair
+//! isolates the field-split overhead from the raster-size delta:
+//!
+//!   - **yuy2_320x288_left_progressive**: 320×288 is the largest
+//!     progressive raster (height == 288 is NOT interlaced), so this
+//!     is the single-field control.
+//!   - **yuy2_320x320_left_interlaced**: 320×320 (height 320 > 288)
+//!     engages `decode_frame_interlaced` — two `decode_field` passes
+//!     plus the `interleave_fields` row-gather. Diffing it against the
+//!     288-row progressive control isolates the interlaced-path cost.
+//!   - **rgb24_320x320_left_decorr_interlaced**: the RGB-decorr
+//!     interlaced variant so the field path is measured on the
+//!     wider-stride family too.
 //!
 //! Run with:
 //!     cargo bench -p oxideav-huffyuv --bench decode
@@ -212,6 +233,58 @@ fn bench_rgb32_320x240_gradient_decorr_classic(c: &mut Criterion) {
     );
 }
 
+fn bench_yuy2_320x240_predict_old_classic(c: &mut Criterion) {
+    bench_scenario(
+        c,
+        "decode_yuy2_320x240_predict_old_classic",
+        PixelFamily::Yuy2,
+        Method::PredictOld,
+        320,
+        240,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_yuy2_320x288_left_progressive(c: &mut Criterion) {
+    // height == 288 is the largest progressive raster (NOT > 288), so
+    // this is the single-field control for the interlaced pair below.
+    bench_scenario(
+        c,
+        "decode_yuy2_320x288_left_progressive",
+        PixelFamily::Yuy2,
+        Method::Left,
+        320,
+        288,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_yuy2_320x320_left_interlaced(c: &mut Criterion) {
+    // height 320 > 288 engages decode_frame_interlaced (two
+    // decode_field passes + interleave_fields row-gather).
+    bench_scenario(
+        c,
+        "decode_yuy2_320x320_left_interlaced",
+        PixelFamily::Yuy2,
+        Method::Left,
+        320,
+        320,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_rgb24_320x320_left_decorr_interlaced(c: &mut Criterion) {
+    bench_scenario(
+        c,
+        "decode_rgb24_320x320_left_decorr_interlaced",
+        PixelFamily::Rgb24,
+        Method::LeftDecorr,
+        320,
+        320,
+        ExtradataMode::ClassicV2,
+    );
+}
+
 criterion_group!(
     benches,
     bench_yuy2_320x240_left_classic,
@@ -221,5 +294,9 @@ criterion_group!(
     bench_yuy2_320x240_left_v1x,
     bench_rgb24_320x240_left_decorr_classic,
     bench_rgb32_320x240_gradient_decorr_classic,
+    bench_yuy2_320x240_predict_old_classic,
+    bench_yuy2_320x288_left_progressive,
+    bench_yuy2_320x320_left_interlaced,
+    bench_rgb24_320x320_left_decorr_interlaced,
 );
 criterion_main!(benches);
