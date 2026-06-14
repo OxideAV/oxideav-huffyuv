@@ -12,6 +12,7 @@ lands as a readable Criterion delta against the matching baseline.
 cargo bench -p oxideav-huffyuv --bench decode
 cargo bench -p oxideav-huffyuv --bench encode
 cargo bench -p oxideav-huffyuv --bench roundtrip
+cargo bench -p oxideav-huffyuv --bench tables
 ```
 
 ## Coverage
@@ -46,6 +47,25 @@ three families:
 | YUY2   | Left, Gradient, Median, Left(interlaced)  | ClassicV2, V1xCompat, CustomV2(auto) |
 | RGB24  | Left, LeftDecorr, GradientDecorr          | ClassicV2, V1xCompat, CustomV2(auto) |
 | RGB32  | Left, LeftDecorr, GradientDecorr          | ClassicV2, V1xCompat |
+
+**Table-build primitives** (`benches/tables.rs`) — the per-channel,
+per-frame work the CustomV2 / auto-select path pays, isolated from the
+whole-frame encode/decode so a future package-merge or table-build
+optimisation lands as a clean Criterion delta (the `encode_*_auto_custom`
+scenarios conflate it with residuals + histogramming + emit):
+
+| primitive                       | what it costs                             |
+| ------------------------------- | ----------------------------------------- |
+| `compute_canonical_lengths`     | length-limited (max-31) package-merge — **encoder** length builder, once per channel per CustomV2 frame |
+| `HuffTable::build_from_lengths` | canonical code assign (spec/04 §2.6) + 64 Ki LUT + overflow bake — **decoder** table build, once per channel per frame |
+| histogram → table (fused)       | the two combined: "residual histogram → decode-ready `HuffTable`" |
+| RLE round-trip                  | `rle_encode_one_channel` → `rle_decode_one_channel` length-table codec (spec/04 §2.2, spec/01 §5) |
+
+Each primitive runs against three histogram shapes: `peaked` (geometric
+decay outward from residual 0 / its wrap-neighbour 255, full 256-symbol
+alphabet live — frame-realistic), `flat` (uniform — package-merge
+balanced-tree worst case), and `sparse` (5 live symbols — small-alphabet
+fast path).
 
 ## Ranked hotspot table
 
@@ -92,6 +112,31 @@ next PROFILE-OPT target.
 | yuy2  1280×720 Left (interlaced)        | 4.50 ms       | 376 MiB/s    |
 | yuy2  320×240 Left v1.x                 | 0.37 ms       | 384 MiB/s    |
 
+### Table-build primitives (per channel, per frame)
+
+| scenario                                       | wall (median) |
+| ---------------------------------------------- | ------------- |
+| `compute_canonical_lengths` peaked             | 589 µs        |
+| `compute_canonical_lengths` flat               | 415 µs        |
+| `compute_canonical_lengths` sparse             | 7.6 µs        |
+| `build_from_lengths` peaked                     | 30 µs         |
+| `build_from_lengths` flat                       | 27 µs         |
+| `build_from_lengths` sparse                     | 28 µs         |
+| histogram → table (fused) peaked                | 633 µs        |
+| histogram → table (fused) flat                  | 472 µs        |
+| RLE round-trip peaked                           | 209 ns        |
+| RLE round-trip flat                             | 164 ns        |
+| RLE round-trip sparse                           | 177 ns        |
+
+**Headline finding:** the package-merge length builder
+(`compute_canonical_lengths`, ~589 µs peaked) dominates the table-build
+pipeline by ~20× over the decoder-side `build_from_lengths` (~30 µs) and
+by ~2800× over the RLE codec (~209 ns). For a 3-channel CustomV2 frame
+the encoder pays ~1.8 ms in package-merge alone — which is why
+`encode_frame_auto` (one length-table build per candidate method) is the
+3–3.5× encode-side outlier. Any auto-select speedup should target this
+primitive; the decode-side table build and the RLE codec are negligible.
+
 ## Interpretation
 
 1. **Decode is the whole-pipeline floor.** Decode tops out at
@@ -133,8 +178,13 @@ candidate wins. Use the YUY2 Left 320×240 scenario as the headline
 regression gate and the 1280×720 interlaced scenario as the HD
 confirmation.
 
-**Secondary (encode): `encode_frame_auto` package-merge length
-builder.** At 3–3.5× the cost of fixed-method encode it dominates any
-auto-selected encode; caching / reusing per-candidate length-table
-work across the method sweep is the lever. Gate on
-`encode_yuy2_320x240_auto_custom`.
+**Secondary (encode): the `compute_canonical_lengths` package-merge
+length builder.** The isolated table-build bench
+(`benches/tables.rs`) confirms this primitive (~589 µs peaked, ~1.8 ms
+for a 3-channel frame) is the entire table-build cost — `build_from_lengths`
+(~30 µs) and the RLE codec (~209 ns) are noise beside it. At 3–3.5× the
+cost of fixed-method encode it dominates any auto-selected encode;
+caching / reusing per-candidate length-table work across the method
+sweep, or a cheaper bounded-depth length algorithm, is the lever. Gate
+the whole-frame effect on `encode_yuy2_320x240_auto_custom` and the
+isolated primitive on `tables_compute_canonical_lengths/peaked`.
