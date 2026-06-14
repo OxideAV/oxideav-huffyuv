@@ -5,6 +5,34 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
+**Round 304 — `chunks_exact_mut` rewrite of the inverse RGB
+decorrelation post-pass.** `predict::inverse_rgb_decorr_bgr` /
+`inverse_rgb_decorr_bgra` — the RGB-decorr decode pass that
+reconstructs `B = (B−G) + G` and `R = (R−G) + G` from each
+pixel's own G (spec/03 §2.4; alpha passes through verbatim per the
+§2.4 Validator note) — was the last inverse predictor body still
+running a naive index-arithmetic `while i + n <= out.len()` loop,
+re-deriving three element indices and recomputing the bound on
+every pixel on the critical path of every RGB24/RGB32-decorr
+decode. Every other inverse pass had already shed its scalar loop
+(LEFT macropixel r181/r208, gradient SWAR r91, median r255). Round
+304 steps the buffer with `chunks_exact_mut(3)` / `(4)`: the
+per-pixel reconstruction is independent (no cross-pixel carry —
+the LEFT / gradient inverse already ran), so a fixed-size pixel
+window per iteration lets the compiler collapse the per-access
+bounds checks to the iterator's single length-aligned stride and
+autovectorise the strided wrapping-add. The `chunks_exact_mut`
+remainder (a partial trailing pixel, only reachable on
+malformed/truncated input where `out.len() % stride != 0`) is left
+untouched, exactly as the `i + n <= len` guard left it.
+Wire-identical to round 277 — five new `round304_inverse_decorr_*`
+tests lock the rewrite: two `*_matches_pre_r304_reference`
+witnesses diff the production output against an inlined copy of the
+pre-r304 index loop across byte counts 0..=64 (covering partial
+trailing pixels), a modular-wrap fixture (G = 0xFF forces every
+B/R add to wrap), an alpha-pass-through fixture, and a
+truncated-buffer remainder fixture. Lib test count: 254 → 259.
+
 **Round 277 — wire-position (slot, store-offset) binding hoist on
 the RGB24 / RGB32 Huffman-decode loops.** The pre-r277
 `decoder::decode_rgb24_field` / `decode_rgb32_field` loops

@@ -299,13 +299,30 @@ pub fn inverse_median_post(out: &mut [u8], row_bytes: usize, height: usize) {
 /// §3.2's BGR ordering on the wire — but note our reconstruction
 /// after the codeword-order adjustments stores G at +1 etc. when
 /// the codeword stream was `G, B-G, R-G`).
+///
+/// Round 304: the pre-r304 body was an index-arithmetic
+/// `while i + 3 <= out.len()` loop that re-derived three element
+/// indices (`i`, `i + 1`, `i + 2`) and ran the implicit
+/// `i + 3 <= len` bound on every pixel — three bounds-checked indexed
+/// accesses plus a recomputed loop guard on the critical path of every
+/// RGB24-decorr decode. The pixels are independent (each reconstructs
+/// `B` / `R` from its own `G` at +1, no cross-pixel carry — the LEFT /
+/// gradient inverse already ran), so stepping the buffer with
+/// `chunks_exact_mut(3)` hands the compiler a fixed-size 3-byte window
+/// per iteration: the three within-pixel offsets are statically known,
+/// the per-access bound collapses to the iterator's single
+/// length-aligned stride, and the strided wrapping-add across pixels
+/// becomes autovectorisable. Bit-identical to round 277 — the
+/// `round304_inverse_decorr_*` witnesses diff this against an inlined
+/// copy of the pre-r304 index loop. The `chunks_exact_mut` remainder
+/// (a partial trailing pixel, only reachable on malformed/truncated
+/// input where `out.len() % 3 != 0`) is left untouched, exactly as the
+/// `i + 3 <= len` guard left it.
 pub fn inverse_rgb_decorr_bgr(out: &mut [u8]) {
-    let mut i = 0;
-    while i + 3 <= out.len() {
-        let g = out[i + 1];
-        out[i] = out[i].wrapping_add(g);
-        out[i + 2] = out[i + 2].wrapping_add(g);
-        i += 3;
+    for px in out.chunks_exact_mut(3) {
+        let g = px[1];
+        px[0] = px[0].wrapping_add(g);
+        px[2] = px[2].wrapping_add(g);
     }
 }
 
@@ -313,13 +330,17 @@ pub fn inverse_rgb_decorr_bgr(out: &mut [u8]) {
 /// place. Alpha is left untouched by the decorrelation transform
 /// (spec/03 §2.4 Validator-corrected note: alpha shares slot-3's
 /// codebook but does NOT receive the decorrelation transform).
+///
+/// Round 304: BGRA companion to the `inverse_rgb_decorr_bgr` rewrite —
+/// `chunks_exact_mut(4)` replaces the `while i + 4 <= out.len()` index
+/// loop, giving the compiler a fixed-size 4-byte pixel window (B at +0,
+/// G at +1, R at +2, A at +3 left verbatim). Same independence argument
+/// and same remainder semantics as the BGR variant.
 pub fn inverse_rgb_decorr_bgra(out: &mut [u8]) {
-    let mut i = 0;
-    while i + 4 <= out.len() {
-        let g = out[i + 1];
-        out[i] = out[i].wrapping_add(g);
-        out[i + 2] = out[i + 2].wrapping_add(g);
-        i += 4;
+    for px in out.chunks_exact_mut(4) {
+        let g = px[1];
+        px[0] = px[0].wrapping_add(g);
+        px[2] = px[2].wrapping_add(g);
     }
 }
 
@@ -2110,5 +2131,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Round 304: inverse RGB decorrelation chunks_exact_mut rewrite ----
+
+    /// Inlined copy of the pre-r304 BGR inverse-decorrelation body
+    /// (`while i + 3 <= len`). The production helper must match this
+    /// byte-for-byte; the only change in r304 is iterating with
+    /// `chunks_exact_mut(3)` instead of index arithmetic.
+    fn ref_pre_r304_inverse_decorr_bgr(out: &mut [u8]) {
+        let mut i = 0;
+        while i + 3 <= out.len() {
+            let g = out[i + 1];
+            out[i] = out[i].wrapping_add(g);
+            out[i + 2] = out[i + 2].wrapping_add(g);
+            i += 3;
+        }
+    }
+
+    /// Inlined copy of the pre-r304 BGRA inverse-decorrelation body.
+    fn ref_pre_r304_inverse_decorr_bgra(out: &mut [u8]) {
+        let mut i = 0;
+        while i + 4 <= out.len() {
+            let g = out[i + 1];
+            out[i] = out[i].wrapping_add(g);
+            out[i + 2] = out[i + 2].wrapping_add(g);
+            i += 4;
+        }
+    }
+
+    #[test]
+    fn round304_inverse_decorr_bgr_matches_pre_r304_reference() {
+        // Sweep pixel counts, including widths that leave a partial
+        // trailing pixel (len % 3 != 0) so the chunks_exact_mut
+        // remainder behaviour is pinned against the `i + 3 <= len`
+        // guard. xorshift-ish fill forces mod-256 wraps in the add.
+        for n_bytes in 0..=64usize {
+            let mut state = 0x1357_9bdfu32 ^ (n_bytes as u32);
+            let buf: Vec<u8> = (0..n_bytes)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state & 0xff) as u8
+                })
+                .collect();
+            let mut prod = buf.clone();
+            let mut reference = buf.clone();
+            inverse_rgb_decorr_bgr(&mut prod);
+            ref_pre_r304_inverse_decorr_bgr(&mut reference);
+            assert_eq!(prod, reference, "BGR mismatch at n_bytes={n_bytes}");
+        }
+    }
+
+    #[test]
+    fn round304_inverse_decorr_bgra_matches_pre_r304_reference() {
+        for n_bytes in 0..=64usize {
+            let mut state = 0x2468_ace0u32 ^ (n_bytes as u32);
+            let buf: Vec<u8> = (0..n_bytes)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state & 0xff) as u8
+                })
+                .collect();
+            let mut prod = buf.clone();
+            let mut reference = buf.clone();
+            inverse_rgb_decorr_bgra(&mut prod);
+            ref_pre_r304_inverse_decorr_bgra(&mut reference);
+            assert_eq!(prod, reference, "BGRA mismatch at n_bytes={n_bytes}");
+        }
+    }
+
+    #[test]
+    fn round304_inverse_decorr_bgr_modular_wrap() {
+        // Force every B / R add to wrap mod 256: G = 0xFF, B = R = 0x02
+        // ⇒ reconstructed B = R = 0x01. G itself is unchanged.
+        let mut buf = vec![0x02u8, 0xff, 0x02, 0x02, 0xff, 0x02];
+        inverse_rgb_decorr_bgr(&mut buf);
+        assert_eq!(buf, vec![0x01, 0xff, 0x01, 0x01, 0xff, 0x01]);
+    }
+
+    #[test]
+    fn round304_inverse_decorr_bgra_leaves_alpha_untouched() {
+        // Alpha (offset +3) must pass through verbatim per the §2.4
+        // Validator note; only B (+0) and R (+2) receive G (+1).
+        let mut buf = vec![0x10u8, 0x05, 0x20, 0xAB, 0x30, 0x07, 0x40, 0xCD];
+        inverse_rgb_decorr_bgra(&mut buf);
+        assert_eq!(
+            buf,
+            vec![
+                0x10u8.wrapping_add(0x05),
+                0x05,
+                0x20u8.wrapping_add(0x05),
+                0xAB,
+                0x30u8.wrapping_add(0x07),
+                0x07,
+                0x40u8.wrapping_add(0x07),
+                0xCD,
+            ]
+        );
+    }
+
+    #[test]
+    fn round304_inverse_decorr_partial_trailing_pixel_untouched() {
+        // A truncated buffer (len not a multiple of stride) leaves the
+        // partial trailing pixel verbatim, matching the `i + n <= len`
+        // guard the chunks_exact_mut remainder reproduces.
+        // BGR: 1 full pixel + 2 trailing bytes.
+        let mut bgr = vec![0x02u8, 0x03, 0x04, 0x77, 0x88];
+        inverse_rgb_decorr_bgr(&mut bgr);
+        assert_eq!(bgr[3], 0x77, "BGR trailing byte 0 must be untouched");
+        assert_eq!(bgr[4], 0x88, "BGR trailing byte 1 must be untouched");
+        // BGRA: 1 full pixel + 3 trailing bytes.
+        let mut bgra = vec![0x02u8, 0x03, 0x04, 0x05, 0x77, 0x88, 0x99];
+        inverse_rgb_decorr_bgra(&mut bgra);
+        assert_eq!(&bgra[4..], &[0x77, 0x88, 0x99], "BGRA tail untouched");
     }
 }

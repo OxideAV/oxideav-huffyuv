@@ -6,6 +6,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Round 304: `predict::inverse_rgb_decorr_bgr` /
+  `inverse_rgb_decorr_bgra` (the RGB-decorr decode post-pass that
+  reconstructs `B = (B−G) + G` / `R = (R−G) + G` from the
+  per-pixel G) rewritten from an index-arithmetic
+  `while i + n <= out.len()` loop into `chunks_exact_mut(3)` /
+  `chunks_exact_mut(4)`. Per-pixel reconstruction is independent
+  (no cross-pixel carry — the LEFT / gradient inverse already
+  ran), so a fixed-size pixel window per iteration lets the
+  compiler collapse the per-access bounds checks to the iterator's
+  single length-aligned stride and autovectorise the strided
+  wrapping-add. This was the last inverse predictor body still
+  running a naive scalar per-pixel loop (LEFT macropixel r181/r208,
+  gradient SWAR r91, median r255 already optimised). Wire-identical
+  to round 277 — five new `round304_inverse_decorr_*` tests lock
+  the rewrite: two `*_matches_pre_r304_reference` witnesses diff
+  the production output against an inlined copy of the pre-r304
+  index loop across byte counts 0..=64 (covering partial trailing
+  pixels where `len % stride != 0`), a modular-wrap fixture, an
+  alpha-pass-through fixture, and a truncated-buffer remainder
+  fixture. Lib test count: 254 → 259.
+
 ### Fixed
 
 - Fuzz-found (scheduled `tables_huffyuv` run 2026-06-09,
