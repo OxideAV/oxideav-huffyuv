@@ -5,6 +5,42 @@ Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 
 ## Status
 
+**Round 310 — refilling 64-bit bit reader (`bitio::BitReader`).**
+The per-symbol Huffman read — one `peek_window` + `consume_bits` per
+codeword, four per YUY2 macropixel — was the flat ~100–120 MiB/s
+decode ceiling the `BENCHMARKS.md` hotspot table identified as
+bit-read-bound (uniform across all six predictors, so the bit read,
+not the `inverse_*_post` predictor pass, governs decode throughput).
+The pre-r310 reader recomputed the 32-bit decode window from scratch
+on every `peek_window` call, reconstructing up to two 32-bit LE words
+byte-by-byte through a bounds-checked `[0u8; 4]` loop and stitching
+them with a shift — two word reconstructions × four bounds-checked
+byte loads per symbol. Round 310 keeps a 64-bit MSB-aligned
+accumulator holding the already-loaded leading stream bits: per
+spec/02 §4's 32-bit-LE-word framing `peek_window` serves
+`(acc >> 32) as u32` with no byte access, and `consume_bits` only
+advances a bit counter and refills the accumulator to ≥ 32 valid bits
+by pulling whole 32-bit LE words (each source word read exactly once
+over the field decode — amortised one bounds-checked word fetch per
+~32 consumed bits — via a single `data.get(base..base + 4)` →
+`u32::from_le_bytes` load, zero-padding only the truncated final word).
+The accumulator is MSB-aligned so the served window is byte-for-byte
+the value the pre-r310 reconstruction produced, and `cursor_bits` /
+`bytes_consumed` (the interlaced field-split's seed locator) are
+unchanged. Wire-identical — all 259 pre-r310 decode/roundtrip tests
+stay green. Measured (release, aarch64, Criterion 0.5, controlled
+back-to-back): `decode_yuy2_320x240_left_classic` 1.18 ms → 0.68 ms
+(**≈ 43% faster**, ~115 → ~217 MiB/s); `decode_yuy2_1280x720_left`
+13.81 ms → 7.44 ms (**≈ 46% faster**);
+`decode_rgb24_320x240_left_decorr` 1.95 ms → 1.26 ms
+(**≈ 35% faster**). Five new `round310_*` equivalence + edge-case
+tests in `bitio.rs` lock the rewrite (two window-equivalence
+witnesses diffing the refilling `peek_window` against an inlined copy
+of the pre-r310 from-scratch reconstruction across stream lengths /
+consume strides / a 96-bit over-read past end-of-data, plus
+out-of-range-consume / `bytes_consumed`-word-rounding / empty-stream
+fixtures). Lib test count: 259 → 264.
+
 **Round 304 — `chunks_exact_mut` rewrite of the inverse RGB
 decorrelation post-pass.** `predict::inverse_rgb_decorr_bgr` /
 `inverse_rgb_decorr_bgra` — the RGB-decorr decode pass that

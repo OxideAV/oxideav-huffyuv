@@ -16,20 +16,69 @@
 use crate::error::{Error, Result};
 
 /// MSB-first bit reader over a `&[u8]` source consumed as 32-bit LE
-/// words. Each call to [`Self::read_window`] returns a 32-bit window
+/// words. Each call to [`Self::peek_window`] returns a 32-bit window
 /// whose top bit is the next unread bit of the stream.
+///
+/// # Refill model (round 310)
+///
+/// The pre-r310 reader recomputed the 32-bit window from scratch on
+/// every [`Self::peek_window`] call: it indexed back into `data`,
+/// reconstructed up to two 32-bit LE words byte-by-byte through a
+/// bounds-checked `[0u8; 4]` loop, and stitched them with a shift.
+/// On the per-symbol decode critical path (one `peek_window` +
+/// `consume_bits` per Huffman codeword — four per YUY2 macropixel)
+/// that's two word reconstructions × four bounds-checked byte loads
+/// for every symbol, which the BENCHMARKS.md hotspot table identified
+/// as the flat ~100–120 MiB/s decode ceiling across all six
+/// predictors (the rate is bit-read-bound, not predictor-bound).
+///
+/// Round 310 keeps a 64-bit MSB-aligned accumulator `acc` holding the
+/// already-loaded leading bits of the stream. `peek_window` serves the
+/// top 32 bits straight from `acc` with no byte access; `consume_bits`
+/// only advances a bit counter and tops the accumulator back up to at
+/// least 32 valid bits by pulling whole 32-bit LE words from `data`.
+/// Each source word is read exactly once over the life of the field
+/// decode (amortised one bounds-checked word fetch per ~32 consumed
+/// bits, vs. the prior two-words-per-symbol), and the
+/// `from_le_bytes(<[u8; 4]>::try_from(...))` fast path lets the
+/// compiler emit a single aligned/unaligned 32-bit load when the slice
+/// is in range.
+///
+/// The accumulator is MSB-aligned: the next-unread bit sits at bit 63,
+/// so `(acc >> 32) as u32` is exactly the window the pre-r310
+/// reconstruction produced (top bit = next-unread bit, zero-padded
+/// past end-of-stream). `valid_bits` tracks how many of `acc`'s top
+/// bits came from `data` (the rest are zero pad), so the public
+/// surface — [`Self::cursor_bits`], [`Self::bytes_consumed`], the
+/// zero-padded over-read window — is byte-for-byte identical to the
+/// pre-r310 behaviour.
 pub struct BitReader<'a> {
     data: &'a [u8],
     /// Total number of bits ALREADY consumed.
     cursor_bits: u64,
+    /// MSB-aligned bit accumulator. The next-unread bit sits at bit
+    /// 63; bits below `64 - valid_bits` are zero pad past end-of-data.
+    acc: u64,
+    /// Number of accumulator bits (from bit 63 downward) backed by
+    /// `data` (not zero pad). Always `>= 32` after [`Self::refill`]
+    /// unless the stream is fully exhausted.
+    valid_bits: u32,
+    /// Byte index of the next 32-bit LE word to pull from `data`,
+    /// always a multiple of 4.
+    byte_pos: usize,
 }
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self {
+        let mut r = Self {
             data,
             cursor_bits: 0,
-        }
+            acc: 0,
+            valid_bits: 0,
+            byte_pos: 0,
+        };
+        r.refill();
+        r
     }
 
     /// Bit-cursor position (bits consumed since construction).
@@ -51,26 +100,13 @@ impl<'a> BitReader<'a> {
     /// Peek the next 32 bits as a u32 with the next-unread bit at bit
     /// position 31 (MSB). Returns a zero-padded window when the
     /// underlying stream is exhausted.
+    #[inline]
     pub fn peek_window(&self) -> u32 {
-        let word_idx = (self.cursor_bits / 32) as usize;
-        let bit_off = (self.cursor_bits % 32) as u32;
-        let cur = self.read_word_le(word_idx);
-        if bit_off == 0 {
-            cur
-        } else {
-            // Need the high (32 - bit_off) bits of `cur` as the top of
-            // the window, plus the high `bit_off` bits of the next
-            // word as the low bits of the window.
-            let nxt = self.read_word_le(word_idx + 1);
-            // The next-unread bit sits at bit position
-            // `(31 - bit_off)` of `cur`. Shift left by `bit_off` to
-            // put it at position 31, then OR in the top `bit_off`
-            // bits of `nxt`.
-            (cur << bit_off) | (nxt >> (32 - bit_off))
-        }
+        (self.acc >> 32) as u32
     }
 
     /// Advance the cursor by `n_bits` (n in 1..=32).
+    #[inline]
     pub fn consume_bits(&mut self, n_bits: u32) -> Result<()> {
         if n_bits == 0 || n_bits > 32 {
             return Err(Error::invalid(format!(
@@ -78,18 +114,56 @@ impl<'a> BitReader<'a> {
             )));
         }
         self.cursor_bits = self.cursor_bits.wrapping_add(n_bits as u64);
+        // Drop `n_bits` from the top of the accumulator (which sits at
+        // bit 63) and shrink the valid-bit count, then top it back up.
+        self.acc <<= n_bits;
+        self.valid_bits = self.valid_bits.saturating_sub(n_bits);
+        if self.valid_bits < 32 {
+            self.refill();
+        }
         Ok(())
     }
 
-    fn read_word_le(&self, word_idx: usize) -> u32 {
-        let base = word_idx * 4;
-        let mut buf = [0u8; 4];
-        for (i, slot) in buf.iter_mut().enumerate() {
-            if let Some(&b) = self.data.get(base + i) {
-                *slot = b;
+    /// Pull whole 32-bit LE words from `data` into the low end of the
+    /// accumulator until `valid_bits >= 32` (the window peek always has
+    /// 32 backed-or-zero-pad bits available) or `data` is exhausted.
+    /// Words past end-of-data contribute nothing (the accumulator's
+    /// low bits stay zero), reproducing the pre-r310 zero-padded
+    /// over-read window exactly.
+    #[inline]
+    fn refill(&mut self) {
+        while self.valid_bits <= 32 {
+            if self.byte_pos >= self.data.len() {
+                break;
             }
+            let word = self.read_word_le(self.byte_pos);
+            self.byte_pos += 4;
+            // Place the freshly-read word's MSB at the first free
+            // accumulator slot below the currently-valid region, i.e.
+            // at bit position `63 - valid_bits`. Shifting a u64 word
+            // up by `32 - valid_bits` lands its top bit there.
+            self.acc |= (word as u64) << (32 - self.valid_bits);
+            self.valid_bits += 32;
         }
-        u32::from_le_bytes(buf)
+    }
+
+    #[inline]
+    fn read_word_le(&self, base: usize) -> u32 {
+        // Fast path: a full 4-byte window in range becomes one 32-bit
+        // load. The tail path zero-pads the missing high-address bytes,
+        // matching spec/02 §4's "final partial word, trailing bits
+        // unspecified (we treat as zero)".
+        if let Some(slice) = self.data.get(base..base + 4) {
+            u32::from_le_bytes(<[u8; 4]>::try_from(slice).unwrap())
+        } else {
+            let mut buf = [0u8; 4];
+            for (i, slot) in buf.iter_mut().enumerate() {
+                if let Some(&b) = self.data.get(base + i) {
+                    *slot = b;
+                }
+            }
+            u32::from_le_bytes(buf)
+        }
     }
 }
 
@@ -194,6 +268,132 @@ mod tests {
         r.consume_bits(4).unwrap();
         assert_eq!(r.peek_window() >> 28, 0b1111);
         r.consume_bits(4).unwrap();
+    }
+
+    /// Inlined copy of the pre-r310 from-scratch window reconstruction
+    /// (recompute the 32-bit window directly from `data` at an absolute
+    /// bit cursor). The round-310 refilling reader must produce a
+    /// byte-identical window at every reachable cursor.
+    fn pre_r310_peek(data: &[u8], cursor_bits: u64) -> u32 {
+        let read_word_le = |word_idx: usize| -> u32 {
+            let base = word_idx * 4;
+            let mut buf = [0u8; 4];
+            for (i, slot) in buf.iter_mut().enumerate() {
+                if let Some(&b) = data.get(base + i) {
+                    *slot = b;
+                }
+            }
+            u32::from_le_bytes(buf)
+        };
+        let word_idx = (cursor_bits / 32) as usize;
+        let bit_off = (cursor_bits % 32) as u32;
+        let cur = read_word_le(word_idx);
+        if bit_off == 0 {
+            cur
+        } else {
+            let nxt = read_word_le(word_idx + 1);
+            (cur << bit_off) | (nxt >> (32 - bit_off))
+        }
+    }
+
+    #[test]
+    fn round310_refill_window_matches_pre_r310_uniform_step() {
+        // Pseudo-random-but-deterministic byte stream; walk it with a
+        // fixed-stride consume and assert the window matches the
+        // from-scratch reconstruction at every step, across stream
+        // lengths that bracket the word boundary (including non-multiple-
+        // of-4 lengths so the EOF zero-pad tail is exercised).
+        for &len in &[0usize, 1, 3, 4, 5, 7, 8, 9, 16, 17, 31, 64, 257] {
+            let mut data = vec![0u8; len];
+            let mut s: u32 = 0x1357_9bdf ^ (len as u32).wrapping_mul(2654435761);
+            for b in data.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                *b = (s >> 24) as u8;
+            }
+            for &step in &[1u32, 3, 7, 11, 13, 16, 17, 23, 31, 32] {
+                let mut r = BitReader::new(&data);
+                let mut cursor: u64 = 0;
+                // Walk past the end of the backing data to exercise the
+                // zero-padded over-read window the decoder relies on for
+                // a truncated/partial final word.
+                let total_bits = (len as u64) * 8 + 96;
+                while cursor < total_bits {
+                    assert_eq!(
+                        r.peek_window(),
+                        pre_r310_peek(&data, cursor),
+                        "len={len} step={step} cursor={cursor}"
+                    );
+                    assert_eq!(r.cursor_bits(), cursor);
+                    r.consume_bits(step).unwrap();
+                    cursor += step as u64;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round310_refill_window_matches_pre_r310_variable_step() {
+        // Variable consume lengths (1..=32) driven by the data itself —
+        // mimics the real decode loop where each consume is a Huffman
+        // code length in 1..=31. Asserts the window equivalence holds
+        // for non-uniform advances that land the cursor at every
+        // residue mod 32.
+        let mut data = vec![0u8; 512];
+        let mut s: u32 = 0x2468_ace0;
+        for b in data.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *b = (s >> 24) as u8;
+        }
+        let mut r = BitReader::new(&data);
+        let mut cursor: u64 = 0;
+        let mut t: u32 = 0x9e37_79b9;
+        for _ in 0..4000 {
+            assert_eq!(r.peek_window(), pre_r310_peek(&data, cursor));
+            assert_eq!(r.cursor_bits(), cursor);
+            t = t.wrapping_mul(1664525).wrapping_add(1013904223);
+            let step = 1 + (t >> 27) % 32; // 1..=32
+            r.consume_bits(step).unwrap();
+            cursor += step as u64;
+        }
+    }
+
+    #[test]
+    fn round310_consume_bits_rejects_out_of_range() {
+        let data = [0xAAu8; 8];
+        let mut r = BitReader::new(&data);
+        assert!(r.consume_bits(0).is_err());
+        assert!(r.consume_bits(33).is_err());
+        // A rejected consume must not perturb the cursor or window.
+        assert_eq!(r.cursor_bits(), 0);
+        assert_eq!(r.peek_window(), pre_r310_peek(&data, 0));
+    }
+
+    #[test]
+    fn round310_bytes_consumed_rounds_up_to_word() {
+        // bytes_consumed() must stay the word-rounded cursor regardless
+        // of the new refill bookkeeping (the interlaced decoder relies
+        // on it to find the next field's seed).
+        let data = [0u8; 32];
+        let mut r = BitReader::new(&data);
+        assert_eq!(r.bytes_consumed(), 0);
+        r.consume_bits(1).unwrap();
+        assert_eq!(r.bytes_consumed(), 4);
+        r.consume_bits(31).unwrap(); // cursor now 32 bits
+        assert_eq!(r.bytes_consumed(), 4);
+        r.consume_bits(1).unwrap(); // cursor now 33 bits
+        assert_eq!(r.bytes_consumed(), 8);
+    }
+
+    #[test]
+    fn round310_empty_stream_serves_zero_window() {
+        let r = BitReader::new(&[]);
+        assert_eq!(r.peek_window(), 0);
+        assert_eq!(r.cursor_bits(), 0);
+        assert_eq!(r.bytes_consumed(), 0);
     }
 
     #[test]

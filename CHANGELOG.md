@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Round 310: refilling 64-bit bit reader in `bitio::BitReader`. The
+  pre-r310 reader recomputed the 32-bit decode window from scratch on
+  every `peek_window` call — it indexed back into the source slice,
+  reconstructed up to two 32-bit LE words byte-by-byte through a
+  bounds-checked `[0u8; 4]` loop, and stitched them with a shift. On
+  the per-symbol decode critical path (one `peek_window` +
+  `consume_bits` per Huffman codeword, four per YUY2 macropixel) that
+  was two word reconstructions × four bounds-checked byte loads for
+  every symbol — the flat ~100–120 MiB/s decode ceiling the
+  `BENCHMARKS.md` hotspot table flagged as bit-read-bound (uniform
+  across all six predictors ⇒ the bit read, not the `inverse_*_post`
+  predictor pass, governs decode throughput). Round 310 keeps a 64-bit
+  MSB-aligned accumulator holding the already-loaded leading stream
+  bits: `peek_window` serves `(acc >> 32) as u32` with no byte access,
+  and `consume_bits` only advances a bit counter and tops the
+  accumulator back up to ≥ 32 valid bits by pulling whole 32-bit LE
+  words from the source (each word read exactly once over the field
+  decode, amortised one bounds-checked word fetch per ~32 consumed
+  bits vs. the prior two-words-per-symbol). The `read_word_le` fast
+  path takes a single `data.get(base..base + 4)` →
+  `u32::from_le_bytes` load when the window is in range, zero-padding
+  only the truncated final word per spec/02 §4 ("final partial word …
+  trailing bits unspecified"). The accumulator is MSB-aligned so the
+  served window is byte-for-byte the value the pre-r310 reconstruction
+  produced (top bit = next-unread bit, zero pad past end-of-stream),
+  and `cursor_bits` / `bytes_consumed` are unchanged — the interlaced
+  field-split that reads `bytes_consumed` to find the next field's seed
+  is unaffected. Wire-identical (every one of the 259 pre-r310
+  decode/roundtrip tests stays green). Measured (release, aarch64,
+  Criterion 0.5, controlled back-to-back, `--measurement-time 3
+  --sample-size 20`): decode_yuy2_320x240_left_classic 1.18 ms → 0.68
+  ms (**≈ 43% faster**, ~115 → ~217 MiB/s); decode_yuy2_1280x720_left
+  13.81 ms → 7.44 ms (**≈ 46% faster**); decode_rgb24_320x240_left_decorr
+  1.95 ms → 1.26 ms (**≈ 35% faster**). Five new
+  `round310_*` tests in `bitio.rs` lock the rewrite: two window-
+  equivalence witnesses (uniform step across 13 stream lengths × 10
+  consume strides, and a 4000-iteration variable-step walk with
+  Huffman-realistic 1..=32-bit advances) diff the refilling
+  `peek_window` against an inlined copy of the pre-r310 from-scratch
+  reconstruction at every cursor — including a 96-bit over-read past
+  end-of-data so the zero-padded truncated-final-word window is
+  covered; plus an out-of-range `consume_bits` rejection (cursor +
+  window unperturbed), a `bytes_consumed` word-rounding fixture, and
+  an empty-stream zero-window fixture. Lib test count: 259 → 264.
+
 - Round 304: `predict::inverse_rgb_decorr_bgr` /
   `inverse_rgb_decorr_bgra` (the RGB-decorr decode post-pass that
   reconstructs `B = (B−G) + G` / `R = (R−G) + G` from the

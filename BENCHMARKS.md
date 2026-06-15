@@ -77,19 +77,28 @@ next PROFILE-OPT target.
 
 ### Decode (cost ranked slowest → fastest per byte)
 
-| scenario                                | wall (median) | throughput   |
-| --------------------------------------- | ------------- | ------------ |
-| rgb24 320×240 LeftDecorr                 | 2.17 ms       | 101 MiB/s    |
-| rgb24 320×320 LeftDecorr (interlaced)    | 2.91 ms       | 101 MiB/s    |
-| yuy2  320×240 Median                     | 1.43 ms       | 102 MiB/s    |
-| rgb32 320×240 GradientDecorr             | 2.60 ms       | 113 MiB/s    |
-| yuy2  320×320 Left (interlaced)          | 1.69 ms       | 116 MiB/s    |
-| yuy2  320×288 Left (progressive ctrl)    | 1.53 ms       | 115 MiB/s    |
-| yuy2  320×240 Left                       | 1.28 ms       | 115 MiB/s    |
-| yuy2  320×240 predict_old                | 1.28 ms       | 114 MiB/s    |
-| yuy2  320×240 Gradient                   | 1.27 ms       | 116 MiB/s    |
-| yuy2  320×240 Left (v1.x)                | 1.28 ms       | 115 MiB/s    |
-| yuy2  1280×720 Left (interlaced)         | 14.3 ms       | 123 MiB/s    |
+Post-round-310 (refilling 64-bit `bitio::BitReader`). The pre-r310
+column is retained alongside so the bit-reader win is readable inline;
+the round-310 rewrite eliminated the per-symbol from-scratch window
+reconstruction that set the flat pre-r310 ~100–123 MiB/s ceiling.
+
+| scenario                                | wall (r310)   | throughput (r310) | wall (pre-r310) |
+| --------------------------------------- | ------------- | ----------------- | --------------- |
+| rgb24 320×240 LeftDecorr                 | 1.29 ms       | 170 MiB/s         | 2.17 ms         |
+| rgb32 320×240 GradientDecorr             | 1.50 ms       | 196 MiB/s         | 2.60 ms         |
+| yuy2  320×240 Median                     | 0.87 ms       | 168 MiB/s         | 1.43 ms         |
+| yuy2  320×320 Left (interlaced)          | 0.91 ms       | 215 MiB/s         | 1.69 ms         |
+| yuy2  320×288 Left (progressive ctrl)    | 0.82 ms       | 214 MiB/s         | 1.53 ms         |
+| yuy2  320×240 predict_old                | 0.72 ms       | 203 MiB/s         | 1.28 ms         |
+| yuy2  320×240 Gradient                   | 0.71 ms       | 207 MiB/s         | 1.27 ms         |
+| yuy2  320×240 Left                       | 0.68 ms       | 217 MiB/s         | 1.18 ms         |
+| yuy2  320×240 Left (v1.x)                | 0.65 ms       | 226 MiB/s         | 1.28 ms         |
+| yuy2  1280×720 Left (interlaced)         | 7.44 ms       | 236 MiB/s         | 13.81 ms        |
+
+The decode rate roughly doubled across the board (~35–46% wall
+reduction) and is now no longer the pre-r310 flat ceiling; the
+predictor-post-pass differences (Median / decorr still the per-byte
+laggards) are starting to surface above the bit-read floor.
 
 ### Encode (cost ranked slowest → fastest per byte)
 
@@ -139,25 +148,29 @@ primitive; the decode-side table build and the RLE codec are negligible.
 
 ## Interpretation
 
-1. **Decode is the whole-pipeline floor.** Decode tops out at
-   ~100–123 MiB/s regardless of predictor; encode of the same frame
-   is 2–3.5× faster per byte. End-to-end (`roundtrip`) cost is
-   decode-dominated.
+1. **Decode is still the whole-pipeline floor, but the floor moved.**
+   Round 310's refilling bit reader lifted decode from the flat pre-r310
+   ~100–123 MiB/s ceiling to ~170–236 MiB/s. Encode of the same frame
+   is now ~1.3–2× faster per byte (was 2–3.5×); end-to-end
+   (`roundtrip`) cost remains decode-dominated but by a smaller margin.
 
-2. **Decode throughput is flat across predictors** (101–116 MiB/s for
-   YUY2 Left / Gradient / Median / predict_old / v1.x). The predictor
-   post-pass (`inverse_*_post`) is NOT the decode bottleneck — if it
-   were, Median (its own scan) would diverge sharply from Left. The
-   uniform ceiling points at the **per-symbol Huffman read** in the
-   inner decode loop (`decoder::decode_*_field` bit-reader + LUT
-   lookup), which every method runs identically. The RGB-decorr and
-   1280×720 rows confirm the rate is byte-volume-bound, not
-   method-bound.
+2. **Decode throughput is no longer flat across predictors.** Pre-r310
+   the rate was uniform (101–116 MiB/s for YUY2 Left / Gradient /
+   Median / predict_old / v1.x) — the strongest evidence that the
+   per-symbol Huffman read, not the `inverse_*_post` predictor pass,
+   governed throughput. Round 310 removed that bottleneck (per-symbol
+   from-scratch window reconstruction → a 64-bit accumulator topped up
+   one word per ~32 consumed bits), and the predictor post-passes now
+   surface above the bit-read floor: Median (0.87 ms, its own
+   gradient/median scan) and the RGB-decorr passes (LeftDecorr 1.29 ms,
+   GradientDecorr 1.50 ms — extra per-byte reconstruction work) are
+   measurably the per-byte laggards, while the cheap LEFT/v1.x paths
+   run fastest.
 
-3. **Interlaced overhead is ~10%** (320×320 interlaced 1.69 ms vs
-   320×288 progressive control 1.53 ms — +10% wall on +11% rows, so
-   the field-split + `interleave_fields` row-gather is close to free
-   per extra row; the cost is the raster, not the split).
+3. **Interlaced overhead is ~11%** (320×320 interlaced 0.91 ms vs
+   320×288 progressive control 0.82 ms — close to the +11% row delta,
+   so the field-split + `interleave_fields` row-gather is near-free per
+   extra row; the cost is the raster, not the split).
 
 4. **The encode auto-selector is the encode-side hotspot** — CustomV2
    `encode_frame_auto` runs at ~104–108 MiB/s, a clean 3–3.5× slower
@@ -166,25 +179,34 @@ primitive; the decode-side table build and the RLE codec are negligible.
 
 ## Next PROFILE-OPT target
 
-**Primary (decode): the inner per-symbol Huffman read in
-`decoder::decode_{yuy2,rgb24,rgb32}_field`.** The flat ~100–120 MiB/s
-ceiling across all six predictors is the strongest evidence that the
-bit-reader + canonical-LUT lookup, not the predictor inverse,
-governs decode throughput. A profile run (e.g. `samply` / `perf`) on
-`decode_yuy2_320x240_left_classic` should attribute the bulk of
-samples to the symbol-read path; widening the LUT, refilling the bit
-buffer in larger chunks, or batching the macropixel read are the
-candidate wins. Use the YUY2 Left 320×240 scenario as the headline
-regression gate and the 1280×720 interlaced scenario as the HD
-confirmation.
-
-**Secondary (encode): the `compute_canonical_lengths` package-merge
-length builder.** The isolated table-build bench
-(`benches/tables.rs`) confirms this primitive (~589 µs peaked, ~1.8 ms
-for a 3-channel frame) is the entire table-build cost — `build_from_lengths`
-(~30 µs) and the RLE codec (~209 ns) are noise beside it. At 3–3.5× the
-cost of fixed-method encode it dominates any auto-selected encode;
-caching / reusing per-candidate length-table work across the method
-sweep, or a cheaper bounded-depth length algorithm, is the lever. Gate
-the whole-frame effect on `encode_yuy2_320x240_auto_custom` and the
+**Primary (encode): the `compute_canonical_lengths` package-merge
+length builder.** With the round-310 decode bit-read bottleneck cleared,
+the encode auto-selector is the workspace's largest remaining
+per-byte cost. The isolated table-build bench (`benches/tables.rs`)
+confirms this primitive (~589 µs peaked, ~1.8 ms for a 3-channel frame)
+is the entire table-build cost — `build_from_lengths` (~30 µs) and the
+RLE codec (~209 ns) are noise beside it. At 3–3.5× the cost of
+fixed-method encode it dominates any auto-selected encode; caching /
+reusing per-candidate length-table work across the method sweep, or a
+cheaper bounded-depth length algorithm, is the lever. Gate the
+whole-frame effect on `encode_yuy2_320x240_auto_custom` and the
 isolated primitive on `tables_compute_canonical_lengths/peaked`.
+
+**Secondary (decode): the predictor inverse post-passes now visible
+above the round-310 bit-read floor.** Median (`inverse_yuy2_median`)
+and the RGB-decorr inverses (`inverse_rgb_decorr_bgr/bgra`,
+`inverse_gradient_post`) are the per-byte laggards in the post-r310
+decode table; a profile run on `decode_rgb24_320x240_left_decorr` or
+`decode_yuy2_320x240_median_classic` should now attribute the spread
+above the LEFT path to the post-pass rather than the symbol read. The
+LEFT / gradient / median / decorr inverses are already SWAR /
+macropixel-step / `chunks_exact_mut` rewritten (r91 / r181 / r255 /
+r304), so the next decode win is likely batching the macropixel
+symbol read (decode N codewords before applying the predictor) rather
+than another post-pass rewrite.
+
+*(Superseded) Primary pre-r310 target — the inner per-symbol Huffman
+read in `decoder::decode_{yuy2,rgb24,rgb32}_field` — was landed in
+round 310 (refilling 64-bit `bitio::BitReader`): ≈ 35–46% decode
+wall reduction, ~115 → ~217 MiB/s on the YUY2 Left 320×240 headline
+gate.)*
