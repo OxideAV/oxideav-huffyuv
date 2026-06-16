@@ -203,6 +203,14 @@ pub struct StreamConfig {
     /// bytes immediately after the 4-byte fixed prefix. Empty when
     /// `has_extradata == false`.
     pub extradata_tables: Vec<u8>,
+    /// The `interlace_flag` byte from the extradata 4-byte fixed prefix
+    /// (BIH `+0x2A`, spec/01 §3). The i386 build's encoder writes
+    /// `0x10` (interlaced) / `0x20` (non-interlaced); the x86-64 build
+    /// and naive clean-room encoders write `0x00` (unset). `0` for v1.x
+    /// (no-extradata) streams. Interpreted by
+    /// [`crate::predict::interlaced_from_flag_and_height`] — see
+    /// [`StreamConfig::is_interlaced`].
+    pub interlace_flag: u8,
 }
 
 impl StreamConfig {
@@ -317,7 +325,15 @@ impl StreamConfig {
         // RGB family must use one of the RGB-decorr-or-not methods;
         // YUV only YUV ones; we already rejected non-matches above.
         let mut extradata_tables = Vec::new();
+        // The interlace_flag byte sits at +0x2A within the 4-byte fixed
+        // prefix (spec/01 §3). Present only when the declared header is
+        // large enough AND the buffer actually carries the byte; else
+        // it stays 0 (= unset, fall back to the height heuristic).
+        let mut interlace_flag = 0u8;
         if extradata_present {
+            if (bi_size as usize) > 0x2A && strf.len() > 0x2A {
+                interlace_flag = strf[0x2A];
+            }
             // 4-byte fixed prefix lives at +0x28..+0x2C; the
             // RLE-compressed tables begin at +0x2C.
             if (bi_size as usize) >= 0x2C {
@@ -335,6 +351,7 @@ impl StreamConfig {
             height: bi_height,
             has_extradata: extradata_present,
             extradata_tables,
+            interlace_flag,
         })
     }
 
@@ -351,14 +368,19 @@ impl StreamConfig {
         self.family.row_bytes(self.width)
     }
 
-    /// `true` when this stream uses the field-stride=2 interlaced
-    /// path (`biHeight > 288`, spec/02 §2 disassembly note). Thin
-    /// wrapper around [`crate::predict::is_interlaced_height`] so
-    /// callers that already hold a `StreamConfig` don't need to
-    /// import the predict module.
+    /// `true` when this stream uses the field-stride=2 interlaced path.
+    ///
+    /// The extradata `interlace_flag` byte (BIH `+0x2A`, spec/01 §3) is
+    /// the **primary** indicator when set: its high nibble `1` forces
+    /// interlaced, `2` forces non-interlaced. When the flag is `0x00`
+    /// (the x86-64 build / clean-room default) or its high nibble is
+    /// outside `{1, 2}`, the decision falls back to the `biHeight > 288`
+    /// heuristic (spec/02 §2 disassembly note + spec/01 §3 Validation
+    /// note). Thin wrapper around
+    /// [`crate::predict::interlaced_from_flag_and_height`].
     #[inline]
     pub fn is_interlaced(&self) -> bool {
-        crate::predict::is_interlaced_height(self.height)
+        crate::predict::interlaced_from_flag_and_height(self.interlace_flag, self.height)
     }
 }
 
@@ -597,9 +619,85 @@ mod tests {
                 want,
                 "height = {h}: expected is_interlaced() = {want}"
             );
-            // Also confirm it matches the free-function source of truth.
+            // v1.x streams carry no extradata prefix, so interlace_flag
+            // is unset (0) and the height heuristic is the source of
+            // truth.
+            assert_eq!(cfg.interlace_flag, 0);
             assert_eq!(cfg.is_interlaced(), crate::predict::is_interlaced_height(h));
         }
+    }
+
+    #[test]
+    fn round322_interlace_flag_parsed_and_overrides_height() {
+        // spec/01 §3 + audit/01-validation-report.md §7.5: the
+        // interlace_flag byte at BIH +0x2A (extradata prefix byte +0x02)
+        // is the PRIMARY interlaced indicator when set. High nibble 1 =
+        // interlaced, 2 = non-interlaced; 0 (or unrecognised) falls back
+        // to the biHeight > 288 heuristic.
+        //
+        // Build a 16×16 YUY2 v2.x BIH (height 16 ≤ 288, so the height
+        // heuristic alone would say NON-interlaced) and confirm a
+        // `0x10` flag overrides it to interlaced.
+        let mk = |flag: u8| {
+            // method=0x00 (Left), bpp_override=16, interlace_flag, pad,
+            // then one trailing RLE byte so biSize > 0x2C.
+            let extradata = vec![0x00u8, 0x10, flag, 0x00, 0xFF];
+            let bih = make_bih(
+                0x28 + extradata.len() as u32,
+                16,
+                16,
+                16,
+                FOURCC_HFYU,
+                &extradata,
+            );
+            StreamConfig::parse_bitmapinfoheader(&bih).unwrap()
+        };
+
+        // 0x10 → high nibble 1 → interlaced, even though height ≤ 288.
+        let cfg = mk(0x10);
+        assert_eq!(cfg.interlace_flag, 0x10);
+        assert!(cfg.is_interlaced(), "0x10 flag must force interlaced");
+
+        // 0x20 → high nibble 2 → non-interlaced (matches height here).
+        let cfg = mk(0x20);
+        assert_eq!(cfg.interlace_flag, 0x20);
+        assert!(!cfg.is_interlaced(), "0x20 flag must force non-interlaced");
+
+        // 0x00 (the x86-64 / clean-room default) → unset → height
+        // heuristic; height 16 ≤ 288 → non-interlaced.
+        let cfg = mk(0x00);
+        assert_eq!(cfg.interlace_flag, 0x00);
+        assert!(!cfg.is_interlaced(), "0x00 flag falls back to height");
+
+        // An unrecognised high nibble (e.g. 0x30) also falls back to the
+        // height heuristic — the i386 decoder only knows 1 and 2.
+        let cfg = mk(0x30);
+        assert_eq!(cfg.interlace_flag, 0x30);
+        assert!(!cfg.is_interlaced(), "unrecognised nibble falls back");
+    }
+
+    #[test]
+    fn round322_interlace_flag_2_overrides_tall_frame_to_progressive() {
+        // The reverse override: a TALL frame (height 480 > 288, which
+        // the height heuristic would call interlaced) carrying an
+        // explicit `0x20` (non-interlaced) flag is decoded progressive.
+        let extradata = vec![0x40u8, 0x18, 0x20, 0x00, 0xFF];
+        let bih = make_bih(
+            0x28 + extradata.len() as u32,
+            16,
+            480,
+            24,
+            FOURCC_HFYU,
+            &extradata,
+        );
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).unwrap();
+        assert_eq!(cfg.interlace_flag, 0x20);
+        // Height alone says interlaced; the flag forces progressive.
+        assert!(crate::predict::is_interlaced_height(480));
+        assert!(
+            !cfg.is_interlaced(),
+            "explicit 0x20 must override a tall frame to progressive"
+        );
     }
 
     #[test]

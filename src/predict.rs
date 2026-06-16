@@ -718,6 +718,55 @@ pub fn is_interlaced_height(height: u32) -> bool {
     height > 288
 }
 
+/// Interpret the extradata `interlace_flag` byte at BIH offset `+0x2A`
+/// (spec/01 §3, extradata 4-byte fixed prefix). The i386 build's
+/// encoder writes a non-zero indicator there; the i386 decoder reads
+/// it back at `syswow64/huffyuv.dll@0x10004485..@0x1000449c` by
+/// isolating the **high nibble** (a 4-bit right shift) and dispatching
+/// on the small constants `1` (interlaced) and `2` (non-interlaced):
+///
+/// | byte value | high nibble | meaning        |
+/// | ---------- | ----------- | -------------- |
+/// | `0x10`     | `1`         | interlaced     |
+/// | `0x20`     | `2`         | non-interlaced |
+/// | `0x00`     | `0`         | unset → infer  |
+///
+/// The x86-64 build (and naive clean-room encoders) write `0x00`; when
+/// the flag is unset the decoder falls back to inferring the interlaced
+/// state from `biHeight > 288` alone (spec/01 §3 Validation note,
+/// audit/01-validation-report.md §7.5). Any high-nibble value outside
+/// `{1, 2}` is likewise treated as "unset" and falls back to the
+/// height heuristic, since the i386 decoder only recognises `1`/`2`.
+#[inline]
+pub fn interlaced_from_flag_and_height(interlace_flag: u8, height: u32) -> bool {
+    match interlace_flag >> 4 {
+        1 => true,
+        2 => false,
+        // 0 (the x86-64 build / clean-room default) or any unrecognised
+        // high nibble: fall back to the biHeight > 288 heuristic.
+        _ => is_interlaced_height(height),
+    }
+}
+
+/// The extradata `interlace_flag` byte (BIH `+0x2A`) the i386 build's
+/// encoder emits for a frame of the given height, mirroring
+/// `syswow64/huffyuv.dll@0x100027cc..@0x10002802` (spec/01 §3
+/// Validation note): a "`height ≤ 288`" test yields `0`/`1`, the result
+/// is incremented (→ `1` interlaced / `2` non-interlaced) and shifted
+/// left 4 bits, giving `0x10` (interlaced) or `0x20` (non-interlaced).
+///
+/// Emitting this mirrors the i386 build bug-for-bug; the x86-64 build
+/// writes `0x00` instead. Both are decoded correctly by
+/// [`interlaced_from_flag_and_height`].
+#[inline]
+pub fn interlace_flag_for_height(height: u32) -> u8 {
+    if is_interlaced_height(height) {
+        0x10
+    } else {
+        0x20
+    }
+}
+
 /// Split a packed pixel buffer into two field-buffers (even rows →
 /// top field; odd rows → bottom field). `row_bytes` is the per-row
 /// byte count (= width * bytes_per_pixel, with `width`
@@ -1075,6 +1124,62 @@ mod tests {
         assert!(is_interlaced_height(289));
         assert!(is_interlaced_height(720));
         assert!(is_interlaced_height(1080));
+    }
+
+    #[test]
+    fn interlace_flag_decode_table() {
+        // spec/01 §3 + audit/01-validation-report.md §7.5: the
+        // interlace_flag's HIGH nibble selects interlaced (1) /
+        // non-interlaced (2); anything else falls back to height.
+        // 0x10 (high nibble 1) → interlaced regardless of height.
+        assert!(interlaced_from_flag_and_height(0x10, 16));
+        assert!(interlaced_from_flag_and_height(0x10, 1080));
+        // 0x20 (high nibble 2) → non-interlaced regardless of height.
+        assert!(!interlaced_from_flag_and_height(0x20, 16));
+        assert!(!interlaced_from_flag_and_height(0x20, 1080));
+        // The low nibble is ignored (the decoder shifts right by 4).
+        assert!(interlaced_from_flag_and_height(0x1F, 16));
+        assert!(!interlaced_from_flag_and_height(0x2A, 1080));
+        // 0x00 (x86-64 / clean-room default) → height heuristic.
+        assert!(!interlaced_from_flag_and_height(0x00, 288));
+        assert!(interlaced_from_flag_and_height(0x00, 289));
+        // Unrecognised high nibbles (0, 3..=15) → height heuristic.
+        for nib in [0u8, 3, 4, 8, 15] {
+            let flag = nib << 4;
+            assert_eq!(
+                interlaced_from_flag_and_height(flag, 289),
+                is_interlaced_height(289),
+                "flag 0x{flag:02x} should fall back to height"
+            );
+            assert_eq!(
+                interlaced_from_flag_and_height(flag, 16),
+                is_interlaced_height(16),
+                "flag 0x{flag:02x} should fall back to height"
+            );
+        }
+    }
+
+    #[test]
+    fn interlace_flag_encode_matches_i386_build() {
+        // spec/01 §3 Validation note: i386 encoder writes 0x20 for
+        // height ≤ 288 (non-interlaced) and 0x10 for height > 288
+        // (interlaced).
+        assert_eq!(interlace_flag_for_height(0), 0x20);
+        assert_eq!(interlace_flag_for_height(288), 0x20);
+        assert_eq!(interlace_flag_for_height(289), 0x10);
+        assert_eq!(interlace_flag_for_height(720), 0x10);
+        // The encode/decode pair must round-trip the interlaced state
+        // for every height (the decoded flag must reproduce the
+        // height heuristic exactly).
+        for &h in &[0u32, 1, 287, 288, 289, 480, 720, 1080] {
+            let flag = interlace_flag_for_height(h);
+            assert_eq!(
+                interlaced_from_flag_and_height(flag, 0xFFFF_FFFF),
+                is_interlaced_height(h),
+                "round-trip at height {h} (flag 0x{flag:02x}); decode height \
+                 deliberately wrong to prove the flag is authoritative"
+            );
+        }
     }
 
     #[test]

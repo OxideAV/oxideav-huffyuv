@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::header::{PixelFamily, Predictor, StreamConfig};
 use crate::predict::{
     interleave_fields, inverse_gradient_post, inverse_left_row, inverse_rgb_decorr_bgr,
-    inverse_rgb_decorr_bgra, inverse_yuy2_left_macropixel, is_interlaced_height,
+    inverse_rgb_decorr_bgra, inverse_yuy2_left_macropixel,
 };
 use crate::tables::{
     classic_blob_bytes, decode_one, rle_decode_one_channel, rle_decode_three_channels,
@@ -44,7 +44,10 @@ pub struct DecodedFrame {
 /// `height`-row raster.
 pub fn decode_frame(config: &StreamConfig, frame_bytes: &[u8]) -> Result<DecodedFrame> {
     let three_tables = build_three_tables(config)?;
-    if is_interlaced_height(config.height) {
+    // Honour the extradata interlace_flag (BIH +0x2A) when set, falling
+    // back to the biHeight > 288 heuristic otherwise — see
+    // `StreamConfig::is_interlaced`.
+    if config.is_interlaced() {
         return decode_frame_interlaced(config, frame_bytes, &three_tables);
     }
     decode_field(
@@ -682,6 +685,7 @@ mod degenerate_dims_tests {
             height,
             has_extradata: false,
             extradata_tables: Vec::new(),
+            interlace_flag: 0,
         }
     }
 
@@ -1285,6 +1289,7 @@ mod round262_row_bytes_accessor_tests {
                     height: h,
                     has_extradata: false,
                     extradata_tables: Vec::new(),
+                    interlace_flag: 0,
                 };
                 assert!(
                     super::decode_frame(&c, &frame).is_err(),

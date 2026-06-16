@@ -24,7 +24,7 @@ use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
 use crate::predict::{
     forward_decorr_gradient_subtract, forward_gradient_subtract, forward_left_decorr_residuals,
     forward_median_subtract, forward_rgb_left_subtract_linear, forward_yuy2_left_subtract,
-    is_interlaced_height,
+    interlace_flag_for_height, is_interlaced_height,
 };
 use crate::tables::{
     classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
@@ -399,7 +399,12 @@ pub fn build_bitmapinfoheader(
         PixelFamily::Rgb24 => 24,
         PixelFamily::Rgb32 => 32,
     };
-    v[0x2A] = 0;
+    // interlace_flag at +0x2A (spec/01 §3): mirror the i386 build's
+    // height-derived `0x10` (interlaced) / `0x20` (non-interlaced)
+    // encoding so our extradata round-trips bug-for-bug with the i386
+    // decoder's primary indicator. (The x86-64 build writes 0x00; both
+    // decode correctly via `interlaced_from_flag_and_height`.)
+    v[0x2A] = interlace_flag_for_height(height);
     v[0x2B] = 0;
     v[0x2C..0x2C + extradata_tables.len()].copy_from_slice(extradata_tables);
     v

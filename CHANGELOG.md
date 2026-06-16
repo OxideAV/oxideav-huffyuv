@@ -6,6 +6,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 322: the extradata `interlace_flag` byte at BIH `+0x2A`
+  (spec/01 §3 + audit/01-validation-report.md §7.5) is now parsed,
+  exposed on `StreamConfig::interlace_flag`, and honoured as the
+  **primary** interlaced indicator. The i386 build's encoder writes
+  this byte (`0x10` interlaced / `0x20` non-interlaced via a height-≤-288
+  test) and its decoder reads the **high nibble** back, dispatching on
+  `1` (interlaced) / `2` (non-interlaced) and falling back to the
+  `biHeight > 288` heuristic only when the byte is `0x00` (the x86-64
+  build / clean-room default). `StreamConfig::is_interlaced` now defers
+  to the new `predict::interlaced_from_flag_and_height`, so a stream
+  carrying an explicit flag is no longer forced through the height
+  heuristic — an `0x10` flag on a short frame decodes interlaced and an
+  `0x20` flag on a tall (> 288) frame decodes progressive. The v2.x
+  `build_bitmapinfoheader` writer now emits the i386-style flag (via the
+  new `predict::interlace_flag_for_height`) instead of the prior
+  hard-coded `0x00`, so our extradata round-trips bug-for-bug with the
+  i386 decoder's primary indicator while still being decoded correctly
+  by any decoder that only reads the byte's high nibble. Both new
+  helpers are unit-tested for the full decode table (high-nibble
+  dispatch, low-nibble-ignored, unrecognised-nibble fallback) and
+  encode/decode round-trip; the BIH writer + parser path is covered
+  end-to-end (encode → parse → decode) for both a short and a tall
+  frame. Wire-identical for the residual bitstream (the flag lives only
+  in the extradata prefix); all prior decode/roundtrip + AVI-lockstep
+  tests stay green.
+
 ### Changed
 
 - Round 310: refilling 64-bit bit reader in `bitio::BitReader`. The

@@ -2028,3 +2028,66 @@ fn round100_fused_left_decorr_alpha_varies_per_row_rgb32() {
     let out = decode_frame(&cfg, &frame).unwrap();
     assert_eq!(out.pixels, pixels);
 }
+
+// ───────── round-322: extradata interlace_flag (BIH +0x2A) emit + parse ─────────
+//
+// spec/01 §3 + audit/01-validation-report.md §7.5: the extradata 4-byte
+// fixed prefix's third byte (BIH +0x2A) is an interlace indicator. The
+// i386 build's encoder writes `0x10` (interlaced) / `0x20`
+// (non-interlaced) by a height-≤-288 test, and its decoder reads the
+// high nibble back as the PRIMARY indicator (1 = interlaced, 2 =
+// non-interlaced), falling back to the biHeight > 288 heuristic only
+// when the byte is `0x00`. This test pins both halves: the v2.x BIH
+// writer now emits the i386-style flag, and a parse of that BIH
+// recovers it and honours it via `StreamConfig::is_interlaced`.
+
+#[test]
+fn round322_v2x_bih_emits_i386_interlace_flag() {
+    // A short (16-row) YUY2 v2.x frame: height ≤ 288 → 0x20.
+    let pixels = synth_yuy2(8, 16);
+    let (strf, frame) = encode_frame_with_mode(
+        PixelFamily::Yuy2,
+        Method::Left,
+        8,
+        16,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    // strf is a v2.x BIH (biSize > 0x28); byte +0x2A carries the flag.
+    assert!(strf.len() > 0x2A, "v2.x strf must carry the +0x2A byte");
+    assert_eq!(
+        strf[0x2A], 0x20,
+        "height 16 ≤ 288 → non-interlaced flag 0x20"
+    );
+    // Parse it back: the flag must be recovered and is_interlaced() must
+    // agree (non-interlaced).
+    let cfg = StreamConfig::parse_bitmapinfoheader(&strf).unwrap();
+    assert_eq!(cfg.interlace_flag, 0x20);
+    assert!(!cfg.is_interlaced());
+    // The full encode→parse→decode path still reconstructs the pixels.
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}
+
+#[test]
+fn round322_v2x_bih_emits_interlaced_flag_for_tall_frame() {
+    // A tall (320-row > 288) YUY2 v2.x frame → interlaced flag 0x10.
+    let pixels = synth_yuy2(8, 320);
+    let (strf, frame) = encode_frame_with_mode(
+        PixelFamily::Yuy2,
+        Method::Left,
+        8,
+        320,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    assert_eq!(strf[0x2A], 0x10, "height 320 > 288 → interlaced flag 0x10");
+    let cfg = StreamConfig::parse_bitmapinfoheader(&strf).unwrap();
+    assert_eq!(cfg.interlace_flag, 0x10);
+    assert!(cfg.is_interlaced());
+    // Round-trips through the interlaced decode path the flag selects.
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels);
+}

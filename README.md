@@ -28,9 +28,12 @@ No external library source consulted.
   (`0x40`, RGB-only), `GradientDecorr` (`0x41`, RGB-only).
 - **Both Huffman-table paths**: v2.x extradata (RLE-compressed length
   tables, canonical Huffman code build) and v1.x precomputed-codes.
-- **Interlaced field-stride prediction** (`biHeight > 288`): the frame
-  splits into two independently-predicted fields and is reassembled on
-  decode.
+- **Interlaced field-stride prediction**: the frame splits into two
+  independently-predicted fields and is reassembled on decode. The
+  trigger honours the extradata `interlace_flag` byte (BIH `+0x2A`,
+  high nibble `1`=interlaced / `2`=non-interlaced) as the **primary**
+  indicator when set, falling back to the `biHeight > 288` heuristic
+  when the byte is `0x00` (the x86-64 build / clean-room default).
 - A 65 536-entry primary lookup table per Huffman table services codes
   ≤ 16 bits in a single indexed load; longer codes fall through to a
   flat overflow table.
@@ -54,7 +57,8 @@ No external library source consulted.
   optimal length tables, and emits the winner (returning the chosen
   `Method`). Pin a method via `MethodSelection::Fixed(...)`.
 - Public **`build_bitmapinfoheader`** BIH writer for muxers
-  synthesising an AVI `strf` payload.
+  synthesising an AVI `strf` payload; emits the i386-style
+  `interlace_flag` byte (`0x10`/`0x20`) at BIH `+0x2A`.
 - **Interlaced encode** for `biHeight > 288`, walking the source
   raster with row-stride 2 into a single reused scratch field buffer.
 
