@@ -8,6 +8,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 335: direct unit coverage for the interlace field-stitching
+  primitives `predict::split_fields` / `predict::interleave_fields`
+  (spec/02 §2). Three new tests harden invariants previously exercised
+  only indirectly through the end-to-end interlaced decode: (1) a
+  single-row frame puts its lone row in the even-parity top field with
+  an empty bottom field and round-trips; (2) the documented degenerate
+  guards (`row_bytes == 0` or `height == 0`, reachable from the decoder
+  when `StreamConfig::row_bytes()` saturates to 0 on a zero-width
+  stream) return empty field buffers / empty raster rather than
+  indexing out of bounds; (3) a `(row_bytes, height)` sweep over both
+  parities and a wide stride asserts the spec row distribution
+  (`top = ceil(h/2)` even rows, `bot = floor(h/2)` odd rows, each row
+  placed byte-for-byte) and the `interleave∘split == identity`
+  contract. No wire-format change; all prior decode / roundtrip /
+  AVI-lockstep tests stay green (273 lib + 8 lockstep).
+
 - Round 322: the extradata `interlace_flag` byte at BIH `+0x2A`
   (spec/01 §3 + audit/01-validation-report.md §7.5) is now parsed,
   exposed on `StreamConfig::interlace_flag`, and honoured as the

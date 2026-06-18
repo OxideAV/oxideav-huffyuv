@@ -1301,6 +1301,98 @@ mod tests {
         assert_eq!(merged, pixels);
     }
 
+    #[test]
+    fn split_interleave_height_one_single_row_goes_to_top() {
+        // spec/02 §2: the field split is a row parity partition. A
+        // single-row frame is wholly the (even-parity) top field; the
+        // bottom field is empty. `interleave_fields` must reproduce the
+        // lone row unchanged.
+        let pixels: Vec<u8> = (0..6u8).collect();
+        let (top, bot) = split_fields(&pixels, 6, 1);
+        assert_eq!(top.len(), 6, "single row → 1 top row");
+        assert!(bot.is_empty(), "single row → empty bottom field");
+        assert_eq!(&top, &pixels);
+        let merged = interleave_fields(&top, &bot, 6, 1);
+        assert_eq!(merged, pixels);
+    }
+
+    #[test]
+    fn split_interleave_degenerate_guards_return_empty() {
+        // The documented degenerate guards: a zero row stride (reachable
+        // from the decoder when `StreamConfig::row_bytes()` saturates to
+        // 0 on a zero-width stream — see the decoder's width-0 test) or a
+        // zero height yield two empty field buffers, and the inverse
+        // yields an empty raster. Exercising these directly keeps the
+        // guard from silently regressing into an out-of-bounds index.
+        let pixels: Vec<u8> = (0..12u8).collect();
+        // Zero row stride.
+        let (t0, b0) = split_fields(&pixels, 0, 4);
+        assert!(t0.is_empty() && b0.is_empty(), "row_bytes=0 → empty fields");
+        assert!(
+            interleave_fields(&t0, &b0, 0, 4).is_empty(),
+            "row_bytes=0 → empty raster"
+        );
+        // Zero height.
+        let (t1, b1) = split_fields(&pixels, 4, 0);
+        assert!(t1.is_empty() && b1.is_empty(), "height=0 → empty fields");
+        assert!(
+            interleave_fields(&t1, &b1, 4, 0).is_empty(),
+            "height=0 → empty raster"
+        );
+        // Empty input with both zero.
+        let (t2, b2) = split_fields(&[], 0, 0);
+        assert!(t2.is_empty() && b2.is_empty());
+        assert!(interleave_fields(&[], &[], 0, 0).is_empty());
+    }
+
+    #[test]
+    fn split_interleave_row_distribution_and_roundtrip_sweep() {
+        // spec/02 §2 / `split_fields` doc: the top field carries the
+        // ceil(h/2) even-parity rows and the bottom field the floor(h/2)
+        // odd-parity rows; `interleave_fields` is the exact inverse. Sweep
+        // a range of (row_bytes, height) — including both parities and a
+        // wide-stride row — and assert both the row-count distribution
+        // and the interleave∘split identity hold across the matrix.
+        for &row_bytes in &[1usize, 2, 4, 16, 13] {
+            for &height in &[1usize, 2, 3, 7, 8, 17] {
+                let n = row_bytes * height;
+                // Deterministic pattern with full 0..=255 wrap coverage.
+                let pixels: Vec<u8> = (0..n).map(|x| ((x * 53 + 7) ^ 0x9E) as u8).collect();
+                let (top, bot) = split_fields(&pixels, row_bytes, height);
+                assert_eq!(
+                    top.len(),
+                    height.div_ceil(2) * row_bytes,
+                    "top rows for {row_bytes}x{height}"
+                );
+                assert_eq!(
+                    bot.len(),
+                    (height / 2) * row_bytes,
+                    "bot rows for {row_bytes}x{height}"
+                );
+                // Every even row lands in the top field, every odd row in
+                // the bottom field, byte-for-byte.
+                for row in 0..height {
+                    let src = &pixels[row * row_bytes..(row + 1) * row_bytes];
+                    let (field, frow) = if row & 1 == 0 {
+                        (&top, row / 2)
+                    } else {
+                        (&bot, row / 2)
+                    };
+                    assert_eq!(
+                        &field[frow * row_bytes..(frow + 1) * row_bytes],
+                        src,
+                        "row {row} misplaced for {row_bytes}x{height}"
+                    );
+                }
+                let merged = interleave_fields(&top, &bot, row_bytes, height);
+                assert_eq!(
+                    merged, pixels,
+                    "interleave∘split must be identity for {row_bytes}x{height}"
+                );
+            }
+        }
+    }
+
     /// Reference round-95 "two-pass" decorrelated-LEFT residual: first
     /// materialise the full decorrelated buffer (`B−G`, `G`, `R−G`,
     /// `A`), then per-channel LEFT-subtract over stride `n`. The fused
