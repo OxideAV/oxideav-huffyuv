@@ -21,8 +21,8 @@ pub const CODEC_ID_STR: &str = "huffyuv";
 /// Register the HuffYUV / FFVHuff codec with `reg`.
 ///
 /// Claims the two FourCCs the AVI demuxer needs to resolve a HuffYUV
-/// stream — `HFYU` (the proprietary Windows VfW codec; spec/01 §1.5)
-/// and `FFVH` (the FFmpeg-internal alias). The decoder in this crate
+/// stream — `HFYU` (the original VfW FourCC; spec/01 §1.5)
+/// and `FFVH` (the FFVHuff extended-variant FourCC). The decoder in this crate
 /// only handles the 8-bit family the round-1 deliverable certifies;
 /// 10/12-bit FFVHuff variants are deferred to a future round.
 pub fn register_codecs(reg: &mut CodecRegistry) {
