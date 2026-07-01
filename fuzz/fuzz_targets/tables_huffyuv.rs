@@ -168,6 +168,17 @@ fn drive_rle_encode_roundtrip(data: &[u8]) {
     let mut out = Vec::new();
     rle_encode_one_channel(&lengths, &mut out)
         .expect("rle_encode of a coerced 0..=31 table must succeed");
+    // spec/04 §3.3 C-string-terminator convention: the RLE stream must
+    // contain no in-band 0x00 byte, so `lstrcpyA`/`lstrlenA`-based
+    // third-party tooling can copy/measure the extradata without
+    // truncating it. Length-0 (absent-symbol) runs are the only way a
+    // 0x00 could leak in; the encoder emits them as short-form 0xE0
+    // chunks. Assert the invariant for *every* coerced length table the
+    // fuzzer reaches (including all-absent and long-absent-run shapes).
+    assert!(
+        !out.contains(&0x00),
+        "RLE stream must contain no in-band 0x00 (spec/04 §3.3)"
+    );
     let mut cursor: &[u8] = &out;
     let decoded = rle_decode_one_channel(&mut cursor)
         .expect("rle_decode of rle_encode output must succeed");

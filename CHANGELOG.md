@@ -25,7 +25,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   existing roundtrips stay bit-identical. Two property tests assert the
   NUL-free invariant across all-absent / sparse / alternating / classic
   length tables plus the three-channel wrapper, each with a full RLE
-  self-roundtrip.
+  self-roundtrip. The `tables_huffyuv` fuzz target's RLE
+  encode→decode driver now also asserts the NUL-free property on every
+  coerced length table the fuzzer reaches, so the §3.3 invariant is
+  continuously enforced across the whole 0..=31 length space.
 
 ### Added
 
