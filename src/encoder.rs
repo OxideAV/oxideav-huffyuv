@@ -3284,3 +3284,229 @@ mod round262_residuals_row_bytes_accessor_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod round382_arbitrary_extradata_conformance_tests {
+    //! Round-382 decoder-contract conformance suite for spec/04 §3.4.
+    //!
+    //! §3.4 states the decoder MUST accept a v2.x extradata stream
+    //! carrying **any** set of three RLE-compressed 256-entry length
+    //! tables — "including but not limited to the six classic blobs" —
+    //! and derive the per-symbol codes from those lengths by canonical
+    //! Huffman construction (spec/03 §3), not by classic-blob lookup.
+    //!
+    //! The existing `ClassicV2` / `CustomV2` roundtrip tests always
+    //! decode against tables the *encoder* chose; neither pins the
+    //! decoder's obligation to accept a length table it would never
+    //! itself emit. Here we hand-build a **deliberately non-classic**
+    //! length table (a flat all-length-8 code over all 256 symbols —
+    //! Kraft sum `256 × 2⁻⁸ = 1`, valid but pessimal, and byte-distinct
+    //! from every one of the six classic blobs), RLE-compress it into
+    //! the extradata, encode a real frame body against that exact table
+    //! through `emit_bitstream_parts`, and prove the decoder
+    //! reconstructs the source pixels bit-exactly. A companion assertion
+    //! confirms the extradata bytes differ from all six classic blobs,
+    //! so a classic-blob-locked decoder would fail this test.
+    //!
+    //! We drive both the progressive path and — for YUY2 — a tall
+    //! (`> 288`) interlaced frame, exercising the arbitrary-table build
+    //! through the field-split path as well.
+
+    use super::*;
+    use crate::decoder::decode_frame;
+    use crate::tables::rle_decode_three_channels;
+
+    /// A flat, valid, non-classic length table: every symbol gets an
+    /// 8-bit code. Kraft sum = 256 × 2⁻⁸ = 1, so canonical build
+    /// succeeds; no classic blob assigns a uniform length across all
+    /// 256 slots, so this is guaranteed distinct.
+    fn flat_len8() -> [u8; 256] {
+        [8u8; 256]
+    }
+
+    fn synth(n: usize, mut s: u32) -> Vec<u8> {
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    /// Assert the hand-built extradata is byte-distinct from every one
+    /// of the six classic blobs for the given family (a classic-blob
+    /// oracle decoder could not have produced these tables).
+    fn assert_not_classic(family: PixelFamily, extradata: &[u8]) {
+        let methods: &[Method] = if family.is_rgb() {
+            &[Method::Left, Method::LeftDecorr, Method::GradientDecorr]
+        } else {
+            &[Method::Left, Method::Gradient, Method::Median]
+        };
+        for &m in methods {
+            let blob = classic_blob_bytes(family, m);
+            assert_ne!(
+                extradata, blob,
+                "{family:?}/{m:?}: hand-built extradata must not equal a classic blob"
+            );
+        }
+    }
+
+    /// Encode `pixels` for `(family, method)` with the three
+    /// hand-supplied length tables, then round-trip through the real
+    /// BIH writer + parser + decoder. Proves spec/04 §3.4 for one case.
+    fn roundtrip_with_tables(
+        family: PixelFamily,
+        method: Method,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        lengths: &[[u8; 256]; 3],
+    ) {
+        // Build the three per-slot canonical Huffman tables from the
+        // hand-supplied lengths (the same construction the decoder runs
+        // on the extradata it receives).
+        let s1 = HuffTable::build_from_lengths(&lengths[0]).expect("slot1");
+        let s2 = HuffTable::build_from_lengths(&lengths[1]).expect("slot2");
+        let s3 = HuffTable::build_from_lengths(&lengths[2]).expect("slot3");
+
+        // RLE-compress the lengths into an extradata table region and
+        // wrap it in a real BITMAPINFOHEADER via the public writer.
+        let extradata = rle_encode_three_channels(lengths).expect("rle encode");
+        assert_not_classic(family, &extradata);
+        // Sanity: the extradata RLE decodes back to the exact lengths.
+        let decoded_lens = rle_decode_three_channels(&extradata).expect("rle roundtrip");
+        assert_eq!(&decoded_lens, lengths, "extradata must RLE-roundtrip");
+
+        let strf = build_bitmapinfoheader(family, method, width, height, &extradata, true);
+
+        // Encode the frame body against the hand-supplied tables. We
+        // reuse the encoder's own residual computation so the body is a
+        // genuine predicted-residual stream, then Huffman-pack it with
+        // the flat tables via `emit_bitstream_parts`.
+        let frame =
+            compute_frame_residuals(family, method, width, height, pixels).expect("residuals");
+        let frame_bytes = if frame.interlaced {
+            let mut out = emit_bitstream_parts(
+                family,
+                method,
+                &frame.top_seed,
+                &frame.combined_body[..frame.top_body_len],
+                &s1,
+                &s2,
+                &s3,
+            )
+            .expect("emit top");
+            if let Some(bot_seed) = frame.bot_seed_opt {
+                let mut bot = emit_bitstream_parts(
+                    family,
+                    method,
+                    &bot_seed,
+                    &frame.combined_body[frame.top_body_len..],
+                    &s1,
+                    &s2,
+                    &s3,
+                )
+                .expect("emit bot");
+                out.append(&mut bot);
+            }
+            out
+        } else {
+            emit_bitstream_parts(
+                family,
+                method,
+                &frame.top_seed,
+                &frame.combined_body,
+                &s1,
+                &s2,
+                &s3,
+            )
+            .expect("emit")
+        };
+
+        // The decoder rebuilds its tables purely from the extradata
+        // lengths — if it were classic-blob-locked, it would decode with
+        // the wrong codes and produce garbage.
+        let cfg = StreamConfig::parse_bitmapinfoheader(&strf).expect("parse strf");
+        assert!(cfg.has_extradata, "cfg must carry the v2.x extradata");
+        let out = decode_frame(&cfg, &frame_bytes).expect("decode");
+        assert_eq!(
+            out.pixels, pixels,
+            "{family:?}/{method:?} {width}×{height}: arbitrary-table decode must be pixel-exact"
+        );
+    }
+
+    #[test]
+    fn round382_yuy2_left_flat_tables_progressive() {
+        let (w, h) = (8u32, 4u32);
+        let pixels = synth(PixelFamily::Yuy2.row_bytes(w) * h as usize, 0x1111_2222);
+        let lens = [flat_len8(), flat_len8(), flat_len8()];
+        roundtrip_with_tables(PixelFamily::Yuy2, Method::Left, w, h, &pixels, &lens);
+    }
+
+    #[test]
+    fn round382_yuy2_gradient_flat_tables_progressive() {
+        let (w, h) = (8u32, 5u32);
+        let pixels = synth(PixelFamily::Yuy2.row_bytes(w) * h as usize, 0x3333_4444);
+        let lens = [flat_len8(), flat_len8(), flat_len8()];
+        roundtrip_with_tables(PixelFamily::Yuy2, Method::Gradient, w, h, &pixels, &lens);
+    }
+
+    #[test]
+    fn round382_yuy2_median_flat_tables_progressive() {
+        let (w, h) = (8u32, 6u32);
+        let pixels = synth(PixelFamily::Yuy2.row_bytes(w) * h as usize, 0x5555_6666);
+        let lens = [flat_len8(), flat_len8(), flat_len8()];
+        roundtrip_with_tables(PixelFamily::Yuy2, Method::Median, w, h, &pixels, &lens);
+    }
+
+    #[test]
+    fn round382_rgb24_left_flat_tables_progressive() {
+        let (w, h) = (5u32, 3u32);
+        let pixels = synth(PixelFamily::Rgb24.row_bytes(w) * h as usize, 0x7777_8888);
+        let lens = [flat_len8(), flat_len8(), flat_len8()];
+        roundtrip_with_tables(PixelFamily::Rgb24, Method::Left, w, h, &pixels, &lens);
+    }
+
+    #[test]
+    fn round382_rgb24_left_decorr_flat_tables_progressive() {
+        let (w, h) = (6u32, 4u32);
+        let pixels = synth(PixelFamily::Rgb24.row_bytes(w) * h as usize, 0x9999_AAAA);
+        let lens = [flat_len8(), flat_len8(), flat_len8()];
+        roundtrip_with_tables(PixelFamily::Rgb24, Method::LeftDecorr, w, h, &pixels, &lens);
+    }
+
+    #[test]
+    fn round382_rgb32_left_decorr_flat_tables_progressive() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = synth(PixelFamily::Rgb32.row_bytes(w) * h as usize, 0xBBBB_CCCC);
+        let lens = [flat_len8(), flat_len8(), flat_len8()];
+        roundtrip_with_tables(PixelFamily::Rgb32, Method::LeftDecorr, w, h, &pixels, &lens);
+    }
+
+    #[test]
+    fn round382_rgb32_gradient_decorr_flat_tables_progressive() {
+        let (w, h) = (5u32, 5u32);
+        let pixels = synth(PixelFamily::Rgb32.row_bytes(w) * h as usize, 0xDDDD_EEEE);
+        let lens = [flat_len8(), flat_len8(), flat_len8()];
+        roundtrip_with_tables(
+            PixelFamily::Rgb32,
+            Method::GradientDecorr,
+            w,
+            h,
+            &pixels,
+            &lens,
+        );
+    }
+
+    #[test]
+    fn round382_yuy2_left_flat_tables_interlaced_tall() {
+        // biHeight > 288 engages the field-split path; the arbitrary
+        // tables must serve both fields (spec/02 §2).
+        let (w, h) = (8u32, 300u32);
+        let pixels = synth(PixelFamily::Yuy2.row_bytes(w) * h as usize, 0x0F0F_1E1E);
+        let lens = [flat_len8(), flat_len8(), flat_len8()];
+        roundtrip_with_tables(PixelFamily::Yuy2, Method::Left, w, h, &pixels, &lens);
+    }
+}

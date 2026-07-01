@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 382: decoder-contract conformance suite for spec/04 §3.4 —
+  the decoder MUST accept a v2.x extradata stream carrying **any**
+  three RLE-compressed 256-entry length tables, "including but not
+  limited to the six classic blobs", deriving codes by canonical
+  Huffman construction (spec/03 §3) rather than classic-blob lookup.
+  Eight new tests hand-build a deliberately non-classic length table
+  (a flat all-length-8 code — Kraft sum `256 × 2⁻⁸ = 1`, byte-distinct
+  from every classic blob), RLE-compress it into extradata, encode a
+  genuine predicted-residual frame body against that exact table via
+  `emit_bitstream_parts`, and prove the decoder reconstructs the
+  source pixels bit-exactly. Coverage spans all seven legal
+  `(family, method)` residual paths (YUY2 Left/Gradient/Median,
+  RGB24 Left/LeftDecorr, RGB32 LeftDecorr/GradientDecorr) plus a tall
+  (`biHeight = 300 > 288`) YUY2 interlaced frame that exercises the
+  arbitrary tables through both field halves. A `assert_not_classic`
+  guard confirms the emitted extradata differs from all six classic
+  blobs, so a classic-blob-locked decoder would fail the suite. No
+  wire-format change; the prior 273 lib + 8 lockstep tests stay green
+  (281 lib total).
+
 - Round 335: direct unit coverage for the interlace field-stitching
   primitives `predict::split_fields` / `predict::interleave_fields`
   (spec/02 §2). Three new tests harden invariants previously exercised
