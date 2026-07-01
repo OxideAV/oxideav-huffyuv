@@ -253,11 +253,22 @@ pub fn rle_decode_three_channels(blob: &[u8]) -> Result<[[u8; 256]; 3]> {
 // So our encoder does NOT emit a `0x00 0x00` between channels. Each
 // `rle_encode_one_channel` call emits exactly the bytes the decoder
 // will consume to fill 256 slots, and nothing more.
+//
+// spec/04 §3.3 additionally requires that NO in-band `0x00` byte appears
+// anywhere in the RLE data (so `lstrcpyA`/`lstrlenA`-based third-party
+// tooling can copy/measure the extradata). The only way a `0x00` could
+// leak in is the long-form encoding of a length-0 (absent-symbol) run,
+// whose leading byte is `v & 0x1F = 0x00`. `rle_encode_one_channel`
+// avoids that by emitting length-0 runs > 7 as repeated short-form
+// chunks of 7 (byte `0xE0`) instead of long-form — see the loop below.
 
 /// RLE-encode one 256-byte length table to `out`. spec/01 §5: each
 /// run uses the count-hint when count ≤ 7, otherwise the long-form
-/// `value 0x_NN` (NN > 0) for runs of 8..255. No trailing `0x00 0x00`
-/// is appended — see module-level note.
+/// `value 0x_NN` (NN > 0) for runs of 8..255. Length-0 runs never use
+/// long-form (that would emit an in-band `0x00`, spec/04 §3.3); they are
+/// emitted as short-form `0xE0` chunks. No trailing `0x00 0x00` is
+/// appended — see module-level note. The emitted stream contains no
+/// `0x00` byte.
 pub fn rle_encode_one_channel(lengths: &[u8; 256], out: &mut Vec<u8>) -> Result<()> {
     for &l in lengths.iter() {
         if l > 31 {
@@ -275,6 +286,21 @@ pub fn rle_encode_one_channel(lengths: &[u8; 256], out: &mut Vec<u8>) -> Result<
             run += 1;
         }
         // Emit (v, run).
+        //
+        // spec/04 §3.3 (C-string-terminator convention): the codec
+        // author's design note guarantees "a zero byte can never appear
+        // in the RLE data" so the classic-table blobs can be copied with
+        // `lstrcpyA` / measured with `lstrlenA`. A clean-room encoder
+        // that ships custom tables (`ExtradataMode::CustomV2`) must
+        // honour the same invariant, or a `lstrlenA`-based third-party
+        // decoder would truncate the extradata at the first in-band
+        // `0x00`. The long-form encoding emits a leading byte equal to
+        // `v & 0x1F`, which is `0x00` for a length-0 (absent-symbol) run
+        // — and absent-symbol runs longer than 7 are the common case for
+        // any real residual histogram. So length-0 runs must be emitted
+        // as short-form chunks of ≤ 7 only (bytes `0x20`..=`0xE0`, all
+        // non-zero); long-form is reserved for `v != 0`, where the
+        // leading byte `v & 0x1F` is already non-zero.
         let mut remaining = run;
         while remaining > 0 {
             if remaining <= 7 {
@@ -284,9 +310,17 @@ pub fn rle_encode_one_channel(lengths: &[u8; 256], out: &mut Vec<u8>) -> Result<
                 // of `v`. Safe (no in-band `0x00` produced).
                 out.push(b);
                 remaining = 0;
+            } else if v == 0 {
+                // Length-0 run > 7: long-form would push a `0x00`
+                // leading byte (in-band zero, spec/04 §3.3 violation).
+                // Emit a full short-form chunk of 7 instead (byte
+                // `0xE0` = count_hint 7, value 0) and loop.
+                out.push(0xE0);
+                remaining -= 7;
             } else {
                 // Long-form: count_hint = 0 (leading byte = v),
-                // followed by an explicit count in 1..=255.
+                // followed by an explicit count in 1..=255. Safe here
+                // because `v != 0` → `leading != 0x00`.
                 let chunk = remaining.min(255) as u8;
                 let leading = v & 0x1F;
                 out.push(leading);
@@ -1204,5 +1238,120 @@ mod tests {
             assert_eq!(decoded_sym as usize, sym);
             assert_eq!(decoded_len, e.length);
         }
+    }
+
+    // ───────── Round-382: spec/04 §3.3 no-in-band-0x00 invariant ─────────
+    //
+    // The C-string-terminator convention (spec/04 §3.3) requires that the
+    // RLE-compressed length-table bytes contain no `0x00` byte, so a
+    // `lstrcpyA`/`lstrlenA`-based third-party decoder can copy/measure
+    // the extradata without truncating it at a spurious NUL. The only way
+    // `rle_encode_one_channel` could leak a `0x00` is the long-form
+    // encoding of a length-0 (absent-symbol) run, whose leading byte is
+    // `v & 0x1F = 0x00`. Absent-symbol runs longer than 7 are the common
+    // case for any real residual histogram, so this was a latent
+    // wire-portability defect before round 382 routed length-0 runs
+    // through short-form `0xE0` chunks.
+
+    /// Assert the encoder never emits a `0x00` byte, for a battery of
+    /// length tables that stress the length-0-run path specifically.
+    #[test]
+    fn round382_rle_encode_never_emits_inband_zero() {
+        // Helper: encode one table and assert no 0x00 byte, plus a
+        // full RLE self-roundtrip (the short-form 0xE0 chunks must
+        // decode back to the exact same 256 lengths).
+        let check = |lengths: &[u8; 256], label: &str| {
+            let mut out = Vec::new();
+            rle_encode_one_channel(lengths, &mut out)
+                .unwrap_or_else(|e| panic!("{label}: encode failed: {e:?}"));
+            assert!(
+                !out.contains(&0x00),
+                "{label}: RLE stream must contain no in-band 0x00 (spec/04 §3.3); got {out:02x?}"
+            );
+            // Terminate the channel with the standard 0x00 0x00 sentinel
+            // so the single-channel decoder stops cleanly at 256.
+            let mut framed = out.clone();
+            framed.extend_from_slice(&[0x00, 0x00]);
+            let mut cursor: &[u8] = &framed;
+            let back = rle_decode_one_channel(&mut cursor)
+                .unwrap_or_else(|e| panic!("{label}: decode failed: {e:?}"));
+            assert_eq!(&back, lengths, "{label}: RLE must roundtrip");
+        };
+
+        // 1. All-absent (every symbol length 0) — a single 256-long
+        //    length-0 run, the worst case for the long-form path.
+        check(&[0u8; 256], "all-zero");
+
+        // 2. One present symbol at length 1, all 255 others absent:
+        //    a length-0 run of 255 straddling the present symbol.
+        let mut one = [0u8; 256];
+        one[128] = 1;
+        // Balance Kraft only matters for HuffTable build, not RLE; the
+        // RLE encoder takes the raw length array as-is.
+        check(&one, "single-present-mid");
+
+        // 3. A realistic sparse histogram: lengths 8 on a handful of
+        //    symbols, 0 elsewhere (long absent runs on both sides).
+        let mut sparse = [0u8; 256];
+        for s in [3usize, 4, 5, 200, 201, 255] {
+            sparse[s] = 8;
+        }
+        check(&sparse, "sparse");
+
+        // 4. Alternating present/absent — forces many short (len-1)
+        //    length-0 runs interleaved with non-zero lengths.
+        let mut alt = [0u8; 256];
+        for (s, slot) in alt.iter_mut().enumerate() {
+            *slot = if s % 2 == 0 { 0 } else { 4 };
+        }
+        check(&alt, "alternating");
+
+        // 5. A block of exactly 8 absent symbols (the run > 7 boundary
+        //    where the pre-fix long-form path would first trigger).
+        let mut block8 = [4u8; 256];
+        for slot in block8.iter_mut().take(8) {
+            *slot = 0;
+        }
+        check(&block8, "leading-8-zero-block");
+
+        // 6. Every classic blob's decoded lengths re-encode with no
+        //    0x00 (they contain length-0 symbols too; confirm our
+        //    encoder keeps them zero-free).
+        for blob in [
+            blobs::yuv_left(),
+            blobs::yuv_gradient(),
+            blobs::yuv_median(),
+            blobs::rgb_left(),
+            blobs::rgb_left_decorr(),
+            blobs::rgb_gradient_decorr(),
+        ] {
+            let three = rle_decode_three_channels(blob).unwrap();
+            for (i, slot) in three.iter().enumerate() {
+                check(slot, &format!("classic-slot-{i}"));
+            }
+        }
+    }
+
+    /// The three-channel wrapper likewise emits no `0x00` — the whole
+    /// extradata table region a `CustomV2` encoder writes is NUL-free.
+    #[test]
+    fn round382_rle_encode_three_channels_never_emits_inband_zero() {
+        // Three deliberately-sparse slots (many absent-symbol runs).
+        let mut s1 = [0u8; 256];
+        let mut s2 = [0u8; 256];
+        let mut s3 = [0u8; 256];
+        for s in 0..256 {
+            s1[s] = if s < 16 { 5 } else { 0 };
+            s2[s] = if s % 3 == 0 { 6 } else { 0 };
+            s3[s] = if (100..140).contains(&s) { 7 } else { 0 };
+        }
+        let out = rle_encode_three_channels(&[s1, s2, s3]).unwrap();
+        assert!(
+            !out.contains(&0x00),
+            "three-channel extradata must be NUL-free (spec/04 §3.3); got {out:02x?}"
+        );
+        // And the region RLE-roundtrips to the exact three tables.
+        let back = rle_decode_three_channels(&out).unwrap();
+        assert_eq!(back, [s1, s2, s3], "three-channel RLE must roundtrip");
     }
 }

@@ -6,6 +6,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 382: the `CustomV2` RLE length-table encoder
+  (`tables::rle_encode_one_channel`) could emit an in-band `0x00` byte,
+  violating the spec/04 §3.3 C-string-terminator convention ("a zero
+  byte can never appear in the RLE data"). The long-form run encoding
+  writes a leading byte equal to `v & 0x1F`, which is `0x00` for a
+  length-0 (absent-symbol) run — and absent-symbol runs longer than 7
+  are the common case for any real residual histogram, so custom
+  extradata routinely carried spurious NULs. A `lstrlenA`/`lstrcpyA`-
+  based third-party HuffYUV tool would have truncated such extradata at
+  the first NUL. Length-0 runs are now emitted as short-form `0xE0`
+  chunks (count-hint 7, value 0 → non-zero byte); long-form is reserved
+  for `v != 0` where the leading byte is already non-zero. Our own
+  decoder was unaffected (it terminates by 256-slot emit count, not by
+  NUL), so this is a wire-portability fix, not a self-roundtrip fix; all
+  existing roundtrips stay bit-identical. Two property tests assert the
+  NUL-free invariant across all-absent / sparse / alternating / classic
+  length tables plus the three-channel wrapper, each with a full RLE
+  self-roundtrip.
+
 ### Added
 
 - Round 382: decoder-contract conformance suite for spec/04 §3.4 —
