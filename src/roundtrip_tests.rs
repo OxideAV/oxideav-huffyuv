@@ -2217,3 +2217,37 @@ fn round382_all_absent_channel_extreme_custom_v2() {
     let out = decode_frame(&cfg, &frame).unwrap();
     assert_eq!(out.pixels, pixels, "solid-colour RGB32 CustomV2 roundtrip");
 }
+
+#[test]
+fn round382_rgb24_x_pad_byte_ignored_on_decode() {
+    // spec/02 §8 #2 + spec/03 §1.1: the first uncompressed RGB24 pixel
+    // is stored as 4 wire bytes `X B G R`, where X is an "unused" pad.
+    // A clean-room encoder writes X = 0x00, but the decoder MUST ignore
+    // whatever value it finds there (a third-party stream may carry a
+    // non-zero pad). Our encoder writes 0x00; flipping frame byte 0 to a
+    // non-zero value must not change a single decoded pixel.
+    for (w, h, method) in [
+        (4usize, 4usize, Method::Left),
+        (5, 3, Method::LeftDecorr),
+        (6, 4, Method::GradientDecorr),
+    ] {
+        let pixels = synth_rgb24(w, h);
+        let (cfg, frame) =
+            encode_for_test(PixelFamily::Rgb24, method, w as u32, h as u32, &pixels).unwrap();
+        // The encoder writes the X pad as 0x00 (spec/03 §6 #6).
+        assert_eq!(
+            frame[0], 0x00,
+            "{method:?}: encoder must zero the RGB24 X pad"
+        );
+        let baseline = decode_frame(&cfg, &frame).unwrap();
+        assert_eq!(baseline.pixels, pixels);
+        // Flip the X pad to a non-zero value; decode must be identical.
+        let mut tampered = frame.clone();
+        tampered[0] = 0xAB;
+        let out = decode_frame(&cfg, &tampered).unwrap();
+        assert_eq!(
+            out.pixels, pixels,
+            "{method:?}: RGB24 decode must ignore the X pad byte value"
+        );
+    }
+}

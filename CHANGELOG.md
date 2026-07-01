@@ -36,6 +36,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   round-trip and a NUL-free emitted extradata table region. These tie
   the §3.3 fix to real encoder output, not just the RLE primitive.
 
+- Round 382: decoder-contract test for the RGB24 "X" pad byte
+  (spec/02 §8 #2 + spec/03 §1.1). The first uncompressed RGB24 pixel is
+  stored as 4 wire bytes `X B G R` where X is unused; a clean-room
+  encoder writes `0x00` but the decoder MUST ignore whatever value a
+  (possibly third-party) stream carries there. The test confirms the
+  encoder zeroes the pad, then flips frame byte 0 to `0xAB` and asserts
+  not a single decoded pixel changes, across Left / LeftDecorr /
+  GradientDecorr.
+
 ### Added
 
 - Round 382: decoder-contract conformance suite for spec/04 §3.4 —
