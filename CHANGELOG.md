@@ -28,7 +28,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   self-roundtrip. The `tables_huffyuv` fuzz target's RLE
   encode→decode driver now also asserts the NUL-free property on every
   coerced length table the fuzzer reaches, so the §3.3 invariant is
-  continuously enforced across the whole 0..=31 length space.
+  continuously enforced across the whole 0..=31 length space. Three
+  sparse-content roundtrip tests drive the full `CustomV2` encode → BIH
+  → parse → decode path on rasters built from a two-value palette (YUY2,
+  RGB24) and a solid-colour frame (RGB32, 255 absent symbols per slot —
+  the maximal length-0-run shape), each asserting both a bit-exact
+  round-trip and a NUL-free emitted extradata table region. These tie
+  the §3.3 fix to real encoder output, not just the RLE primitive.
 
 ### Added
 

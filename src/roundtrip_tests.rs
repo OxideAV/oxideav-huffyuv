@@ -2091,3 +2091,129 @@ fn round322_v2x_bih_emits_interlaced_flag_for_tall_frame() {
     let out = decode_frame(&cfg, &frame).unwrap();
     assert_eq!(out.pixels, pixels);
 }
+
+// ───────── Round-382: sparse-content CustomV2 end-to-end ─────────
+//
+// A frame built from a tiny palette of byte values produces residual
+// histograms where most of the 256 symbols are absent (length 0). The
+// package-merge builder then emits length tables with long length-0
+// runs — precisely the shape that used to leak an in-band `0x00` into
+// the RLE extradata (spec/04 §3.3, fixed round 382). These tests drive
+// the *full* CustomV2 encode → BIH → parse → decode path on such
+// content and additionally assert the encoder's emitted extradata table
+// region (BIH `+0x2C..`) is NUL-free, tying the §3.3 fix to real
+// encoder output rather than the RLE primitive alone.
+
+/// Build a YUY2 raster whose bytes take only two distinct values, so
+/// every channel histogram leaves ~254 symbols absent.
+fn synth_yuy2_sparse(width: usize, height: usize) -> Vec<u8> {
+    let mut v = vec![0u8; width * 2 * height];
+    for (i, b) in v.iter_mut().enumerate() {
+        // Alternate between two constants → residual stream is
+        // dominated by a couple of values, most symbols never appear.
+        *b = if i % 5 == 0 { 0x11 } else { 0x22 };
+    }
+    v
+}
+
+fn synth_rgb24_sparse(width: usize, height: usize) -> Vec<u8> {
+    let mut v = vec![0u8; width * 3 * height];
+    for (i, b) in v.iter_mut().enumerate() {
+        *b = if i % 7 == 0 { 0x40 } else { 0x41 };
+    }
+    v
+}
+
+fn assert_extradata_nul_free(strf: &[u8]) {
+    // v2.x extradata table region starts at BIH +0x2C; the first 0x2C
+    // bytes are the fixed header + 4-byte prefix (which legitimately
+    // carry 0x00 pad bytes at +0x2A/+0x2B). Only the table region must
+    // be NUL-free per spec/04 §3.3.
+    assert!(
+        strf.len() > 0x2C,
+        "v2.x strf must carry an extradata region"
+    );
+    let tables = &strf[0x2C..];
+    assert!(
+        !tables.contains(&0x00),
+        "spec/04 §3.3: CustomV2 extradata table region must be NUL-free; got {tables:02x?}"
+    );
+}
+
+#[test]
+fn round382_yuy2_sparse_custom_v2_roundtrip_and_nul_free() {
+    for (w, h, method) in [
+        (8usize, 6usize, Method::Left),
+        (8, 5, Method::Gradient),
+        (8, 6, Method::Median),
+    ] {
+        let pixels = synth_yuy2_sparse(w, h);
+        let (strf, frame) = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            method,
+            w as u32,
+            h as u32,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .unwrap();
+        assert_extradata_nul_free(&strf);
+        let cfg = StreamConfig::parse_bitmapinfoheader(&strf).unwrap();
+        let out = decode_frame(&cfg, &frame).unwrap();
+        assert_eq!(
+            out.pixels, pixels,
+            "YUY2 {method:?} {w}x{h} sparse roundtrip"
+        );
+    }
+}
+
+#[test]
+fn round382_rgb24_sparse_custom_v2_roundtrip_and_nul_free() {
+    for (w, h, method) in [
+        (5usize, 4usize, Method::Left),
+        (6, 3, Method::LeftDecorr),
+        (5, 5, Method::GradientDecorr),
+    ] {
+        let pixels = synth_rgb24_sparse(w, h);
+        let (strf, frame) = encode_frame_with_mode(
+            PixelFamily::Rgb24,
+            method,
+            w as u32,
+            h as u32,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .unwrap();
+        assert_extradata_nul_free(&strf);
+        let cfg = StreamConfig::parse_bitmapinfoheader(&strf).unwrap();
+        let out = decode_frame(&cfg, &frame).unwrap();
+        assert_eq!(
+            out.pixels, pixels,
+            "RGB24 {method:?} {w}x{h} sparse roundtrip"
+        );
+    }
+}
+
+#[test]
+fn round382_all_absent_channel_extreme_custom_v2() {
+    // A single-colour raster: every residual after the seed is 0, so
+    // the encoder's histogram has ONE present symbol per slot and 255
+    // absent — the maximal length-0-run shape. Full round-trip must
+    // hold and the extradata must be NUL-free.
+    let w = 4usize;
+    let h = 4usize;
+    let pixels = vec![0x80u8; w * 4 * h]; // RGB32 solid colour
+    let (strf, frame) = encode_frame_with_mode(
+        PixelFamily::Rgb32,
+        Method::Left,
+        w as u32,
+        h as u32,
+        &pixels,
+        ExtradataMode::CustomV2,
+    )
+    .unwrap();
+    assert_extradata_nul_free(&strf);
+    let cfg = StreamConfig::parse_bitmapinfoheader(&strf).unwrap();
+    let out = decode_frame(&cfg, &frame).unwrap();
+    assert_eq!(out.pixels, pixels, "solid-colour RGB32 CustomV2 roundtrip");
+}
