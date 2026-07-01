@@ -37,6 +37,12 @@ No external library source consulted.
 - A 65 536-entry primary lookup table per Huffman table services codes
   ≤ 16 bits in a single indexed load; longer codes fall through to a
   flat overflow table.
+- **Arbitrary v2.x extradata** (spec/04 §3.4): the decoder accepts
+  *any* set of three RLE-compressed 256-entry length tables in the
+  extradata — not only the six classic blobs — deriving per-symbol
+  codes by canonical-Huffman construction, and ignores the RGB24 "X"
+  pad byte's value (spec/02 §8 #2). A dedicated conformance suite pins
+  both contracts.
 
 ### Encode
 
@@ -48,7 +54,12 @@ No external library source consulted.
     blob (spec/04 §3).
   - **`CustomV2`** — builds per-channel histograms from the residual
     stream, runs a length-limited (max-31) package-merge Huffman
-    builder, and RLE-encodes the resulting length tables inline.
+    builder, and RLE-encodes the resulting length tables inline. The
+    RLE stream is guaranteed free of in-band `0x00` bytes (spec/04
+    §3.3 C-string-terminator convention: length-0 runs are emitted as
+    short-form chunks, never long-form), so `lstrcpyA`/`lstrlenA`-based
+    third-party tooling can copy/measure the extradata without
+    truncating it.
   - **`V1xCompat`** — emits `biSize == 0x28` with no extradata; the
     decoder reads its codebook from the v1.x precomputed-codes set.
 - **Predictor auto-selection** (`encode_frame_auto` with
