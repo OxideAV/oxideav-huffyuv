@@ -1,5 +1,7 @@
 # oxideav-huffyuv
 
+[![CI](https://github.com/OxideAV/oxideav-huffyuv/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-huffyuv/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-huffyuv.svg)](https://crates.io/crates/oxideav-huffyuv) [![docs.rs](https://docs.rs/oxideav-huffyuv/badge.svg)](https://docs.rs/oxideav-huffyuv) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust HuffYUV / FFVHuff lossless video codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
