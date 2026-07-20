@@ -41,7 +41,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_huffyuv::header::{PixelFamily, StreamConfig};
-use oxideav_huffyuv::{decode_frame, DecodedFrame};
+use oxideav_huffyuv::{decode_frame, decode_frame_with_workers, DecodedFrame};
 
 /// Upper bound on the declared output raster (16 MiB). Anything larger
 /// is a resource request, not a logic path, so the harness skips it.
@@ -73,10 +73,30 @@ fn drive(strf: &[u8], frame: &[u8]) {
     }
 
     // The whole point: decode must never panic / overflow / OOB on a
-    // body of arbitrary bytes. Return value intentionally discarded
-    // (a debug-build round-trip oracle would need a trusted encoder of
-    // the *same* arbitrary stream, which doesn't exist).
-    let _: Result<DecodedFrame, _> = decode_frame(&cfg, frame);
+    // body of arbitrary bytes.
+    let serial: Result<DecodedFrame, _> = decode_frame(&cfg, frame);
+
+    // Round-420 differential oracle: the two-worker interlaced path
+    // (split-scan prefix + parallel field decode) must agree with the
+    // serial path on EVERY input, hostile or not — same Ok/Err
+    // disposition, byte-identical pixels on Ok. Unlike an external
+    // reference this oracle lives inside the crate, so the clean-room
+    // wall is untouched. Progressive configs route both calls through
+    // the identical serial code, keeping the added cost confined to
+    // the interlaced slice of the input space.
+    let parallel = decode_frame_with_workers(&cfg, frame, 2);
+    match (&serial, &parallel) {
+        (Ok(a), Ok(b)) => assert_eq!(
+            a.pixels, b.pixels,
+            "budget-2 decode diverged from serial on identical input"
+        ),
+        (Err(_), Err(_)) => {}
+        _ => panic!(
+            "budget-2 decode disposition diverged from serial (serial ok={}, parallel ok={})",
+            serial.is_ok(),
+            parallel.is_ok(),
+        ),
+    }
 }
 
 fuzz_target!(|data: &[u8]| {

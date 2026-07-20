@@ -63,7 +63,8 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_huffyuv::header::{Method, PixelFamily, StreamConfig};
 use oxideav_huffyuv::{
-    build_bitmapinfoheader, decode_frame, encode_frame_with_mode, ExtradataMode,
+    build_bitmapinfoheader, decode_frame, decode_frame_with_workers, encode_frame_with_mode,
+    encode_frame_with_mode_workers, ExtradataMode,
 };
 
 /// Minimum width per family. YUY2 macropixels are 2 pixels wide, so
@@ -182,9 +183,28 @@ fuzz_target!(|data: &[u8]| {
     // codebooks (handled by `verify_body_in_table` inside the
     // encoder). All `Err` returns are fine; the contract under test
     // is "no panic on any input".
-    let (strf, frame) = match encode_frame_with_mode(family, method, width, height, &pixels, mode) {
-        Ok(pair) => pair,
-        Err(_) => return,
+    let serial = encode_frame_with_mode(family, method, width, height, &pixels, mode);
+    // Round-420 differential oracle: the two-worker encode path must
+    // agree with the serial encoder on every input — same Ok/Err
+    // disposition, byte-identical (strf, frame) on Ok. Interlaced
+    // heights exercise the parallel residual + emit phases;
+    // progressive heights pin the budget as a no-op.
+    let parallel = encode_frame_with_mode_workers(family, method, width, height, &pixels, mode, 2);
+    let (strf, frame) = match (serial, parallel) {
+        (Ok(s), Ok(p)) => {
+            assert_eq!(
+                s, p,
+                "budget-2 encode diverged from serial (family={:?} method={:?} mode={:?} {}×{})",
+                family, method, mode, width, height,
+            );
+            s
+        }
+        (Err(_), Err(_)) => return,
+        (s, p) => panic!(
+            "budget-2 encode disposition diverged from serial (serial ok={}, parallel ok={})",
+            s.is_ok(),
+            p.is_ok(),
+        ),
     };
 
     // The strf the encoder emits must parse back into a usable
@@ -225,6 +245,17 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(
         decoded.pixels, pixels,
         "encode→decode must round-trip bit-exact (family={:?} method={:?} mode={:?} {}×{})",
+        family, method, mode, width, height,
+    );
+
+    // Round-420: the budget-2 decoder must round-trip the same wire
+    // bytes identically (fuzz-side companion to the golden-pin
+    // budget-invariance suite).
+    let decoded_p = decode_frame_with_workers(&cfg, &frame, 2)
+        .expect("budget-2 decode must succeed on encoder-produced output");
+    assert_eq!(
+        decoded_p.pixels, pixels,
+        "budget-2 encode→decode must round-trip bit-exact (family={:?} method={:?} mode={:?} {}×{})",
         family, method, mode, width, height,
     );
 });
