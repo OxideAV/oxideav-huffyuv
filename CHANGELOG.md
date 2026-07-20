@@ -6,6 +6,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 419: golden-output pin suite (`tests/golden_pins.rs`). Pins an
+  FNV-1a-64 hash of the `strf` and frame wire bytes for the full legal
+  matrix — 3 pixel families × every legal method × 3 extradata modes ×
+  {progressive 48×32, interlaced 32×292} (72 scenarios) plus 6
+  auto-selector pins (chosen method + wire hashes) — and additionally
+  decodes every pinned frame back, asserting bit-exact lossless
+  reconstruction. This is the round-419 profile-work guard: every
+  performance change must keep all 78 pins byte-identical (a
+  regeneration path exists via `OXIDEAV_HUFFYUV_GOLDEN_DUMP=1` but must
+  never be needed inside a profile round).
+
 ### Fixed
 
 - Round 382: the `CustomV2` RLE length-table encoder
