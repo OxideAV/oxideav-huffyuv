@@ -185,6 +185,7 @@ fn encode_with_precomputed(
                 slot1: HuffTable::build_from_lengths(&lengths[0])?,
                 slot2: HuffTable::build_from_lengths(&lengths[1])?,
                 slot3: HuffTable::build_from_lengths(&lengths[2])?,
+                scan_luts: crate::decoder::ScanLuts::default(),
             });
             let extra = rle_encode_three_channels(&lengths)?;
             (extra, tabs, true)

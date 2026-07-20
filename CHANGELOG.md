@@ -49,6 +49,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   golden-pin budget-2 sweep); budget ≤ 1, progressive frames, and
   `encode_frame_auto` keep the serial path.
 
+- Round 420: scan-side pair-length LUTs
+  (`tables::build_pair_len_lut`). The split scanner's critical path
+  was the same serialized two-lookup chain as the decoder's
+  `decode_pair`, which left the two-worker decode win small (the
+  bottom-field worker can only start after the scan). A 64-KiB LUT
+  per (first, second) slot pair maps the top 16 window bits straight
+  to the summed bit length of the next two codewords whenever the
+  pair fits inside the 16 known bits (entry 0 falls back to the exact
+  `decode_pair`/`decode_one` walk, so consumed bits stay identical —
+  soundness pinned per-prefix against the production walk with
+  randomised low bits, on v1.x and CustomV2 tables). LUTs build
+  lazily behind the r419 table cache (`OnceLock`, once per stream,
+  only when a budget-≥ 2 interlaced decode actually scans). Measured
+  (aarch64, min-of-80 on interlaced 720p, 1 → 2 workers): YUY2 Left
+  7.91 → 5.47 ms (**1.45×**), YUY2 Median 9.81 → 6.69 ms (**1.47×**),
+  RGB32 GradientDecorr 17.90 → 13.45 ms (**1.33×**); serial wall
+  unchanged.
+
 - Round 419: golden-output pin suite (`tests/golden_pins.rs`). Pins an
   FNV-1a-64 hash of the `strf` and frame wire bytes for the full legal
   matrix — 3 pixel families × every legal method × 3 extradata modes ×

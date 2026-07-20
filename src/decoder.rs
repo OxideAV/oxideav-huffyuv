@@ -344,10 +344,20 @@ fn scan_yuy2_field(
     let mut reader = BitReader::new(&frame_bytes[4..]);
     let body_end = total_bytes - ((total_bytes - 4) & 3);
     let mut byte_idx = 4usize;
+    // Round-420 pair-length LUTs: one 8-bit load resolves the summed
+    // bit length of two codewords when the pair fits inside the 16
+    // known window bits (`tables::build_pair_len_lut` soundness note);
+    // `0` falls back to the exact decode_pair / decode_one walk the
+    // decoder itself uses, so the consumed bit count stays identical.
+    let lut12 = tables.scan_lut_s1s2();
+    let lut13 = tables.scan_lut_s1s3();
     while byte_idx < body_end {
         // (Y₁ → slot1, U → slot2)
         let w = reader.peek_window();
-        if let Some((_, _, n)) = decode_pair(&tables.slot1, &tables.slot2, w) {
+        let s = lut12[(w >> 16) as usize];
+        if s != 0 {
+            reader.consume_bits_trusted(s as u32);
+        } else if let Some((_, _, n)) = decode_pair(&tables.slot1, &tables.slot2, w) {
             reader.consume_bits_trusted(n);
         } else {
             let (_, len_y1) = decode_one(&tables.slot1, w)?;
@@ -357,7 +367,10 @@ fn scan_yuy2_field(
         }
         // (Y₂ → slot1, V → slot3)
         let w = reader.peek_window();
-        if let Some((_, _, n)) = decode_pair(&tables.slot1, &tables.slot3, w) {
+        let s = lut13[(w >> 16) as usize];
+        if s != 0 {
+            reader.consume_bits_trusted(s as u32);
+        } else if let Some((_, _, n)) = decode_pair(&tables.slot1, &tables.slot3, w) {
             reader.consume_bits_trusted(n);
         } else {
             let (_, len_y2) = decode_one(&tables.slot1, w)?;
@@ -428,10 +441,26 @@ fn scan_rgb_field(
     } else {
         (&tables.slot1, &tables.slot2)
     };
+    // Round-420 pair-length LUTs (see the YUY2 scanner note): the
+    // first two wire positions resolve through the mode-matched pair
+    // LUT, RGB32's (+2, +3) pair through the slot3/slot3 LUT.
+    let lut01 = if decorrelate {
+        tables.scan_lut_s2s1()
+    } else {
+        tables.scan_lut_s1s2()
+    };
+    let lut33 = if is_rgb32 {
+        tables.scan_lut_s3s3()
+    } else {
+        &[][..]
+    };
     let n_pixels = width_us * height_us;
     for _px in 1..n_pixels {
         let w = reader.peek_window();
-        if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
+        let s = lut01[(w >> 16) as usize];
+        if s != 0 {
+            reader.consume_bits_trusted(s as u32);
+        } else if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
             reader.consume_bits_trusted(n);
         } else {
             let (_, l0) = decode_one(s_w0, w)?;
@@ -446,7 +475,10 @@ fn scan_rgb_field(
             // Wire positions +2 (R or R−G) and +3 (A) both use the
             // slot-3 codebook (spec/03 §1.2; alpha shares slot 3).
             let w = reader.peek_window();
-            if let Some((_, _, n)) = decode_pair(&tables.slot3, &tables.slot3, w) {
+            let s = lut33[(w >> 16) as usize];
+            if s != 0 {
+                reader.consume_bits_trusted(s as u32);
+            } else if let Some((_, _, n)) = decode_pair(&tables.slot3, &tables.slot3, w) {
                 reader.consume_bits_trusted(n);
             } else {
                 let (_, l2) = decode_one(&tables.slot3, w)?;
@@ -471,6 +503,56 @@ pub(crate) struct ThreeTables {
     pub(crate) slot1: HuffTable,
     pub(crate) slot2: HuffTable,
     pub(crate) slot3: HuffTable,
+    /// Round-420: lazily-built pair-length LUTs for the interlaced
+    /// split scanner (see [`ScanLuts`]). `Default`-initialised empty;
+    /// built on first budget-≥ 2 interlaced decode of the stream and
+    /// reused for its lifetime via the round-419 table cache.
+    pub(crate) scan_luts: ScanLuts,
+}
+
+/// Lazily-built scan-side pair-length LUTs
+/// ([`crate::tables::build_pair_len_lut`]), one per (first-slot,
+/// second-slot) pair the field scanners consume:
+///
+/// - `s1s2` — YUY2 `(Y₁ → slot1, U → slot2)`; also RGB no-decorr
+///   `(B → slot1, G → slot2)`.
+/// - `s1s3` — YUY2 `(Y₂ → slot1, V → slot3)`.
+/// - `s2s1` — RGB decorr `(G → slot2, B−G → slot1)`.
+/// - `s3s3` — RGB32 `(R/R−G → slot3, A → slot3)`.
+///
+/// Each is 64 KiB and built at most once per cached `ThreeTables`
+/// (`OnceLock`), only when the two-worker interlaced path actually
+/// scans with that pair — progressive and serial decodes never pay
+/// for them.
+#[derive(Debug, Default)]
+pub(crate) struct ScanLuts {
+    s1s2: std::sync::OnceLock<Box<[u8]>>,
+    s1s3: std::sync::OnceLock<Box<[u8]>>,
+    s2s1: std::sync::OnceLock<Box<[u8]>>,
+    s3s3: std::sync::OnceLock<Box<[u8]>>,
+}
+
+impl ThreeTables {
+    fn scan_lut_s1s2(&self) -> &[u8] {
+        self.scan_luts
+            .s1s2
+            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot1, &self.slot2))
+    }
+    fn scan_lut_s1s3(&self) -> &[u8] {
+        self.scan_luts
+            .s1s3
+            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot1, &self.slot3))
+    }
+    fn scan_lut_s2s1(&self) -> &[u8] {
+        self.scan_luts
+            .s2s1
+            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot2, &self.slot1))
+    }
+    fn scan_lut_s3s3(&self) -> &[u8] {
+        self.scan_luts
+            .s3s3
+            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot3, &self.slot3))
+    }
 }
 
 /// Round-419 decode-table cache.
@@ -532,6 +614,7 @@ pub(crate) mod table_cache {
             slot1: HuffTable::build_from_lengths(&lengths[0])?,
             slot2: HuffTable::build_from_lengths(&lengths[1])?,
             slot3: HuffTable::build_from_lengths(&lengths[2])?,
+            scan_luts: ScanLuts::default(),
         });
         if let Ok(mut map) = extradata_cache().lock() {
             if map.len() >= EXTRADATA_CACHE_CAP {
@@ -571,6 +654,7 @@ pub(crate) mod table_cache {
                 slot1: table_a.clone(),
                 slot2: table_a.clone(),
                 slot3: table_a,
+                scan_luts: ScanLuts::default(),
             });
         }
         let mut cursor: &[u8] = v1x_lengths_set_b();
@@ -583,6 +667,7 @@ pub(crate) mod table_cache {
             slot1: table_a,
             slot2: table_b.clone(),
             slot3: table_b,
+            scan_luts: ScanLuts::default(),
         })
     }
 }
@@ -2480,5 +2565,97 @@ mod round420_field_parallel_tests {
             }
             cut += 32; // word-multiple stride keeps the sweep bounded
         }
+    }
+}
+
+#[cfg(test)]
+mod round420_pair_len_lut_tests {
+    //! Round-420 soundness guard for the scan-side pair-length LUTs
+    //! (`tables::build_pair_len_lut`): a non-zero entry claims that
+    //! EVERY 32-bit window sharing the entry's 16-bit prefix decodes
+    //! its next two codewords to that exact combined length. Verify
+    //! the claim against the production `decode_pair` /
+    //! `decode_one` walk across randomised low window bits, for all
+    //! four (first, second) slot pairs the scanners consume, on both
+    //! the v1.x compiled-in tables and a histogram-derived CustomV2
+    //! set (whose code lengths differ per slot).
+
+    use super::*;
+    use crate::tables::{build_pair_len_lut, decode_one, decode_pair};
+
+    fn check_pair(a: &HuffTable, b: &HuffTable, label: &str) {
+        let lut = build_pair_len_lut(a, b);
+        let mut s: u32 = 0x0420_5eed;
+        for (p, &sum) in lut.iter().enumerate() {
+            if sum == 0 {
+                continue;
+            }
+            for _ in 0..4 {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let w = ((p as u32) << 16) | (s & 0xFFFF);
+                // Reference: the exact two-symbol walk the decoder
+                // (and the scanner's fallback) performs.
+                let n = if let Some((_, _, n)) = decode_pair(a, b, w) {
+                    n
+                } else {
+                    let (_, l0) = decode_one(a, w).expect("code A must decode");
+                    // Second window after consuming l0 bits: low bits
+                    // beyond the 32-bit window are unknown to this
+                    // test, but sum ≤ 16 guarantees code B lies inside
+                    // the first 16 bits, so shifting w suffices.
+                    let (_, l1) = decode_one(b, w << l0).expect("code B must decode within window");
+                    (l0 + l1) as u32
+                };
+                assert_eq!(
+                    n,
+                    sum as u32,
+                    "{label}: prefix 0x{p:04x} low 0x{:04x}: LUT sum {sum} vs walk {n}",
+                    w & 0xFFFF
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round420_pair_len_lut_sound_v1x_tables() {
+        let yuv = table_cache::v1x_tables(PixelFamily::Yuy2).expect("tables");
+        check_pair(&yuv.slot1, &yuv.slot2, "v1x yuv s1s2");
+        check_pair(&yuv.slot1, &yuv.slot3, "v1x yuv s1s3");
+        let rgb = table_cache::v1x_tables(PixelFamily::Rgb24).expect("tables");
+        check_pair(&rgb.slot2, &rgb.slot1, "v1x rgb s2s1");
+        check_pair(&rgb.slot3, &rgb.slot3, "v1x rgb s3s3");
+    }
+
+    #[test]
+    fn round420_pair_len_lut_sound_custom_tables() {
+        use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+        use crate::header::Method;
+        // A CustomV2 encode derives per-channel tables from the frame
+        // histograms — three genuinely distinct codebooks.
+        let mut s: u32 = 0xBEEF_0042;
+        let mut pixels = vec![0u8; 64 * 300 * 2];
+        for slot in pixels.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        let (strf, _) = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            Method::Median,
+            64,
+            300,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&strf).expect("parse");
+        let tables = build_three_tables(&cfg).expect("tables");
+        check_pair(&tables.slot1, &tables.slot2, "custom s1s2");
+        check_pair(&tables.slot1, &tables.slot3, "custom s1s3");
+        check_pair(&tables.slot2, &tables.slot1, "custom s2s1");
+        check_pair(&tables.slot3, &tables.slot3, "custom s3s3");
     }
 }

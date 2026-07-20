@@ -942,6 +942,53 @@ pub fn decode_pair(a: &HuffTable, b: &HuffTable, window: u32) -> Option<(u8, u8,
     Some(((slot_a & 0xFF) as u8, (slot_b & 0xFF) as u8, l1 + l2))
 }
 
+/// Round-420 pair-LENGTH LUT for the interlaced split scanner: maps
+/// the top 16 window bits to the combined bit length of the next TWO
+/// codewords (first from `a`, second from `b`), or `0` when the pair
+/// cannot be resolved from 16 known bits alone.
+///
+/// The scanner (`decoder::scan_field`) only needs cumulative bit
+/// length — never symbols — so one 8-bit load can replace
+/// [`decode_pair`]'s serialized load-A → shift → load-B chain on its
+/// critical path.
+///
+/// Soundness: entry `p` is non-zero only when, for EVERY 32-bit
+/// window whose top 16 bits equal `p`, the two codewords decode to
+/// the same combined length `l1 + l2`:
+///
+/// - code A resolves from `a`'s primary LUT at index `p` (fast hit ⇒
+///   `l1 ≤ 16`, fully determined by the known bits);
+/// - code B is looked up at the zero-completed shifted index; the
+///   result is trusted only when `l1 + l2 ≤ 16`, i.e. code B lies
+///   entirely inside the 16 known bits — any completion of the
+///   unknown low bits indexes a LUT slot with the same leading code
+///   bits and therefore the same `(symbol, length)`.
+///
+/// Everything else (either lookup overflowing, or the pair straddling
+/// bit 16) stays `0` and the scanner falls back to the exact
+/// [`decode_pair`] / [`decode_one`] path. 64 KiB per table pair,
+/// built lazily once per stream behind the round-419 table cache.
+pub(crate) fn build_pair_len_lut(a: &HuffTable, b: &HuffTable) -> Box<[u8]> {
+    let mut sums = vec![0u8; 65536].into_boxed_slice();
+    for (p, slot) in sums.iter_mut().enumerate() {
+        let slot_a = a.primary_lut[p];
+        if slot_a == PRIMARY_LUT_OVERFLOW {
+            continue;
+        }
+        let l1 = (slot_a >> 8) as u32;
+        let w = (p as u32) << 16;
+        let slot_b = b.primary_lut[((w << l1) >> 16) as usize];
+        if slot_b == PRIMARY_LUT_OVERFLOW {
+            continue;
+        }
+        let l2 = (slot_b >> 8) as u32;
+        if l1 + l2 <= 16 {
+            *slot = (l1 + l2) as u8;
+        }
+    }
+    sums
+}
+
 /// Long-code slow path: walks the precomputed [`HuffTable::overflow_entries`]
 /// (round 91) — a flat slice of only the codes with length > 16, with
 /// their masks already computed. Replaces the round-7 256-entry scan
