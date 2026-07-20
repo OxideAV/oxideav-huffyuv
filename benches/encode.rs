@@ -27,7 +27,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use oxideav_huffyuv::{
-    encode_frame_auto, encode_frame_with_mode, ExtradataMode, Method, MethodSelection, PixelFamily,
+    encode_frame_auto, encode_frame_with_mode, encode_frame_with_mode_workers, ExtradataMode,
+    Method, MethodSelection, PixelFamily,
 };
 
 fn xorshift_byte(state: &mut u32) -> u8 {
@@ -356,6 +357,54 @@ fn bench_yuy2_1280x720_auto_custom(c: &mut Criterion) {
     );
 }
 
+/// Round-420 worker-scaling gates: 1 vs 2 workers on interlaced HD
+/// encodes (`encode_frame_with_mode_workers`). Unlike decode, encode
+/// has no split-finding prefix (each field packs into its own buffer
+/// and the buffers concatenate), so both the residual phase and the
+/// emit phase parallelise fully — these gates read as the ceiling of
+/// the crate's ExecutionContext scaling.
+fn bench_hd_interlaced_encode_worker_scaling(c: &mut Criterion) {
+    for (name, family, method) in [
+        (
+            "encode_workers_yuy2_1280x720_left_classic",
+            PixelFamily::Yuy2,
+            Method::Left,
+        ),
+        (
+            "encode_workers_yuy2_1280x720_median_classic",
+            PixelFamily::Yuy2,
+            Method::Median,
+        ),
+        (
+            "encode_workers_rgb32_1280x720_gradient_decorr_classic",
+            PixelFamily::Rgb32,
+            Method::GradientDecorr,
+        ),
+    ] {
+        let (w, h) = (1280u32, 720u32);
+        let pixels = build_pixels(w as usize, h as usize, bytes_per_pixel(family));
+        let mut g = c.benchmark_group(name);
+        g.throughput(Throughput::Bytes(pixels.len() as u64));
+        for workers in [1usize, 2] {
+            g.bench_function(BenchmarkId::from_parameter(format!("{workers}w")), |b| {
+                b.iter(|| {
+                    encode_frame_with_mode_workers(
+                        family,
+                        method,
+                        w,
+                        h,
+                        criterion::black_box(&pixels),
+                        ExtradataMode::ClassicV2,
+                        workers,
+                    )
+                    .expect("encode")
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
 criterion_group!(
     benches,
     bench_yuy2_320x240_left_classic,
@@ -376,5 +425,6 @@ criterion_group!(
     bench_rgb24_320x240_auto_custom,
     bench_rgb24_1280x720_left_decorr_classic,
     bench_yuy2_1280x720_auto_custom,
+    bench_hd_interlaced_encode_worker_scaling,
 );
 criterion_main!(benches);
