@@ -62,7 +62,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use oxideav_huffyuv::{
-    decode_frame, encode_frame_with_mode, ExtradataMode, Method, PixelFamily, StreamConfig,
+    decode_frame, decode_frame_with_workers, encode_frame_with_mode, ExtradataMode, Method,
+    PixelFamily, StreamConfig,
 };
 
 /// Cheap deterministic xorshift32 — synthesises "natural-ish" per-pixel
@@ -302,6 +303,59 @@ fn bench_rgb32_1280x720_gradient_decorr_classic(c: &mut Criterion) {
     );
 }
 
+/// Round-420 worker-scaling gates: 1 vs 2 workers on interlaced HD
+/// streams (`decode_frame_with_workers`). The budget-1 arm routes
+/// through the identical serial path `decode_frame` takes, so the
+/// pair reads directly as the field-parallel win. Three gates:
+///
+/// - **yuy2 720p LEFT** — entropy-dominated; the win is bounded by
+///   the split-scan prefix (the wire carries no bottom-field offset,
+///   so the second worker can only start after the top field's
+///   codeword stream has been length-scanned).
+/// - **yuy2 720p MEDIAN** — adds the serial per-byte median inverse,
+///   the heaviest predictor pass; best case for the parallel path.
+/// - **rgb32 720p GradientDecorr** — wide-stride family with decorr +
+///   gradient post-passes (the r419 HD RGB gate, now under budget 2).
+fn bench_hd_interlaced_worker_scaling(c: &mut Criterion) {
+    for (name, family, method) in [
+        (
+            "decode_workers_yuy2_1280x720_left_classic",
+            PixelFamily::Yuy2,
+            Method::Left,
+        ),
+        (
+            "decode_workers_yuy2_1280x720_median_classic",
+            PixelFamily::Yuy2,
+            Method::Median,
+        ),
+        (
+            "decode_workers_rgb32_1280x720_gradient_decorr_classic",
+            PixelFamily::Rgb32,
+            Method::GradientDecorr,
+        ),
+    ] {
+        let (w, h) = (1280u32, 720u32);
+        let (cfg, frame) = make_decode_input(family, method, w, h, ExtradataMode::ClassicV2);
+        let mut g = c.benchmark_group(name);
+        g.throughput(Throughput::Bytes(
+            (w as u64) * (h as u64) * bytes_per_pixel(family) as u64,
+        ));
+        for workers in [1usize, 2] {
+            g.bench_function(BenchmarkId::from_parameter(format!("{workers}w")), |b| {
+                b.iter(|| {
+                    decode_frame_with_workers(
+                        criterion::black_box(&cfg),
+                        criterion::black_box(&frame),
+                        workers,
+                    )
+                    .expect("decode")
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
 criterion_group!(
     benches,
     bench_yuy2_320x240_left_classic,
@@ -316,5 +370,6 @@ criterion_group!(
     bench_yuy2_320x320_left_interlaced,
     bench_rgb24_320x320_left_decorr_interlaced,
     bench_rgb32_1280x720_gradient_decorr_classic,
+    bench_hd_interlaced_worker_scaling,
 );
 criterion_main!(benches);
