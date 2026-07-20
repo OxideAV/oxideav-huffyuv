@@ -32,8 +32,8 @@
 //! and paste the emitted table over `EXPECTED` / `EXPECTED_AUTO`.
 
 use oxideav_huffyuv::{
-    decode_frame, encode_frame_auto, encode_frame_with_mode, ExtradataMode, Method,
-    MethodSelection, PixelFamily, StreamConfig,
+    decode_frame, decode_frame_with_workers, encode_frame_auto, encode_frame_with_mode,
+    ExtradataMode, Method, MethodSelection, PixelFamily, StreamConfig,
 };
 
 /// FNV-1a 64-bit — dependency-free, deterministic across platforms.
@@ -601,6 +601,53 @@ fn golden_pins_full_matrix() {
             *frame_hash, *exp_frame,
             "{scenario}: frame wire bytes changed (golden pin violation)"
         );
+    }
+}
+
+/// Round-420 worker-budget invariance over the golden-pin matrix.
+///
+/// The two-worker interlaced decode path (`decode_frame_with_workers`
+/// with budget ≥ 2) must reproduce the serial decode byte-for-byte on
+/// EVERY interlaced golden pin — same wire bytes in (the pinned
+/// encoder output; wire hashes are asserted by
+/// `golden_pins_full_matrix`), same raster out. Progressive pins are
+/// exercised too: for them any budget must be a strict no-op (single
+/// work unit). Together with the r419 pins this locks the round-420
+/// threading work at "zero wire change, zero output change".
+#[test]
+fn golden_pins_budget2_decode_invariance() {
+    for family in FAMILIES {
+        for &method in legal_methods(family) {
+            for mode in MODES {
+                for (w, h) in SIZES {
+                    let scenario = format!(
+                        "{}/{}/{}/{}x{}",
+                        family_name(family),
+                        method_name(method),
+                        mode_name(mode),
+                        w,
+                        h
+                    );
+                    let pixels = build_pixels(w as usize, h as usize, bpp(family));
+                    let (strf, frame) = encode_frame_with_mode(family, method, w, h, &pixels, mode)
+                        .unwrap_or_else(|e| panic!("{scenario}: encode failed: {e:?}"));
+                    let cfg = StreamConfig::parse_bitmapinfoheader(&strf)
+                        .unwrap_or_else(|e| panic!("{scenario}: parse failed: {e:?}"));
+                    let serial = decode_frame(&cfg, &frame)
+                        .unwrap_or_else(|e| panic!("{scenario}: serial decode failed: {e:?}"));
+                    let budget2 = decode_frame_with_workers(&cfg, &frame, 2)
+                        .unwrap_or_else(|e| panic!("{scenario}: budget-2 decode failed: {e:?}"));
+                    assert_eq!(
+                        serial.pixels, budget2.pixels,
+                        "{scenario}: budget-2 decode diverged from serial"
+                    );
+                    assert_eq!(
+                        budget2.pixels, pixels,
+                        "{scenario}: budget-2 decode is not lossless"
+                    );
+                }
+            }
+        }
     }
 }
 
