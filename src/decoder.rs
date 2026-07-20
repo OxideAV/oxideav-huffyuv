@@ -43,11 +43,49 @@ pub struct DecodedFrame {
 /// its own H/2-tall frame, then interleave rows back into a single
 /// `height`-row raster.
 pub fn decode_frame(config: &StreamConfig, frame_bytes: &[u8]) -> Result<DecodedFrame> {
+    decode_frame_with_workers(config, frame_bytes, 1)
+}
+
+/// Decode one HuffYUV frame under an explicit worker budget.
+///
+/// `worker_budget` is the caller's advisory thread cap, in the sense of
+/// the `oxideav-core` `ExecutionContext` threading contract: the codec
+/// runs serial until told otherwise, and every internal fan-out is
+/// bounded by `budget.min(work_units).max(1)`. This crate's only
+/// independent work units are the two fields of an interlaced stream
+/// (spec/02 §2: each field is coded independently — own uncompressed
+/// seed, own bit-packed body — with the two per-field streams
+/// concatenated on the wire), so:
+///
+/// - `worker_budget <= 1`, or a progressive stream: exactly the
+///   [`decode_frame`] serial code path. Byte-identical output.
+/// - `worker_budget >= 2` AND the stream is interlaced (with a
+///   non-empty bottom field): the two fields are decoded on two
+///   parallel workers via [`decode_frame_interlaced_parallel`]. The
+///   output is byte-identical to the serial path (regression-guarded
+///   by the round-420 invariance tests + the r419 golden pins).
+///
+/// The registry `Decoder` routes its stored `ExecutionContext` budget
+/// here; direct-API callers can pass a budget explicitly. Budgets
+/// above 2 are clamped — there is no third independent unit to feed.
+pub fn decode_frame_with_workers(
+    config: &StreamConfig,
+    frame_bytes: &[u8],
+    worker_budget: usize,
+) -> Result<DecodedFrame> {
     let three_tables = build_three_tables(config)?;
     // Honour the extradata interlace_flag (BIH +0x2A) when set, falling
     // back to the biHeight > 288 heuristic otherwise — see
     // `StreamConfig::is_interlaced`.
     if config.is_interlaced() {
+        // Two independently-coded fields = two parallelisable work
+        // units. Inline worker clamp per the ExecutionContext
+        // threading contract — `threads.min(units).max(1)`, written
+        // as `clamp(1, units)` with `units = 2`.
+        let workers = worker_budget.clamp(1, 2);
+        if workers >= 2 {
+            return decode_frame_interlaced_parallel(config, frame_bytes, &three_tables);
+        }
         return decode_frame_interlaced(config, frame_bytes, &three_tables);
     }
     decode_field(
@@ -117,6 +155,99 @@ fn decode_frame_interlaced(
     })
 }
 
+/// Round-420 two-worker interlaced decode.
+///
+/// The two fields of an interlaced stream are coded independently
+/// (own seed, own bit stream), but the wire carries **no bottom-field
+/// offset**: the bottom field starts at the top field's word-rounded
+/// consumed-byte count, which is only known after walking the top
+/// field's variable-length codeword stream. Field-parallel decode
+/// therefore needs a split-finding prefix:
+///
+/// - **Worker (spawned):** full top-field decode, started immediately
+///   at t=0 — it never waits on the split.
+/// - **Caller thread:** runs [`scan_field`] over the top field — a
+///   bit-exact *length-only* walk of the same codeword stream (same
+///   tables, same slot order, same `BitReader`, no pixel stores, no
+///   predictor passes, no output allocation) — to recover the split
+///   point, then decodes the bottom field from there.
+///
+/// Wall clock goes from `top + bottom` to `max(top, scan + bottom)`;
+/// the scan is cheaper than a full field decode (no raster writes, no
+/// predictor inverse), so the parallel path wins whenever the fields
+/// carry real work. Output and error behaviour are identical to the
+/// serial path: the scan consumes bit-for-bit what the top-field
+/// decode consumes (including `decode_one` failures on invalid
+/// windows, which surface identically), the split is clamped to the
+/// chunk length exactly like the serial path, and the top field's
+/// result is inspected first so a malformed top field reports the
+/// same error the serial path reports.
+fn decode_frame_interlaced_parallel(
+    config: &StreamConfig,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<DecodedFrame> {
+    let h = config.height as usize;
+    let top_h = h.div_ceil(2) as u32;
+    let bot_h = (h / 2) as u32;
+    if bot_h == 0 {
+        // Single-field degenerate (forced-interlaced height 1): no
+        // second unit to parallelise; keep the serial path.
+        return decode_frame_interlaced(config, frame_bytes, tables);
+    }
+    let family = config.family;
+    let predictor = config.method.predictor();
+    let decorrelate = config.method.decorrelate();
+    let width = config.width;
+    let (top_joined, bot_result) = std::thread::scope(|s| {
+        let top_handle = s.spawn(|| {
+            decode_field(
+                family,
+                predictor,
+                decorrelate,
+                width,
+                top_h,
+                frame_bytes,
+                tables,
+            )
+        });
+        // Same clamp as the serial path: a malformed/truncated top
+        // field can push the scan cursor past the end of the chunk;
+        // the bottom field then sees the (possibly empty) remainder
+        // and its own length guard rejects it cleanly.
+        let bot_result = scan_field(family, decorrelate, width, top_h, frame_bytes, tables)
+            .and_then(|top_consumed| {
+                let split = top_consumed.min(frame_bytes.len());
+                decode_field(
+                    family,
+                    predictor,
+                    decorrelate,
+                    width,
+                    bot_h,
+                    &frame_bytes[split..],
+                    tables,
+                )
+            });
+        (top_handle.join(), bot_result)
+    });
+    let (top_frame, _top_consumed) = match top_joined {
+        Ok(res) => res?,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    let (bot_frame, _bot_consumed) = bot_result?;
+    // Round-261: single source of truth (`StreamConfig::row_bytes`)
+    // for the family → wire-stride dispatch; spec/02 §3 wire-byte
+    // layout table.
+    let row_bytes = config.row_bytes();
+    let merged = interleave_fields(&top_frame.pixels, &bot_frame.pixels, row_bytes, h);
+    Ok(DecodedFrame {
+        family: config.family,
+        width: config.width,
+        height: config.height,
+        pixels: merged,
+    })
+}
+
 /// Decode one field (or one full progressive frame).  Returns the
 /// reconstructed pixels plus the byte count consumed from
 /// `frame_bytes` (used by the interlaced path to find the start of
@@ -139,6 +270,193 @@ fn decode_field(
             decode_rgb32_field(predictor, decorrelate, width, height, frame_bytes, tables)
         }
     }
+}
+
+/// Round-420 split scanner: walk one field's entropy stream and
+/// return the byte count `decode_field` would report as consumed —
+/// WITHOUT reconstructing pixels, running predictor inverses, or
+/// allocating an output raster.
+///
+/// This is the split-finding prefix of the two-worker interlaced
+/// path: the wire carries no bottom-field offset, so the caller
+/// thread scans the top field's codeword stream to learn where the
+/// bottom field's seed starts while a second worker performs the full
+/// top-field decode in parallel.
+///
+/// Bit-exactness contract (guarded by the round-420 scan-equivalence
+/// tests): for every input on which `decode_field` succeeds, the scan
+/// consumes the identical bit count — it replicates the per-family
+/// dimension guards, the slot order of every codeword (spec/02 §3 /
+/// spec/03 §1.4 wire cycles), and the shared `BitReader` word-rounded
+/// [`BitReader::bytes_consumed`] tail — and for every input on which
+/// `decode_field` fails inside the entropy loop, the scan fails with
+/// the same error. (`decode_field` errors that fire *after* the
+/// entropy loop — the RGB median-illegal check — are not replicated
+/// here; the parallel caller surfaces them from the top-field decode
+/// result, which it inspects first.)
+///
+/// The predictor never affects the bit stream (spec/02 §5: byte
+/// ordering, channel-table assignment and bit packing are
+/// predictor-independent), so the scanner takes no `Predictor`.
+fn scan_field(
+    family: PixelFamily,
+    decorrelate: bool,
+    width: u32,
+    height: u32,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<usize> {
+    match family {
+        PixelFamily::Yuy2 => scan_yuy2_field(width, height, frame_bytes, tables),
+        PixelFamily::Rgb24 | PixelFamily::Rgb32 => {
+            scan_rgb_field(family, decorrelate, width, height, frame_bytes, tables)
+        }
+    }
+}
+
+/// YUY2 arm of [`scan_field`]. Mirrors `decode_yuy2_field`'s guards
+/// and its macropixel-step entropy loop (slot cycle `+0 → slot1,
+/// +1 → slot2, +2 → slot1, +3 → slot3`; paired window reads with the
+/// sequential long-code fallback) with the stores elided.
+fn scan_yuy2_field(
+    width: u32,
+    height: u32,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<usize> {
+    let width_us = width as usize;
+    let height_us = height as usize;
+    if width_us % 2 != 0 {
+        return Err(Error::invalid("YUY2 width must be even"));
+    }
+    let row_bytes = PixelFamily::Yuy2.row_bytes(width);
+    let total_bytes = row_bytes * height_us;
+    if total_bytes < 4 {
+        return Err(Error::invalid(
+            "YUY2 frame: degenerate dimensions (need ≥ 1 macropixel)",
+        ));
+    }
+    if frame_bytes.len() < 4 {
+        return Err(Error::invalid(
+            "YUY2 frame: missing 4-byte uncompressed pixel",
+        ));
+    }
+    let mut reader = BitReader::new(&frame_bytes[4..]);
+    let body_end = total_bytes - ((total_bytes - 4) & 3);
+    let mut byte_idx = 4usize;
+    while byte_idx < body_end {
+        // (Y₁ → slot1, U → slot2)
+        let w = reader.peek_window();
+        if let Some((_, _, n)) = decode_pair(&tables.slot1, &tables.slot2, w) {
+            reader.consume_bits_trusted(n);
+        } else {
+            let (_, len_y1) = decode_one(&tables.slot1, w)?;
+            reader.consume_bits_trusted(len_y1 as u32);
+            let (_, len_u) = decode_one(&tables.slot2, reader.peek_window())?;
+            reader.consume_bits_trusted(len_u as u32);
+        }
+        // (Y₂ → slot1, V → slot3)
+        let w = reader.peek_window();
+        if let Some((_, _, n)) = decode_pair(&tables.slot1, &tables.slot3, w) {
+            reader.consume_bits_trusted(n);
+        } else {
+            let (_, len_y2) = decode_one(&tables.slot1, w)?;
+            reader.consume_bits_trusted(len_y2 as u32);
+            let (_, len_v) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits_trusted(len_v as u32);
+        }
+        byte_idx += 4;
+    }
+    // Scalar fall-through mirror of the decode loop's 1..=3-byte tail
+    // (unreachable for in-spec YUY2 input; kept so the scan stays
+    // bit-exact even on unforeseen future layouts).
+    while byte_idx < total_bytes {
+        let slot = match byte_idx % 4 {
+            0 | 2 => &tables.slot1,
+            1 => &tables.slot2,
+            _ => &tables.slot3,
+        };
+        let (_, len) = decode_one(slot, reader.peek_window())?;
+        reader.consume_bits_trusted(len as u32);
+        byte_idx += 1;
+    }
+    Ok(4 + reader.bytes_consumed())
+}
+
+/// RGB arm of [`scan_field`], shared between RGB24 and RGB32.
+/// Mirrors `decode_rgb24_field` / `decode_rgb32_field`: the same
+/// dimension guards (via the same saturating
+/// [`PixelFamily::row_bytes`] accessor), the same mode-resolved
+/// first-two-position slot binding (spec/03 §1.4: `B, G` no-decorr /
+/// `G, B−G` decorr), position +2 (R / R−G) via slot3, and — RGB32
+/// only — position +3 (A) via slot3.
+fn scan_rgb_field(
+    family: PixelFamily,
+    decorrelate: bool,
+    width: u32,
+    height: u32,
+    frame_bytes: &[u8],
+    tables: &ThreeTables,
+) -> Result<usize> {
+    debug_assert!(matches!(family, PixelFamily::Rgb24 | PixelFamily::Rgb32));
+    let is_rgb32 = matches!(family, PixelFamily::Rgb32);
+    let width_us = width as usize;
+    let height_us = height as usize;
+    let row_bytes = family.row_bytes(width);
+    let total_bytes = row_bytes * height_us;
+    if is_rgb32 {
+        if total_bytes < 4 {
+            return Err(Error::invalid(
+                "RGB32 frame: degenerate dimensions (need ≥ 1 pixel)",
+            ));
+        }
+    } else if total_bytes < 3 {
+        return Err(Error::invalid(
+            "RGB24 frame: degenerate dimensions (need ≥ 1 pixel)",
+        ));
+    }
+    if frame_bytes.len() < 4 {
+        return Err(Error::invalid(if is_rgb32 {
+            "RGB32 frame: missing 4-byte uncompressed pixel"
+        } else {
+            "RGB24 frame: missing 4-byte uncompressed pixel"
+        }));
+    }
+    let mut reader = BitReader::new(&frame_bytes[4..]);
+    let (s_w0, s_w1) = if decorrelate {
+        (&tables.slot2, &tables.slot1)
+    } else {
+        (&tables.slot1, &tables.slot2)
+    };
+    let n_pixels = width_us * height_us;
+    for _px in 1..n_pixels {
+        let w = reader.peek_window();
+        if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
+            reader.consume_bits_trusted(n);
+        } else {
+            let (_, l0) = decode_one(s_w0, w)?;
+            reader.consume_bits_trusted(l0 as u32);
+            let (_, l1) = decode_one(s_w1, reader.peek_window())?;
+            reader.consume_bits_trusted(l1 as u32);
+        }
+        if !is_rgb32 {
+            let (_, l2) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits_trusted(l2 as u32);
+        } else {
+            // Wire positions +2 (R or R−G) and +3 (A) both use the
+            // slot-3 codebook (spec/03 §1.2; alpha shares slot 3).
+            let w = reader.peek_window();
+            if let Some((_, _, n)) = decode_pair(&tables.slot3, &tables.slot3, w) {
+                reader.consume_bits_trusted(n);
+            } else {
+                let (_, l2) = decode_one(&tables.slot3, w)?;
+                reader.consume_bits_trusted(l2 as u32);
+                let (_, l3) = decode_one(&tables.slot3, reader.peek_window())?;
+                reader.consume_bits_trusted(l3 as u32);
+            }
+        }
+    }
+    Ok(4 + reader.bytes_consumed())
 }
 
 /// The three per-channel-slot Huffman tables (spec/03 §1.2 slot
@@ -1835,6 +2153,332 @@ mod round277_rgb_decode_binding_tests {
             assert_eq!(ref_pixels, pixels, "ref body must round-trip identically");
             let prod = decode_frame(&cfg, &frame).expect("decode");
             assert_eq!(prod.pixels, pixels, "production decode must round-trip");
+        }
+    }
+}
+
+#[cfg(test)]
+mod round420_field_parallel_tests {
+    //! Round-420 regression guard for the two-worker interlaced decode
+    //! path (`decode_frame_with_workers` / `scan_field`).
+    //!
+    //! Two invariants are pinned:
+    //!
+    //! 1. **Scan bit-exactness.** [`super::scan_field`] must report the
+    //!    identical consumed-byte count [`super::decode_field`] reports
+    //!    for the same field bytes — the split point the parallel path
+    //!    hands to the bottom-field worker IS this value, so any drift
+    //!    would decode the bottom field from a garbage offset. Covered
+    //!    across the full (family, method, extradata-mode) matrix on
+    //!    progressive frames (a progressive frame is one field), on
+    //!    both fields of interlaced frames, and on the v1.x table path.
+    //! 2. **Budget invariance.** `decode_frame_with_workers(cfg, f, 2)`
+    //!    must produce byte-identical pixels to the serial
+    //!    `decode_frame` on every interlaced stream, including odd
+    //!    heights (unequal field heights) and forced-interlace tiny
+    //!    heights, and must fail (not panic, not diverge) exactly when
+    //!    the serial path fails on malformed input.
+
+    use super::*;
+    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::header::{Method, StreamConfig};
+
+    fn synth(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    fn bpp(family: PixelFamily) -> usize {
+        match family {
+            PixelFamily::Yuy2 => 2,
+            PixelFamily::Rgb24 => 3,
+            PixelFamily::Rgb32 => 4,
+        }
+    }
+
+    fn legal_methods(family: PixelFamily) -> &'static [Method] {
+        match family {
+            PixelFamily::Yuy2 => &[
+                Method::PredictOld,
+                Method::Left,
+                Method::Gradient,
+                Method::Median,
+            ],
+            PixelFamily::Rgb24 | PixelFamily::Rgb32 => &[
+                Method::PredictOld,
+                Method::Left,
+                Method::LeftDecorr,
+                Method::GradientDecorr,
+            ],
+        }
+    }
+
+    const FAMILIES: [PixelFamily; 3] = [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32];
+    const MODES: [ExtradataMode; 3] = [
+        ExtradataMode::ClassicV2,
+        ExtradataMode::CustomV2,
+        ExtradataMode::V1xCompat,
+    ];
+
+    /// Scan == decode consumed-bytes, progressive frames (one field),
+    /// full method/mode matrix.
+    #[test]
+    fn round420_scan_matches_decode_consumed_progressive_matrix() {
+        for family in FAMILIES {
+            for &method in legal_methods(family) {
+                for mode in MODES {
+                    // All widths even so the YUY2 macropixel guard is
+                    // satisfied for every family.
+                    for (w, h) in [(2u32, 2u32), (4, 4), (16, 3), (48, 32)] {
+                        let pixels = synth((w as usize) * (h as usize) * bpp(family), 0x0420_0001);
+                        let (bih, frame) =
+                            encode_frame_with_mode(family, method, w, h, &pixels, mode)
+                                .expect("encode");
+                        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+                        let tables = build_three_tables(&cfg).expect("tables");
+                        let (_, consumed) = decode_field(
+                            family,
+                            method.predictor(),
+                            method.decorrelate(),
+                            w,
+                            h,
+                            &frame,
+                            &tables,
+                        )
+                        .expect("decode_field");
+                        let scanned =
+                            scan_field(family, method.decorrelate(), w, h, &frame, &tables)
+                                .expect("scan_field");
+                        assert_eq!(
+                            scanned, consumed,
+                            "scan/decode consumed drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scan == decode consumed-bytes on BOTH fields of interlaced
+    /// frames (the split point itself, then the bottom field's tail).
+    #[test]
+    fn round420_scan_matches_decode_consumed_interlaced_fields() {
+        for family in FAMILIES {
+            for &method in legal_methods(family) {
+                // Odd height: top field is one row taller than bottom.
+                for (w, h) in [(32u32, 292u32), (16, 293)] {
+                    let pixels = synth((w as usize) * (h as usize) * bpp(family), 0x0420_0002);
+                    let (bih, frame) = encode_frame_with_mode(
+                        family,
+                        method,
+                        w,
+                        h,
+                        &pixels,
+                        ExtradataMode::ClassicV2,
+                    )
+                    .expect("encode");
+                    let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+                    assert!(cfg.is_interlaced(), "test premise: h > 288 is interlaced");
+                    let tables = build_three_tables(&cfg).expect("tables");
+                    let top_h = (h as usize).div_ceil(2) as u32;
+                    let bot_h = h / 2;
+                    let (_, top_consumed) = decode_field(
+                        family,
+                        method.predictor(),
+                        method.decorrelate(),
+                        w,
+                        top_h,
+                        &frame,
+                        &tables,
+                    )
+                    .expect("decode top");
+                    let top_scanned =
+                        scan_field(family, method.decorrelate(), w, top_h, &frame, &tables)
+                            .expect("scan top");
+                    assert_eq!(
+                        top_scanned, top_consumed,
+                        "top-field split drift: {family:?}/{method:?}/{w}x{h}"
+                    );
+                    let rest = &frame[top_consumed.min(frame.len())..];
+                    let (_, bot_consumed) = decode_field(
+                        family,
+                        method.predictor(),
+                        method.decorrelate(),
+                        w,
+                        bot_h,
+                        rest,
+                        &tables,
+                    )
+                    .expect("decode bot");
+                    let bot_scanned =
+                        scan_field(family, method.decorrelate(), w, bot_h, rest, &tables)
+                            .expect("scan bot");
+                    assert_eq!(
+                        bot_scanned, bot_consumed,
+                        "bottom-field consumed drift: {family:?}/{method:?}/{w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scan replicates decode_field's guard errors on degenerate
+    /// dimensions and truncated input.
+    #[test]
+    fn round420_scan_replicates_guard_errors() {
+        let tables = table_cache::v1x_tables(PixelFamily::Yuy2).expect("tables");
+        // Odd YUY2 width.
+        assert!(scan_field(PixelFamily::Yuy2, false, 3, 4, &[0u8; 64], &tables).is_err());
+        // Zero-height rasters.
+        assert!(scan_field(PixelFamily::Yuy2, false, 4, 0, &[0u8; 64], &tables).is_err());
+        // Input shorter than the 4-byte seed.
+        assert!(scan_field(PixelFamily::Yuy2, false, 4, 4, &[0u8; 3], &tables).is_err());
+        let rgb_tables = table_cache::v1x_tables(PixelFamily::Rgb24).expect("tables");
+        assert!(scan_field(PixelFamily::Rgb24, false, 4, 0, &[0u8; 64], &rgb_tables).is_err());
+        assert!(scan_field(PixelFamily::Rgb32, true, 0, 4, &[0u8; 64], &rgb_tables).is_err());
+        assert!(scan_field(PixelFamily::Rgb32, false, 4, 4, &[0u8; 2], &rgb_tables).is_err());
+    }
+
+    /// Budget-2 decode must be byte-identical to serial decode on
+    /// interlaced streams across the method/mode matrix, including an
+    /// odd interlaced height (top field one row taller).
+    #[test]
+    fn round420_workers2_matches_serial_interlaced_matrix() {
+        for family in FAMILIES {
+            for &method in legal_methods(family) {
+                for mode in MODES {
+                    for (w, h) in [(32u32, 292u32), (16, 293), (48, 289)] {
+                        let pixels = synth((w as usize) * (h as usize) * bpp(family), 0x0420_0003);
+                        let (bih, frame) =
+                            encode_frame_with_mode(family, method, w, h, &pixels, mode)
+                                .expect("encode");
+                        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+                        assert!(cfg.is_interlaced());
+                        let serial = decode_frame(&cfg, &frame).expect("serial decode");
+                        let parallel =
+                            decode_frame_with_workers(&cfg, &frame, 2).expect("parallel decode");
+                        assert_eq!(
+                            serial.pixels, parallel.pixels,
+                            "budget-2 divergence: {family:?}/{method:?}/{mode:?}/{w}x{h}"
+                        );
+                        assert_eq!(
+                            parallel.pixels, pixels,
+                            "budget-2 lossless drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Budgets 0 / 1 route through the serial path; budgets > 2 clamp
+    /// to the two field units. All must equal serial output.
+    #[test]
+    fn round420_budget_clamp_all_equal_serial() {
+        let (w, h) = (32u32, 292u32);
+        let pixels = synth((w as usize) * (h as usize) * 2, 0x0420_0004);
+        let (bih, frame) = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            Method::Median,
+            w,
+            h,
+            &pixels,
+            ExtradataMode::ClassicV2,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let serial = decode_frame(&cfg, &frame).expect("decode");
+        for budget in [0usize, 1, 2, 3, 8, 64] {
+            let out = decode_frame_with_workers(&cfg, &frame, budget).expect("decode");
+            assert_eq!(out.pixels, serial.pixels, "budget {budget} diverged");
+        }
+    }
+
+    /// Progressive streams ignore the budget entirely (single unit).
+    #[test]
+    fn round420_progressive_budget_is_noop() {
+        let (w, h) = (48u32, 32u32);
+        let pixels = synth((w as usize) * (h as usize) * 3, 0x0420_0005);
+        let (bih, frame) = encode_frame_with_mode(
+            PixelFamily::Rgb24,
+            Method::LeftDecorr,
+            w,
+            h,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let serial = decode_frame(&cfg, &frame).expect("decode");
+        let budgeted = decode_frame_with_workers(&cfg, &frame, 8).expect("decode");
+        assert_eq!(serial.pixels, budgeted.pixels);
+    }
+
+    /// Malformed interlaced input: the parallel path must fail exactly
+    /// when the serial path fails (same Ok/Err disposition, no panic),
+    /// mirroring `degenerate_dims_tests::interlaced_truncated_top_field_no_panic`.
+    #[test]
+    fn round420_workers2_truncated_matches_serial_disposition() {
+        let cfg = StreamConfig {
+            family: PixelFamily::Yuy2,
+            method: Method::Left,
+            width: 2,
+            height: 290,
+            has_extradata: false,
+            extradata_tables: Vec::new(),
+            interlace_flag: 0,
+        };
+        for len in [0usize, 3, 4, 5, 8, 16, 64] {
+            let frame = vec![0u8; len];
+            let serial = decode_frame(&cfg, &frame);
+            let parallel = decode_frame_with_workers(&cfg, &frame, 2);
+            match (&serial, &parallel) {
+                (Ok(a), Ok(b)) => assert_eq!(a.pixels, b.pixels, "len {len}: Ok pixels diverged"),
+                (Err(_), Err(_)) => {}
+                _ => panic!(
+                    "len {len}: serial/parallel disposition diverged: serial {}, parallel {}",
+                    if serial.is_ok() { "Ok" } else { "Err" },
+                    if parallel.is_ok() { "Ok" } else { "Err" },
+                ),
+            }
+        }
+    }
+
+    /// Truncated-mid-stream interlaced frames (cut at every word
+    /// boundary of a real stream) keep serial/parallel dispositions in
+    /// lockstep, and Ok outputs byte-identical.
+    #[test]
+    fn round420_workers2_word_truncation_sweep() {
+        let (w, h) = (16u32, 292u32);
+        let pixels = synth((w as usize) * (h as usize) * 2, 0x0420_0006);
+        let (bih, frame) = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            Method::Left,
+            w,
+            h,
+            &pixels,
+            ExtradataMode::ClassicV2,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+        let mut cut = 0usize;
+        while cut < frame.len() {
+            let sub = &frame[..cut];
+            let serial = decode_frame(&cfg, sub);
+            let parallel = decode_frame_with_workers(&cfg, sub, 2);
+            match (&serial, &parallel) {
+                (Ok(a), Ok(b)) => assert_eq!(a.pixels, b.pixels, "cut {cut}: pixels diverged"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("cut {cut}: serial/parallel disposition diverged"),
+            }
+            cut += 32; // word-multiple stride keeps the sweep bounded
         }
     }
 }

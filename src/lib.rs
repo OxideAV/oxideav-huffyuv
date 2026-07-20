@@ -67,7 +67,7 @@ pub mod tables;
 #[cfg(test)]
 mod roundtrip_tests;
 
-pub use crate::decoder::{decode_frame, DecodedFrame};
+pub use crate::decoder::{decode_frame, decode_frame_with_workers, DecodedFrame};
 pub use crate::encoder::{
     bit_cost_for_method, build_bitmapinfoheader, encode_frame, encode_frame_auto,
     encode_frame_with_mode, ExtradataMode, MethodSelection,

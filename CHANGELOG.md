@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 420: two-worker interlaced decode. New public
+  `decode_frame_with_workers(config, frame_bytes, worker_budget)`
+  decodes the two independently-coded fields of an interlaced stream
+  (spec/02 §2) on two parallel workers when the budget allows,
+  following the `oxideav-core` `ExecutionContext` threading contract
+  (serial until told otherwise; fan-out bounded by
+  `budget.min(units).max(1)` with `units = 2`). The wire carries no
+  bottom-field offset, so the caller thread first runs a bit-exact
+  length-only scan of the top field's codeword stream (same tables,
+  same slot order, same `BitReader`; no pixel stores, no predictor
+  passes) to find the split while a spawned worker performs the full
+  top-field decode — wall time drops from `top + bottom` to
+  `max(top, scan + bottom)`. Budget ≤ 1, progressive streams, and
+  empty-bottom-field degenerates keep the exact pre-existing serial
+  path; `decode_frame` is now a `worker_budget = 1` alias. Output is
+  byte-identical between budgets (guarded by a scan/decode
+  consumed-bytes equivalence matrix, a budget-invariance matrix over
+  every family/method/mode at even and odd interlaced heights, and
+  malformed-input disposition sweeps; no wire-format change).
+
 - Round 419: golden-output pin suite (`tests/golden_pins.rs`). Pins an
   FNV-1a-64 hash of the `strf` and frame wire bytes for the full legal
   matrix — 3 pixel families × every legal method × 3 extradata modes ×
