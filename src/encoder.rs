@@ -27,9 +27,7 @@ use crate::predict::{
     interlace_flag_for_height, is_interlaced_height,
 };
 use crate::tables::{
-    classic_blob_bytes, compute_canonical_lengths, rle_decode_one_channel,
-    rle_decode_three_channels, rle_encode_three_channels, v1x_codes_set_a, v1x_codes_set_b,
-    v1x_lengths_set_a, v1x_lengths_set_b, v1x_table_from_pair, HuffEntry, HuffTable,
+    classic_blob_bytes, compute_canonical_lengths, rle_encode_three_channels, HuffEntry, HuffTable,
 };
 
 /// Selects which BIH/extradata path the encoder writes.
@@ -115,39 +113,54 @@ fn encode_with_precomputed(
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let stats_body: &[u8] = &frame.combined_body;
 
-    let (extradata_tables, slot1, slot2, slot3, has_extradata): (
+    // Round-419: the ClassicV2 / V1xCompat table sets are pure
+    // functions of compiled-in bytes, so they come out of the decoder's
+    // shared `table_cache` (keyed by the same classic-blob bytes the
+    // extradata embeds / the same per-family v1.x `OnceLock`s) instead
+    // of being rebuilt — three `build_from_lengths` runs including the
+    // 64-Ki primary-LUT fill, which the round-419 `sample` profile
+    // attributed ~33% of a ClassicV2 320×240 encode to — or re-cloned
+    // (3 × 128-KiB LUT memcpy per V1xCompat frame) on every call. Only
+    // CustomV2 still builds per frame, since its tables derive from the
+    // frame's own histograms.
+    let (extradata_tables, tabs, has_extradata): (
         Vec<u8>,
-        HuffTable,
-        HuffTable,
-        HuffTable,
+        std::sync::Arc<crate::decoder::ThreeTables>,
         bool,
     ) = match mode {
         ExtradataMode::ClassicV2 => {
             let extra = classic_blob_bytes(family, method).to_vec();
-            let lengths = rle_decode_three_channels(&extra)?;
-            let s1 = HuffTable::build_from_lengths(&lengths[0])?;
-            let s2 = HuffTable::build_from_lengths(&lengths[1])?;
-            let s3 = HuffTable::build_from_lengths(&lengths[2])?;
-            (extra, s1, s2, s3, true)
+            let tabs = crate::decoder::table_cache::extradata_tables(&extra)?;
+            (extra, tabs, true)
         }
         ExtradataMode::CustomV2 => {
             let lengths = compute_lengths_from_body(family, method, stats_body);
-            let s1 = HuffTable::build_from_lengths(&lengths[0])?;
-            let s2 = HuffTable::build_from_lengths(&lengths[1])?;
-            let s3 = HuffTable::build_from_lengths(&lengths[2])?;
+            let tabs = std::sync::Arc::new(crate::decoder::ThreeTables {
+                slot1: HuffTable::build_from_lengths(&lengths[0])?,
+                slot2: HuffTable::build_from_lengths(&lengths[1])?,
+                slot3: HuffTable::build_from_lengths(&lengths[2])?,
+            });
             let extra = rle_encode_three_channels(&lengths)?;
-            (extra, s1, s2, s3, true)
+            (extra, tabs, true)
         }
         ExtradataMode::V1xCompat => {
-            let (s1, s2, s3) = build_v1x_tables(family)?;
+            let tabs = crate::decoder::table_cache::v1x_tables(family)?;
             // Verify residuals only use symbols that have non-zero
             // length in the v1.x codebooks — otherwise the wire would
             // be undecodable. (The classic v1.x sets cover all 256
             // symbols, so this is a belt-and-braces check.)
-            verify_body_in_table(family, method, stats_body, &s1, &s2, &s3)?;
-            (Vec::new(), s1, s2, s3, false)
+            verify_body_in_table(
+                family,
+                method,
+                stats_body,
+                &tabs.slot1,
+                &tabs.slot2,
+                &tabs.slot3,
+            )?;
+            (Vec::new(), tabs, false)
         }
     };
+    let (slot1, slot2, slot3) = (&tabs.slot1, &tabs.slot2, &tabs.slot3);
 
     let strf = build_bitmapinfoheader(
         family,
@@ -168,9 +181,9 @@ fn encode_with_precomputed(
             method,
             &frame.top_seed,
             &frame.combined_body[..frame.top_body_len],
-            &slot1,
-            &slot2,
-            &slot3,
+            slot1,
+            slot2,
+            slot3,
         )?;
         out.append(&mut top_bytes);
         if let Some(bot_seed) = frame.bot_seed_opt {
@@ -179,9 +192,9 @@ fn encode_with_precomputed(
                 method,
                 &bot_seed,
                 &frame.combined_body[frame.top_body_len..],
-                &slot1,
-                &slot2,
-                &slot3,
+                slot1,
+                slot2,
+                slot3,
             )?;
             out.append(&mut bot_bytes);
         }
@@ -192,9 +205,9 @@ fn encode_with_precomputed(
             method,
             &frame.top_seed,
             &frame.combined_body,
-            &slot1,
-            &slot2,
-            &slot3,
+            slot1,
+            slot2,
+            slot3,
         )?
     };
 
@@ -1206,40 +1219,6 @@ fn histogramise(
 /// proprietary's V1xCompat path (commonly used by AviSynth + VirtualDub
 /// pipelines that need to interop with the original binary) costs the
 /// LUT-build once at process start rather than per encode call.
-fn build_v1x_tables(family: PixelFamily) -> Result<(HuffTable, HuffTable, HuffTable)> {
-    use std::sync::OnceLock;
-    static YUY2_TABLES: OnceLock<Result<(HuffTable, HuffTable, HuffTable)>> = OnceLock::new();
-    static RGB_TABLES: OnceLock<Result<(HuffTable, HuffTable, HuffTable)>> = OnceLock::new();
-    let cell = match family {
-        PixelFamily::Yuy2 => &YUY2_TABLES,
-        PixelFamily::Rgb24 | PixelFamily::Rgb32 => &RGB_TABLES,
-    };
-    let cached = cell.get_or_init(|| build_v1x_tables_uncached(family));
-    match cached {
-        Ok((s1, s2, s3)) => Ok((s1.clone(), s2.clone(), s3.clone())),
-        Err(e) => Err(Error::invalid(format!("v1.x cache build failed: {e}"))),
-    }
-}
-
-fn build_v1x_tables_uncached(family: PixelFamily) -> Result<(HuffTable, HuffTable, HuffTable)> {
-    let mut cur: &[u8] = v1x_lengths_set_a();
-    let lens_a = rle_decode_one_channel(&mut cur)?;
-    let mut cur: &[u8] = v1x_lengths_set_b();
-    let lens_b = rle_decode_one_channel(&mut cur)?;
-    let codes_a_buf = v1x_codes_set_a();
-    let codes_b_buf = v1x_codes_set_b();
-    let mut codes_a = [0u8; 256];
-    codes_a.copy_from_slice(codes_a_buf);
-    let mut codes_b = [0u8; 256];
-    codes_b.copy_from_slice(codes_b_buf);
-    let table_a = v1x_table_from_pair(&lens_a, &codes_a)?;
-    let table_b = v1x_table_from_pair(&lens_b, &codes_b)?;
-    match family {
-        PixelFamily::Yuy2 => Ok((table_a, table_b.clone(), table_b)),
-        PixelFamily::Rgb24 | PixelFamily::Rgb32 => Ok((table_a.clone(), table_a.clone(), table_a)),
-    }
-}
-
 /// V1xCompat verification: walk the body in slot order and ensure
 /// each emitted symbol has a non-zero length in its slot's table.
 /// Round 5 takes `body: &[u8]` directly so the interlaced
@@ -2012,7 +1991,8 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
         // Build the v1.x YUY2 codebook triple and ask both the
         // production verify and the per-byte reference to walk a
         // synthetic body. Both must accept.
-        let (s1, s2, s3) = build_v1x_tables(PixelFamily::Yuy2).expect("v1x build");
+        let tabs = crate::decoder::table_cache::v1x_tables(PixelFamily::Yuy2).expect("v1x build");
+        let (s1, s2, s3) = (tabs.slot1.clone(), tabs.slot2.clone(), tabs.slot3.clone());
         let body: Vec<u8> = (0u8..64).collect();
         let prod = verify_body_in_table(PixelFamily::Yuy2, Method::Left, &body, &s1, &s2, &s3);
         let refr = ref_verify_body_in_table_yuy2_per_byte(&body, &s1, &s2, &s3);
@@ -2031,7 +2011,8 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
         // tests it against slot2). The production verify and the
         // per-byte reference must both reject, with the same error
         // text.
-        let (s1, s2, s3) = build_v1x_tables(PixelFamily::Yuy2).expect("v1x build");
+        let tabs = crate::decoder::table_cache::v1x_tables(PixelFamily::Yuy2).expect("v1x build");
+        let (s1, s2, s3) = (tabs.slot1.clone(), tabs.slot2.clone(), tabs.slot3.clone());
         // Pick a symbol that has length 0 in slot2's v1.x table. The
         // v1.x precomputed-code set B doesn't cover the full 256-
         // symbol space densely on every position, so we scan for an

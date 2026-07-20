@@ -92,6 +92,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   2.803 ms (−38%, ~630 MiB/s), auto-custom scenarios a further −20%
   to −22% on top of the package-merge win.
 
+- Round 419 (performance, output-invariant): the encoder shares the
+  decoder's built-tables cache. `encode_with_precomputed`'s ClassicV2
+  arm re-derived the three decode-grade `HuffTable`s (including the
+  64-Ki primary LUT the emit path never reads — ~33% of a ClassicV2
+  320×240 encode per the round-419 `sample` profile) on every frame,
+  and the V1xCompat arm cloned 3 × 128-KiB LUTs out of its private
+  `OnceLock` per call. Both now pull `Arc<ThreeTables>` from the
+  decoder's `table_cache` (ClassicV2 keyed by the same classic-blob
+  bytes it embeds as extradata, V1xCompat from the shared per-family
+  `OnceLock`s), so an encode→decode round trip builds each table set
+  once, total. CustomV2 still builds per frame (histogram-derived).
+  Measured (aarch64, Criterion, drift-controlled A/B): ClassicV2
+  encode −15% to −30% wall (e.g. `encode_yuy2_320x240_left_classic`
+  ~218 µs → ~148 µs, `encode_yuy2_320x240_median_classic` ~366 µs →
+  ~295 µs, `encode_rgb32_320x240_left_classic` ~576 µs → ~492 µs);
+  V1xCompat and auto-custom neutral within noise.
+
 ### Fixed
 
 - Round 382: the `CustomV2` RLE length-table encoder

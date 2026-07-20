@@ -144,10 +144,15 @@ fn decode_field(
 /// The three per-channel-slot Huffman tables (spec/03 §1.2 slot
 /// architecture). Slot 1 = Y / B / B-G; Slot 2 = U / G / G; Slot 3 =
 /// V / R / R-G (and reused for RGB32 alpha).
-struct ThreeTables {
-    slot1: HuffTable,
-    slot2: HuffTable,
-    slot3: HuffTable,
+///
+/// `pub(crate)` since round 419: the encoder's ClassicV2 / V1xCompat
+/// paths build the exact same three tables from the exact same bytes,
+/// so they share this struct and the [`table_cache`] below instead of
+/// re-deriving (and re-cloning 128-KiB LUTs) per encoded frame.
+pub(crate) struct ThreeTables {
+    pub(crate) slot1: HuffTable,
+    pub(crate) slot2: HuffTable,
+    pub(crate) slot3: HuffTable,
 }
 
 /// Round-419 decode-table cache.
@@ -178,7 +183,13 @@ struct ThreeTables {
 ///
 /// Both paths fall back to an uncached build on the (unreachable in
 /// practice) error branches so error semantics stay identical.
-mod table_cache {
+///
+/// Shared with the encoder (round 419): `encode_with_precomputed`'s
+/// ClassicV2 arm keys the same map by the same classic-blob bytes it
+/// embeds as extradata, and its V1xCompat arm uses the same per-family
+/// `OnceLock`s — so an encode→decode round trip builds each table set
+/// once, total.
+pub(crate) mod table_cache {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -192,7 +203,7 @@ mod table_cache {
     }
 
     /// v2.x: build-or-fetch the tables for one RLE table-bytes blob.
-    pub(super) fn extradata_tables(table_bytes: &[u8]) -> Result<Arc<ThreeTables>> {
+    pub(crate) fn extradata_tables(table_bytes: &[u8]) -> Result<Arc<ThreeTables>> {
         if let Ok(map) = extradata_cache().lock() {
             if let Some(hit) = map.get(table_bytes) {
                 return Ok(Arc::clone(hit));
@@ -214,7 +225,7 @@ mod table_cache {
     }
 
     /// v1.x: family-shaped compiled-in tables, built once per process.
-    pub(super) fn v1x_tables(family: PixelFamily) -> Result<Arc<ThreeTables>> {
+    pub(crate) fn v1x_tables(family: PixelFamily) -> Result<Arc<ThreeTables>> {
         static YUV: OnceLock<Option<Arc<ThreeTables>>> = OnceLock::new();
         static RGB: OnceLock<Option<Arc<ThreeTables>>> = OnceLock::new();
         let (cell, is_rgb) = match family {
