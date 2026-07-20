@@ -45,6 +45,14 @@ No external library source consulted.
   codes by canonical-Huffman construction, and ignores the RGB24 "X"
   pad byte's value (spec/02 §8 #2). A dedicated conformance suite pins
   both contracts.
+- **Two-worker interlaced decode** (round 420): the two
+  independently-coded fields decode on parallel workers when the
+  caller grants a thread budget ≥ 2 (`decode_frame_with_workers`, or
+  `ExecutionContext` through the registry `Decoder`). The wire
+  carries no bottom-field offset, so the second worker is fed by a
+  bit-exact length-only scan of the top field's codeword stream.
+  Serial by default; output byte-identical across budgets (golden-pin
+  invariance suite + fuzz differential oracle).
 
 ### Encode
 
@@ -74,6 +82,10 @@ No external library source consulted.
   `interlace_flag` byte (`0x10`/`0x20`) at BIH `+0x2A`.
 - **Interlaced encode** for `biHeight > 288`, walking the source
   raster with row-stride 2 into a single reused scratch field buffer.
+- **Two-worker interlaced encode** (round 420,
+  `encode_frame_with_mode_workers`): with a thread budget ≥ 2 the two
+  fields' residual and bit-pack phases run on parallel workers; wire
+  bytes stay byte-identical to the serial encoder.
 
 ### FourCCs
 
@@ -84,7 +96,12 @@ HuffYUV stream's `biCompression` straight through `CodecResolver`.
 ## Public API
 
 - `decode_frame(&StreamConfig, frame_bytes) -> Result<DecodedFrame>`
+- `decode_frame_with_workers(&StreamConfig, frame_bytes, worker_budget)`
+  — same output, field-parallel interlaced decode under an
+  `ExecutionContext`-style thread budget (`decode_frame` ≡ budget 1)
 - `encode_frame` / `encode_frame_with_mode` / `encode_frame_auto`
+- `encode_frame_with_mode_workers(..., worker_budget)` — budgeted
+  field-parallel interlaced encode, wire-identical to the serial path
 - `build_bitmapinfoheader`, `bit_cost_for_method`
 - `Method`, `PixelFamily`, `Predictor`, `StreamConfig`,
   `ExtradataMode`, `MethodSelection`
@@ -111,6 +128,14 @@ package-merge) YUY2-LEFT 320×240 decodes at ~0.64 ms/frame
 ~173–247 MiB/s and encode ~233 MiB/s–1.0 GiB/s across the matrix. All
 round-419 performance work is output-invariant, pinned by the 78-entry
 golden-hash suite in `tests/golden_pins.rs`.
+
+Round 420 adds `ExecutionContext`-budgeted field-parallel interlaced
+decode/encode: with 2 granted workers, interlaced 720p decode runs
+1.33–1.47× (e.g. YUY2 Left 7.91 → 5.47 ms via a pair-length-LUT
+split scan) and encode 1.72–1.99× (RGB32 GradientDecorr
+10.78 → 5.43 ms) over the unchanged serial walls — byte-identical
+output across budgets. See the worker-scaling table in
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Fuzzing
 

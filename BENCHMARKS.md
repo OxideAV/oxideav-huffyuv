@@ -40,6 +40,15 @@ The 320×288 (largest progressive raster, `height == 288` is NOT
 `decode_frame_interlaced` field-split overhead from the raster-size
 delta.
 
+Round 420 adds **worker-scaling gates** (1 vs 2 workers through
+`decode_frame_with_workers` / `encode_frame_with_mode_workers`) on
+three interlaced 1280×720 scenarios each:
+`{decode,encode}_workers_yuy2_1280x720_left_classic`,
+`…_yuy2_1280x720_median_classic`, and
+`…_rgb32_1280x720_gradient_decorr_classic`. The `1w` arm routes
+through the identical serial code path, so each pair reads directly
+as the field-parallel delta.
+
 **Encode** (`benches/encode.rs`) — symmetric v1.x / v2.x across all
 three families:
 
@@ -163,6 +172,44 @@ primary-LUT fill) is the new largest primitive. Decode/encode no
 longer pay `build_from_lengths` per frame at all outside CustomV2
 (built-tables cache).
 
+### Worker scaling (round 420)
+
+Round 420 added the `ExecutionContext`-gated two-worker interlaced
+paths (`decode_frame_with_workers` / `encode_frame_with_mode_workers`)
+plus the scan-side pair-length LUTs. Measured on the same aarch64 dev
+machine; the host was contended by sibling jobs during the r420
+session, so these are **min-of-80 wall times** (a min over many
+iterations approximates the uncontended wall far better than a mean
+under load — the 1-worker mins reproduce the r419 Criterion table
+within ~4%, e.g. 7.91 vs 7.62 ms YUY2-720p-Left decode, 17.90 vs
+17.2 ms RGB32-720p). The Criterion `*_workers_*` gates cover the same
+scenarios for future quiet-host runs.
+
+All scenarios interlaced 1280×720 ClassicV2, 1 → 2 workers:
+
+| direction | scenario                  | 1 worker | 2 workers | speedup |
+| --------- | ------------------------- | -------- | --------- | ------- |
+| decode    | yuy2 Left                 | 7.91 ms (222 MiB/s)  | 5.47 ms (321 MiB/s)  | **1.45×** |
+| decode    | yuy2 Median               | 9.81 ms (179 MiB/s)  | 6.69 ms (263 MiB/s)  | **1.47×** |
+| decode    | rgb32 GradientDecorr      | 17.90 ms (196 MiB/s) | 13.45 ms (261 MiB/s) | **1.33×** |
+| encode    | yuy2 Left                 | 2.95 ms (597 MiB/s)  | 1.59 ms (1.08 GiB/s) | **1.85×** |
+| encode    | yuy2 Median               | 4.82 ms (365 MiB/s)  | 2.79 ms (629 MiB/s)  | **1.72×** |
+| encode    | rgb32 GradientDecorr      | 10.78 ms (326 MiB/s) | 5.43 ms (648 MiB/s)  | **1.99×** |
+
+Reading the asymmetry: **encode scales near-perfectly** (no
+cross-field dependency — each field's residual + bit-pack lands in
+its own buffer, concatenated afterwards; the residual gather and the
+final `Vec` join are the only serial parts). **Decode is bounded by
+the split-scan prefix**: the wire carries no bottom-field offset, so
+the bottom worker starts only after a bit-exact length-only scan of
+the top field's codeword stream. The r420 pair-length LUTs (one
+8-bit load per two codewords when the pair fits in the 16 known
+window bits) cut that scan to well under half a field decode —
+before them the 2-worker decode wins were only 1.02× / 1.18× /
+1.04×. Serial (budget-1) walls are unchanged on every scenario, and
+all worker paths are byte-identical to serial (golden-pin invariance
+suites + fuzz differential oracles).
+
 ## Interpretation
 
 1. **Encode is no longer the cheap side by a small margin — it is
@@ -195,17 +242,21 @@ longer pay `build_from_lengths` per frame at all outside CustomV2
 
 **Primary (decode): amortise the per-symbol LUT dependency chain
 further.** After r419's pairing, each 2-symbol step still carries a
-serialized LUT-load → shift → LUT-load chain. The two candidate
-levers, in order of expected value: (a) a second-level pair LUT
-(16-bit window → both symbols + combined length in one load) built
-lazily behind the round-419 built-tables cache so its ~256-KiB/table
-cost is paid once per stream, not per frame; (b) decoding the two
-independent field bitstreams of an interlaced frame on two threads
-(the fields are independent by wire design — spec/02 §2 — so this is
-parallelism the format offers for free, but it needs a decision about
-threading policy in a decoder that is currently allocation-light and
-thread-free). Gate on `decode_yuy2_320x240_left_classic` and the
-1280×720 scenarios.
+serialized LUT-load → shift → LUT-load chain. The remaining lever:
+a second-level pair LUT (16-bit window → both symbols + combined
+length in one load) built lazily behind the round-419 built-tables
+cache so its ~256-KiB/table cost is paid once per stream, not per
+frame. Gate on `decode_yuy2_320x240_left_classic` and the 1280×720
+scenarios.
+
+*(Landed r420)* The r419 candidate lever (b) — decoding the two
+independent field bitstreams of an interlaced frame on two threads —
+shipped in round 420 behind the `ExecutionContext` budget
+(`decode_frame_with_workers`), with the caveat the r419 note didn't
+anticipate: the wire carries no bottom-field offset, so the second
+worker is fed by a bit-exact length-only scan of the top field
+(§ "Worker scaling (round 420)" below). Encode-side field parallelism
+(no such prefix needed) landed in the same round.
 
 **Secondary (encode, CustomV2 only): skip the dead 64-Ki primary-LUT
 fill.** CustomV2 still builds three decode-grade `HuffTable`s per
