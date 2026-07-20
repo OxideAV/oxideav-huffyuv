@@ -37,6 +37,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   197.8 MiB/s, +83%), `encode_rgb24_320x240_auto_custom` 1.967 ms →
   1.166 ms (111.7 → 188.5 MiB/s, +69%).
 
+- Round 419 (performance, output-invariant): decode-side Huffman-table
+  cache. `decode_frame` re-derived its three per-slot `HuffTable`s on
+  every call — three `build_from_lengths` runs (canonical assign +
+  64 Ki primary-LUT fill + overflow bake, ~25 µs each) on the v2.x
+  path, or two `v1x_table_from_pair` builds plus 128-KiB LUT clones on
+  the v1.x path — ~12% of a 320×240 frame decode, repeated per frame
+  of the same stream. The tables are a pure function of stream-fixed
+  bytes, so they are now cached: v2.x keyed by the exact RLE
+  extradata/classic-blob bytes in a bounded map (16 entries, cleared
+  wholesale on overflow — deterministic worst-case memory), v1.x in
+  per-family `OnceLock`s (compiled-in codebooks, built once per
+  process). Same tables, same outputs (golden pins + full suite).
+  Measured (aarch64, Criterion): 320-class decode scenarios −11% to
+  −21% wall (e.g. `decode_yuy2_320x240_left_classic` 657.9 µs →
+  579.3 µs, 222.7 → 252.9 MiB/s; `decode_yuy2_320x240_gradient_classic`
+  710.8 µs → 566.7 µs, +26% throughput; `decode_rgb24_320x240_left_decorr`
+  1.347 ms → 1.155 ms), 1280×720 −2.8% (table build amortises over the
+  larger raster).
+
 ### Fixed
 
 - Round 382: the `CustomV2` RLE length-table encoder

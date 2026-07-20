@@ -150,57 +150,132 @@ struct ThreeTables {
     slot3: HuffTable,
 }
 
-fn build_three_tables(config: &StreamConfig) -> Result<ThreeTables> {
+/// Round-419 decode-table cache.
+///
+/// `decode_frame` is stateless by design (the public contract takes a
+/// `&StreamConfig` per call), which meant every frame re-derived its
+/// three `HuffTable`s from scratch: three `build_from_lengths` calls
+/// (canonical code assign + 64 Ki-entry primary-LUT fill + overflow
+/// bake, ~25 µs each) on the v2.x path, or two `v1x_table_from_pair`
+/// builds plus 128-KiB LUT `clone`s on the v1.x path — ~12% of the
+/// whole 320×240 frame decode, paid again for every frame of the same
+/// stream even though the tables depend only on bytes that are fixed
+/// at stream-open time.
+///
+/// The tables are a pure function of their inputs, so the cache is
+/// output-invariant by construction:
+///
+/// - **v2.x** (extradata present): keyed by the exact RLE table bytes
+///   (the stream's own extradata region, or the classic blob the
+///   empty-region fallback substitutes). A bounded `HashMap` holds the
+///   built tables behind `Arc`; when a hostile/fuzz workload cycles
+///   more than [`EXTRADATA_CACHE_CAP`] distinct table blobs the map is
+///   cleared wholesale (deterministic, keeps worst-case memory at
+///   `CAP × ~390 KiB`).
+/// - **v1.x** (no extradata): the two codebook sets are compiled-in
+///   constants, so the two family-shaped `ThreeTables` live in
+///   `OnceLock`s — built exactly once per process.
+///
+/// Both paths fall back to an uncached build on the (unreachable in
+/// practice) error branches so error semantics stay identical.
+mod table_cache {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// Max distinct extradata blobs held before the map is reset.
+    const EXTRADATA_CACHE_CAP: usize = 16;
+
+    fn extradata_cache() -> &'static Mutex<HashMap<Vec<u8>, Arc<ThreeTables>>> {
+        static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Arc<ThreeTables>>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// v2.x: build-or-fetch the tables for one RLE table-bytes blob.
+    pub(super) fn extradata_tables(table_bytes: &[u8]) -> Result<Arc<ThreeTables>> {
+        if let Ok(map) = extradata_cache().lock() {
+            if let Some(hit) = map.get(table_bytes) {
+                return Ok(Arc::clone(hit));
+            }
+        }
+        let lengths = rle_decode_three_channels(table_bytes)?;
+        let built = Arc::new(ThreeTables {
+            slot1: HuffTable::build_from_lengths(&lengths[0])?,
+            slot2: HuffTable::build_from_lengths(&lengths[1])?,
+            slot3: HuffTable::build_from_lengths(&lengths[2])?,
+        });
+        if let Ok(mut map) = extradata_cache().lock() {
+            if map.len() >= EXTRADATA_CACHE_CAP {
+                map.clear();
+            }
+            map.insert(table_bytes.to_vec(), Arc::clone(&built));
+        }
+        Ok(built)
+    }
+
+    /// v1.x: family-shaped compiled-in tables, built once per process.
+    pub(super) fn v1x_tables(family: PixelFamily) -> Result<Arc<ThreeTables>> {
+        static YUV: OnceLock<Option<Arc<ThreeTables>>> = OnceLock::new();
+        static RGB: OnceLock<Option<Arc<ThreeTables>>> = OnceLock::new();
+        let (cell, is_rgb) = match family {
+            PixelFamily::Yuy2 => (&YUV, false),
+            PixelFamily::Rgb24 | PixelFamily::Rgb32 => (&RGB, true),
+        };
+        if let Some(t) = cell.get_or_init(|| build_v1x(is_rgb).ok().map(Arc::new)) {
+            return Ok(Arc::clone(t));
+        }
+        // Unreachable for the compiled-in blobs (covered by tests);
+        // re-run the build so the caller sees the original error.
+        build_v1x(is_rgb).map(Arc::new)?;
+        unreachable!("v1x table build cannot succeed here after failing above");
+    }
+
+    fn build_v1x(is_rgb: bool) -> Result<ThreeTables> {
+        let mut cursor: &[u8] = v1x_lengths_set_a();
+        let lens_a = rle_decode_one_channel(&mut cursor)?;
+        let mut codes_a = [0u8; 256];
+        codes_a.copy_from_slice(v1x_codes_set_a());
+        let table_a = v1x_table_from_pair(&lens_a, &codes_a)?;
+        if is_rgb {
+            // v1.x RGB: all three of B, G, R use set A.
+            return Ok(ThreeTables {
+                slot1: table_a.clone(),
+                slot2: table_a.clone(),
+                slot3: table_a,
+            });
+        }
+        let mut cursor: &[u8] = v1x_lengths_set_b();
+        let lens_b = rle_decode_one_channel(&mut cursor)?;
+        let mut codes_b = [0u8; 256];
+        codes_b.copy_from_slice(v1x_codes_set_b());
+        let table_b = v1x_table_from_pair(&lens_b, &codes_b)?;
+        // v1.x YUY2: Y uses set A; both U and V use set B.
+        Ok(ThreeTables {
+            slot1: table_a,
+            slot2: table_b.clone(),
+            slot3: table_b,
+        })
+    }
+}
+
+fn build_three_tables(config: &StreamConfig) -> Result<std::sync::Arc<ThreeTables>> {
     if config.has_extradata {
         // v2.x extradata path: 3 RLE-compressed length tables in
         // slot-1, slot-2, slot-3 order, then build canonical Huffman.
-        let lengths = if !config.extradata_tables.is_empty() {
-            rle_decode_three_channels(&config.extradata_tables)?
+        let table_bytes: &[u8] = if !config.extradata_tables.is_empty() {
+            &config.extradata_tables
         } else {
             // Fallback: extradata-present flag set but the table
             // region is empty — shouldn't happen on the wire but we
             // accept it by falling through to the classic blob for
             // this (family, method).
-            let blob = classic_blob_bytes(config.family, config.method);
-            rle_decode_three_channels(blob)?
+            classic_blob_bytes(config.family, config.method)
         };
-        Ok(ThreeTables {
-            slot1: HuffTable::build_from_lengths(&lengths[0])?,
-            slot2: HuffTable::build_from_lengths(&lengths[1])?,
-            slot3: HuffTable::build_from_lengths(&lengths[2])?,
-        })
+        table_cache::extradata_tables(table_bytes)
     } else {
         // v1.x precomputed-codes path (spec/04 §4): the per-channel
         // sharing depends on the family.
-        let lens_a_blob = v1x_lengths_set_a();
-        let lens_b_blob = v1x_lengths_set_b();
-        let mut cursor: &[u8] = lens_a_blob;
-        let lens_a = rle_decode_one_channel(&mut cursor)?;
-        let mut cursor: &[u8] = lens_b_blob;
-        let lens_b = rle_decode_one_channel(&mut cursor)?;
-        let codes_a_buf = v1x_codes_set_a();
-        let codes_b_buf = v1x_codes_set_b();
-        let mut codes_a = [0u8; 256];
-        codes_a.copy_from_slice(codes_a_buf);
-        let mut codes_b = [0u8; 256];
-        codes_b.copy_from_slice(codes_b_buf);
-        let table_a = v1x_table_from_pair(&lens_a, &codes_a)?;
-        let table_b = v1x_table_from_pair(&lens_b, &codes_b)?;
-
-        match config.family {
-            PixelFamily::Yuy2 => Ok(ThreeTables {
-                // v1.x YUY2: Y uses set A; both U and V use set B.
-                slot1: table_a,
-                slot2: table_b.clone(),
-                slot3: table_b,
-            }),
-            PixelFamily::Rgb24 | PixelFamily::Rgb32 => Ok(ThreeTables {
-                // v1.x RGB: all three of B, G, R use set A.
-                slot1: table_a.clone(),
-                slot2: table_a.clone(),
-                slot3: table_a,
-            }),
-        }
+        table_cache::v1x_tables(config.family)
     }
 }
 
