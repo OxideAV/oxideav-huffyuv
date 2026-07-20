@@ -36,6 +36,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   API change. Output is byte-identical across budgets (registry-level
   end-to-end test on interlaced + progressive streams).
 
+- Round 420: two-worker interlaced encode. New public
+  `encode_frame_with_mode_workers(..., worker_budget)` runs the two
+  fields' residual computations (own per-field scratch each) and the
+  two per-field bit-stream emits on parallel workers when the budget
+  allows, under the same `budget.min(units).max(1)` / `units = 2`
+  clamp as the decode side. Unlike decode, encode has no
+  split-finding prefix — each field packs into its own buffer and the
+  buffers concatenate — so both phases parallelise fully. Wire bytes
+  are byte-identical to `encode_frame_with_mode` for every input
+  (encode-invariance matrix incl. odd interlaced heights + a
+  golden-pin budget-2 sweep); budget ≤ 1, progressive frames, and
+  `encode_frame_auto` keep the serial path.
+
 - Round 419: golden-output pin suite (`tests/golden_pins.rs`). Pins an
   FNV-1a-64 hash of the `strf` and frame wire bytes for the full legal
   matrix — 3 pixel families × every legal method × 3 extradata modes ×

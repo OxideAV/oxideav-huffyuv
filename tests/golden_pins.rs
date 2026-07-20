@@ -33,7 +33,8 @@
 
 use oxideav_huffyuv::{
     decode_frame, decode_frame_with_workers, encode_frame_auto, encode_frame_with_mode,
-    ExtradataMode, Method, MethodSelection, PixelFamily, StreamConfig,
+    encode_frame_with_mode_workers, ExtradataMode, Method, MethodSelection, PixelFamily,
+    StreamConfig,
 };
 
 /// FNV-1a 64-bit — dependency-free, deterministic across platforms.
@@ -644,6 +645,43 @@ fn golden_pins_budget2_decode_invariance() {
                     assert_eq!(
                         budget2.pixels, pixels,
                         "{scenario}: budget-2 decode is not lossless"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Round-420 worker-budget invariance for the ENCODE side over the
+/// golden-pin matrix: `encode_frame_with_mode_workers(..., 2)` must
+/// emit the exact pinned wire bytes (strf + frame hashes) on every
+/// scenario — interlaced pins exercise the two-worker residual + emit
+/// phases, progressive pins pin the budget as a strict no-op.
+#[test]
+fn golden_pins_budget2_encode_invariance() {
+    for family in FAMILIES {
+        for &method in legal_methods(family) {
+            for mode in MODES {
+                for (w, h) in SIZES {
+                    let scenario = format!(
+                        "{}/{}/{}/{}x{} (budget 2)",
+                        family_name(family),
+                        method_name(method),
+                        mode_name(mode),
+                        w,
+                        h
+                    );
+                    let pixels = build_pixels(w as usize, h as usize, bpp(family));
+                    let (strf, frame) =
+                        encode_frame_with_mode_workers(family, method, w, h, &pixels, mode, 2)
+                            .unwrap_or_else(|e| panic!("{scenario}: encode failed: {e:?}"));
+                    let (strf_serial, frame_serial) =
+                        encode_frame_with_mode(family, method, w, h, &pixels, mode)
+                            .unwrap_or_else(|e| panic!("{scenario}: serial encode failed: {e:?}"));
+                    assert_eq!(strf, strf_serial, "{scenario}: strf diverged from serial");
+                    assert_eq!(
+                        frame, frame_serial,
+                        "{scenario}: wire bytes diverged from serial"
                     );
                 }
             }

@@ -93,7 +93,52 @@ pub fn encode_frame_with_mode(
     // emit pass (one residual computation per candidate instead of
     // candidate + winner-restart = N+1).
     let frame = compute_frame_residuals(family, method, width, height, pixels)?;
-    encode_with_precomputed(family, method, width, height, &frame, mode)
+    encode_with_precomputed(family, method, width, height, &frame, mode, 1)
+}
+
+/// Encode a frame under an explicit worker budget (round 420).
+///
+/// Same wire output as [`encode_frame_with_mode`] for every input —
+/// the budget only changes how the work is scheduled. Interlaced
+/// frames (spec/02 §2, `biHeight > 288`) carry two independently
+/// coded fields whose residual computations and bit-stream emits
+/// don't depend on each other (the encode side has no split-finding
+/// problem: each field is packed into its own buffer and the buffers
+/// are concatenated afterwards), so with a budget ≥ 2 both phases run
+/// their two fields on two parallel workers. `worker_budget` follows
+/// the `oxideav-core` `ExecutionContext` threading contract: serial
+/// until told otherwise, fan-out bounded by
+/// `budget.min(units).max(1)` with `units = 2`. Budget ≤ 1 and
+/// progressive frames take exactly the [`encode_frame_with_mode`]
+/// serial code path.
+///
+/// Byte-identity across budgets is guarded by the round-420
+/// encode-invariance tests plus the r419 golden wire-hash pins.
+pub fn encode_frame_with_mode_workers(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    mode: ExtradataMode,
+    worker_budget: usize,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if family.is_rgb() && !method.is_rgb_legal() {
+        return Err(Error::invalid("encoder: method not legal for RGB"));
+    }
+    if !family.is_rgb() && !method.is_yuv_legal() {
+        return Err(Error::invalid("encoder: method not legal for YUV"));
+    }
+    // Inline worker clamp per the ExecutionContext threading contract
+    // — `threads.min(units).max(1)`, written as `clamp(1, units)`
+    // with `units = 2` interlaced fields.
+    let workers = worker_budget.clamp(1, 2);
+    let frame = if workers >= 2 {
+        compute_frame_residuals_parallel(family, method, width, height, pixels)?
+    } else {
+        compute_frame_residuals(family, method, width, height, pixels)?
+    };
+    encode_with_precomputed(family, method, width, height, &frame, mode, workers)
 }
 
 /// Emit one wire frame from a pre-computed residual stream.
@@ -110,6 +155,7 @@ fn encode_with_precomputed(
     height: u32,
     frame: &PrecomputedFrame,
     mode: ExtradataMode,
+    workers: usize,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let stats_body: &[u8] = &frame.combined_body;
 
@@ -172,33 +218,72 @@ fn encode_with_precomputed(
     );
 
     let frame_bytes = if frame.interlaced {
-        let mut out = Vec::new();
-        // Top field: pass the seed + the [..top_body_len] slice of
-        // the combined body directly to `emit_bitstream_parts`. No
-        // per-field body Vec allocation needed.
-        let mut top_bytes = emit_bitstream_parts(
-            family,
-            method,
-            &frame.top_seed,
-            &frame.combined_body[..frame.top_body_len],
-            slot1,
-            slot2,
-            slot3,
-        )?;
-        out.append(&mut top_bytes);
-        if let Some(bot_seed) = frame.bot_seed_opt {
-            let mut bot_bytes = emit_bitstream_parts(
+        if let (2.., Some(bot_seed)) = (workers, frame.bot_seed_opt) {
+            // Round-420 two-worker emit: the two per-field bit-streams
+            // are packed into independent buffers from disjoint body
+            // slices and identical tables, then concatenated in wire
+            // order — byte-identical to the serial arm below. The top
+            // field's result is inspected first so a top-field emit
+            // error surfaces exactly as in the serial arm.
+            let (top_joined, bot_result) = std::thread::scope(|s| {
+                let top_handle = s.spawn(|| {
+                    emit_bitstream_parts(
+                        family,
+                        method,
+                        &frame.top_seed,
+                        &frame.combined_body[..frame.top_body_len],
+                        slot1,
+                        slot2,
+                        slot3,
+                    )
+                });
+                let bot_result = emit_bitstream_parts(
+                    family,
+                    method,
+                    &bot_seed,
+                    &frame.combined_body[frame.top_body_len..],
+                    slot1,
+                    slot2,
+                    slot3,
+                );
+                (top_handle.join(), bot_result)
+            });
+            let mut out = match top_joined {
+                Ok(res) => res?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+            let mut bot_bytes = bot_result?;
+            out.append(&mut bot_bytes);
+            out
+        } else {
+            let mut out = Vec::new();
+            // Top field: pass the seed + the [..top_body_len] slice of
+            // the combined body directly to `emit_bitstream_parts`. No
+            // per-field body Vec allocation needed.
+            let mut top_bytes = emit_bitstream_parts(
                 family,
                 method,
-                &bot_seed,
-                &frame.combined_body[frame.top_body_len..],
+                &frame.top_seed,
+                &frame.combined_body[..frame.top_body_len],
                 slot1,
                 slot2,
                 slot3,
             )?;
-            out.append(&mut bot_bytes);
+            out.append(&mut top_bytes);
+            if let Some(bot_seed) = frame.bot_seed_opt {
+                let mut bot_bytes = emit_bitstream_parts(
+                    family,
+                    method,
+                    &bot_seed,
+                    &frame.combined_body[frame.top_body_len..],
+                    slot1,
+                    slot2,
+                    slot3,
+                )?;
+                out.append(&mut bot_bytes);
+            }
+            out
         }
-        out
     } else {
         emit_bitstream_parts(
             family,
@@ -340,6 +425,63 @@ fn compute_frame_residuals(
         interlaced: true,
         top_seed,
         bot_seed_opt,
+        top_body_len: top_len,
+        combined_body: combined,
+    })
+}
+
+/// Round-420 two-worker variant of [`compute_frame_residuals`] for
+/// interlaced frames: the two fields' row-gather + forward-predictor
+/// passes read disjoint source rows and write independent outputs, so
+/// each runs on its own worker with its own field-sized scratch (the
+/// serial path's single shared scratch cannot be reused across
+/// concurrent fields). The per-field `Residuals` are computed by the
+/// same [`compute_residuals`] the serial path calls on the same field
+/// bytes, and concatenated into the same
+/// `top.body || bot.body` combined layout — `PrecomputedFrame`
+/// contents are identical to the serial path's for every input
+/// (guarded by the round-420 encode-invariance tests). Progressive
+/// and single-field-degenerate frames fall through to the serial
+/// function.
+fn compute_frame_residuals_parallel(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<PrecomputedFrame> {
+    let h = height as usize;
+    if !is_interlaced_height(height) || h / 2 == 0 {
+        return compute_frame_residuals(family, method, width, height, pixels);
+    }
+    let row_bytes = family.row_bytes(width);
+    let top_h = h.div_ceil(2) as u32;
+    let bot_h = (h / 2) as u32;
+    let (top_result, bot_joined) = std::thread::scope(|s| {
+        let bot_handle = s.spawn(|| {
+            let mut scratch = vec![0u8; (bot_h as usize) * row_bytes];
+            compact_field_rows(pixels, &mut scratch, row_bytes, h, 1);
+            compute_residuals(family, method, width, bot_h, &scratch)
+        });
+        let mut scratch = vec![0u8; (top_h as usize) * row_bytes];
+        compact_field_rows(pixels, &mut scratch, row_bytes, h, 0);
+        let top_result = compute_residuals(family, method, width, top_h, &scratch);
+        (top_result, bot_handle.join())
+    });
+    // Serial error order: the top field is computed (and its errors
+    // surfaced) before the bottom field is touched.
+    let top_res = top_result?;
+    let bot_res = match bot_joined {
+        Ok(res) => res?,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    let top_len = top_res.body.len();
+    let mut combined = top_res.body;
+    combined.extend_from_slice(&bot_res.body);
+    Ok(PrecomputedFrame {
+        interlaced: true,
+        top_seed: top_res.seed,
+        bot_seed_opt: Some(bot_res.seed),
         top_body_len: top_len,
         combined_body: combined,
     })
@@ -572,7 +714,7 @@ pub fn encode_frame_auto(
         }
     }
     let (chosen, _, frame) = best.expect("non-empty candidates → some winner");
-    let (strf, bytes) = encode_with_precomputed(family, chosen, width, height, &frame, mode)?;
+    let (strf, bytes) = encode_with_precomputed(family, chosen, width, height, &frame, mode, 1)?;
     Ok((strf, bytes, chosen))
 }
 
@@ -3489,5 +3631,200 @@ mod round382_arbitrary_extradata_conformance_tests {
         let pixels = synth(PixelFamily::Yuy2.row_bytes(w) * h as usize, 0x0F0F_1E1E);
         let lens = [flat_len8(), flat_len8(), flat_len8()];
         roundtrip_with_tables(PixelFamily::Yuy2, Method::Left, w, h, &pixels, &lens);
+    }
+}
+
+#[cfg(test)]
+mod round420_encode_parallel_tests {
+    //! Round-420 regression guard for the two-worker interlaced
+    //! encode path (`encode_frame_with_mode_workers`). Wire bytes
+    //! (strf AND frame body) must be byte-identical between budgets
+    //! for every input — the budget only reschedules work.
+
+    use super::*;
+
+    fn synth(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    fn bpp(family: PixelFamily) -> usize {
+        match family {
+            PixelFamily::Yuy2 => 2,
+            PixelFamily::Rgb24 => 3,
+            PixelFamily::Rgb32 => 4,
+        }
+    }
+
+    fn legal_methods(family: PixelFamily) -> &'static [Method] {
+        match family {
+            PixelFamily::Yuy2 => &[
+                Method::PredictOld,
+                Method::Left,
+                Method::Gradient,
+                Method::Median,
+            ],
+            PixelFamily::Rgb24 | PixelFamily::Rgb32 => &[
+                Method::PredictOld,
+                Method::Left,
+                Method::LeftDecorr,
+                Method::GradientDecorr,
+            ],
+        }
+    }
+
+    const FAMILIES: [PixelFamily; 3] = [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32];
+    const MODES: [ExtradataMode; 3] = [
+        ExtradataMode::ClassicV2,
+        ExtradataMode::CustomV2,
+        ExtradataMode::V1xCompat,
+    ];
+
+    /// Budget-2 encode is byte-identical to serial encode on
+    /// interlaced frames across the full family/method/mode matrix,
+    /// including an odd interlaced height (top field one row taller),
+    /// and round-trips losslessly through the budget-2 decoder.
+    #[test]
+    fn round420_encode_workers2_matches_serial_interlaced_matrix() {
+        for family in FAMILIES {
+            for &method in legal_methods(family) {
+                for mode in MODES {
+                    for (w, h) in [(32u32, 292u32), (16, 293), (48, 289)] {
+                        let pixels = synth((w as usize) * (h as usize) * bpp(family), 0x0420_0007);
+                        let serial = encode_frame_with_mode(family, method, w, h, &pixels, mode)
+                            .expect("serial encode");
+                        let parallel =
+                            encode_frame_with_mode_workers(family, method, w, h, &pixels, mode, 2)
+                                .expect("parallel encode");
+                        assert_eq!(
+                            serial.0, parallel.0,
+                            "strf drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
+                        );
+                        assert_eq!(
+                            serial.1, parallel.1,
+                            "wire drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
+                        );
+                        let cfg = crate::header::StreamConfig::parse_bitmapinfoheader(&parallel.0)
+                            .expect("parse");
+                        let decoded =
+                            crate::decoder::decode_frame_with_workers(&cfg, &parallel.1, 2)
+                                .expect("decode");
+                        assert_eq!(
+                            decoded.pixels, pixels,
+                            "lossless drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Budgets 0/1 take the serial path, > 2 clamps to the two field
+    /// units; all budgets produce identical wire bytes. Progressive
+    /// frames ignore the budget entirely.
+    #[test]
+    fn round420_encode_budget_clamp_and_progressive_noop() {
+        let (w, h) = (32u32, 292u32);
+        let pixels = synth((w as usize) * (h as usize) * 2, 0x0420_0008);
+        let serial = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            Method::Median,
+            w,
+            h,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .expect("encode");
+        for budget in [0usize, 1, 2, 3, 8, 64] {
+            let out = encode_frame_with_mode_workers(
+                PixelFamily::Yuy2,
+                Method::Median,
+                w,
+                h,
+                &pixels,
+                ExtradataMode::CustomV2,
+                budget,
+            )
+            .expect("encode");
+            assert_eq!(out, serial, "budget {budget} diverged");
+        }
+        let (w, h) = (48u32, 32u32);
+        let pixels = synth((w as usize) * (h as usize) * 3, 0x0420_0009);
+        let serial = encode_frame_with_mode(
+            PixelFamily::Rgb24,
+            Method::GradientDecorr,
+            w,
+            h,
+            &pixels,
+            ExtradataMode::ClassicV2,
+        )
+        .expect("encode");
+        let budgeted = encode_frame_with_mode_workers(
+            PixelFamily::Rgb24,
+            Method::GradientDecorr,
+            w,
+            h,
+            &pixels,
+            ExtradataMode::ClassicV2,
+            8,
+        )
+        .expect("encode");
+        assert_eq!(serial, budgeted, "progressive budget must be a no-op");
+    }
+
+    /// Illegal (family, method) pairs are rejected identically by both
+    /// entry points, and wrong-size pixel buffers error (not panic)
+    /// through the parallel path exactly like the serial one.
+    #[test]
+    fn round420_encode_workers_error_parity() {
+        let pixels = synth(32 * 292 * 2, 0x0420_000A);
+        assert!(encode_frame_with_mode_workers(
+            PixelFamily::Yuy2,
+            Method::LeftDecorr,
+            32,
+            292,
+            &pixels,
+            ExtradataMode::ClassicV2,
+            2,
+        )
+        .is_err());
+        assert!(encode_frame_with_mode_workers(
+            PixelFamily::Rgb24,
+            Method::Median,
+            32,
+            292,
+            &pixels,
+            ExtradataMode::ClassicV2,
+            2,
+        )
+        .is_err());
+        // Odd YUY2 width errors from compute_residuals on both paths
+        // (width 2·k+1 with an interlaced height).
+        let odd = synth(31 * 292 * 2, 0x0420_000B);
+        let serial = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            Method::Left,
+            31,
+            292,
+            &odd,
+            ExtradataMode::ClassicV2,
+        );
+        let parallel = encode_frame_with_mode_workers(
+            PixelFamily::Yuy2,
+            Method::Left,
+            31,
+            292,
+            &odd,
+            ExtradataMode::ClassicV2,
+            2,
+        );
+        assert!(serial.is_err() && parallel.is_err());
     }
 }
