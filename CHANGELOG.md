@@ -28,6 +28,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every family/method/mode at even and odd interlaced heights, and
   malformed-input disposition sweeps; no wire-format change).
 
+- Round 420: registry `Decoder` implements `set_execution_context`.
+  The advisory `ExecutionContext::threads` budget is stored on the
+  decoder (default 1 = serial, per the contract) and routed into
+  `decode_frame_with_workers`, so executors that grant ≥ 2 threads get
+  field-parallel interlaced decode through the registry path with no
+  API change. Output is byte-identical across budgets (registry-level
+  end-to-end test on interlaced + progressive streams).
+
 - Round 419: golden-output pin suite (`tests/golden_pins.rs`). Pins an
   FNV-1a-64 hash of the `strf` and frame wire bytes for the full legal
   matrix — 3 pixel families × every legal method × 3 extradata modes ×
