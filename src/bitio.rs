@@ -113,6 +113,21 @@ impl<'a> BitReader<'a> {
                 "BitReader: consume_bits({n_bits}) out of 1..=32"
             )));
         }
+        self.consume_bits_trusted(n_bits);
+        Ok(())
+    }
+
+    /// Round-419 hot-path variant of [`Self::consume_bits`] for callers
+    /// whose `n_bits` provably lies in `1..=32` already (Huffman code
+    /// lengths come out of a built [`crate::tables::HuffTable`], whose
+    /// build rejects lengths outside `1..=31`, and the primary-LUT fast
+    /// path caps them at 16). Skips the per-symbol range check +
+    /// `Result` plumbing on the decode critical path; the range
+    /// contract is kept as a `debug_assert`.
+    #[doc(hidden)]
+    #[inline]
+    pub fn consume_bits_trusted(&mut self, n_bits: u32) {
+        debug_assert!((1..=32).contains(&n_bits));
         self.cursor_bits = self.cursor_bits.wrapping_add(n_bits as u64);
         // Drop `n_bits` from the top of the accumulator (which sits at
         // bit 63) and shrink the valid-bit count, then top it back up.
@@ -121,7 +136,6 @@ impl<'a> BitReader<'a> {
         if self.valid_bits < 32 {
             self.refill();
         }
-        Ok(())
     }
 
     /// Pull whole 32-bit LE words from `data` into the low end of the

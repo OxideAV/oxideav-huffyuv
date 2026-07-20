@@ -907,6 +907,41 @@ pub fn decode_one(table: &HuffTable, window: u32) -> Result<(u8, u8)> {
     decode_one_slow(table, window)
 }
 
+/// Round-419 paired fast path: decode TWO consecutive symbols from one
+/// 32-bit MSB-first window without an intermediate accumulator update.
+///
+/// The first symbol is looked up exactly like [`decode_one`]'s fast
+/// path (top 16 bits of `window` into `a`'s primary LUT). When it hits
+/// with length `l1 ≤ 16`, the next codeword's first 16 bits are
+/// `window` bits `l1..l1+16` — all still inside the 32-bit window
+/// (`l1 + 16 ≤ 32`), so `(window << l1) >> 16` indexes `b`'s primary
+/// LUT with exactly the same 16 bits a fresh [`BitReader::peek_window`]
+/// after `consume_bits(l1)` would serve (the low `l1` zero bits shifted
+/// in never reach the used top 16). Returns `(sym_a, sym_b, l1 + l2)`
+/// so the caller advances the reader once per pair — halving the
+/// serialized `consume → refill → peek` chains on the per-symbol
+/// decode critical path (the whole-decode hotspot per the round-419
+/// `sample` profile: ~95% of wall in the symbol loop).
+///
+/// Returns `None` when either lookup lands on a > 16-bit code
+/// ([`PRIMARY_LUT_OVERFLOW`]); the caller falls back to the sequential
+/// [`decode_one`] + consume path, which serves long codes from the
+/// true 32-bit window. Byte-identical output either way.
+#[inline]
+pub fn decode_pair(a: &HuffTable, b: &HuffTable, window: u32) -> Option<(u8, u8, u32)> {
+    let slot_a = a.primary_lut[(window >> 16) as usize];
+    if slot_a == PRIMARY_LUT_OVERFLOW {
+        return None;
+    }
+    let l1 = (slot_a >> 8) as u32;
+    let slot_b = b.primary_lut[((window << l1) >> 16) as usize];
+    if slot_b == PRIMARY_LUT_OVERFLOW {
+        return None;
+    }
+    let l2 = (slot_b >> 8) as u32;
+    Some(((slot_a & 0xFF) as u8, (slot_b & 0xFF) as u8, l1 + l2))
+}
+
 /// Long-code slow path: walks the precomputed [`HuffTable::overflow_entries`]
 /// (round 91) — a flat slice of only the codes with length > 16, with
 /// their masks already computed. Replaces the round-7 256-entry scan
@@ -1358,6 +1393,95 @@ mod tests {
             let three = rle_decode_three_channels(blob).unwrap();
             for (i, slot) in three.iter().enumerate() {
                 check(slot, &format!("classic-slot-{i}"));
+            }
+        }
+    }
+
+    // ───────── Round-419: decode_pair / sequential equivalence ─────────
+
+    /// Drive a `BitReader` over pseudo-random byte streams and assert
+    /// that wherever `decode_pair(a, b, window)` returns a hit, the
+    /// sequential `decode_one(a) → consume → decode_one(b)` walk over
+    /// the same reader position produces the identical `(sym, sym,
+    /// total_len)` triple. Covers table pairs with and without > 16-bit
+    /// codes (the v1.x set-B table has ~210 long codes, maximising
+    /// overflow fallbacks) and runs past end-of-data so the zero-padded
+    /// tail window is exercised on both paths.
+    #[test]
+    fn round419_decode_pair_matches_sequential() {
+        // Classic YUV-left blob → three canonical tables (short codes
+        // dominate → pair fast path dominates).
+        let [l1, l2, l3] = rle_decode_three_channels(blobs::yuv_left()).unwrap();
+        let t1 = HuffTable::build_from_lengths(&l1).unwrap();
+        let t2 = HuffTable::build_from_lengths(&l2).unwrap();
+        let t3 = HuffTable::build_from_lengths(&l3).unwrap();
+        // v1.x set B (many > 16-bit codes → overflow fallback path).
+        let mut cursor: &[u8] = blobs::v1x_lengths_set_b();
+        let lens_b = rle_decode_one_channel(&mut cursor).unwrap();
+        let mut codes_b = [0u8; 256];
+        codes_b.copy_from_slice(blobs::v1x_codes_set_b());
+        let tb = v1x_table_from_pair(&lens_b, &codes_b).unwrap();
+
+        let pairs: [(&HuffTable, &HuffTable); 4] = [(&t1, &t2), (&t1, &t3), (&t3, &t3), (&tb, &t1)];
+        for (pi, (ta, tb)) in pairs.iter().enumerate() {
+            let mut data = vec![0u8; 4096];
+            let mut s: u32 = 0x419_0000 ^ (pi as u32).wrapping_mul(2654435761);
+            for byte in data.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                *byte = (s >> 24) as u8;
+            }
+            let mut reader = crate::bitio::BitReader::new(&data);
+            let total_bits = (data.len() as u64) * 8 + 64;
+            let mut hits = 0usize;
+            let mut misses = 0usize;
+            while reader.cursor_bits() < total_bits {
+                let w = reader.peek_window();
+                let pair = decode_pair(ta, tb, w);
+                // Sequential reference walk on the same reader state.
+                let Ok((sa, la)) = decode_one(ta, w) else {
+                    // No code matches at all (possible on the zero-pad
+                    // tail for tables without an all-zeros code). A
+                    // pair hit requires a primary-LUT hit on the same
+                    // window, so the pair path must agree.
+                    assert!(pair.is_none(), "pair {pi}: hit where decode_one fails");
+                    break;
+                };
+                reader.consume_bits(la as u32).unwrap();
+                let w2 = reader.peek_window();
+                let Ok((sb, lb)) = decode_one(tb, w2) else {
+                    break;
+                };
+                reader.consume_bits(lb as u32).unwrap();
+                match pair {
+                    Some((pa, pb, n)) => {
+                        hits += 1;
+                        assert_eq!(pa, sa, "pair sym A must match sequential (pair {pi})");
+                        assert_eq!(pb, sb, "pair sym B must match sequential (pair {pi})");
+                        assert_eq!(
+                            n,
+                            la as u32 + lb as u32,
+                            "pair total length must match sequential (pair {pi})"
+                        );
+                    }
+                    None => {
+                        misses += 1;
+                        // A miss is only legal when at least one of the
+                        // two codes is a > 16-bit overflow code.
+                        assert!(
+                            la > 16 || lb > 16,
+                            "decode_pair miss but both codes fit the primary LUT \
+                             (pair {pi}: la={la}, lb={lb})"
+                        );
+                    }
+                }
+            }
+            // The short-code table pairs must actually exercise the
+            // fast path, and the set-B pair must exercise the fallback.
+            assert!(hits > 0, "pair {pi}: fast path never hit");
+            if pi == 3 {
+                assert!(misses > 0, "set-B pair: overflow fallback never hit");
             }
         }
     }

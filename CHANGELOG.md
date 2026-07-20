@@ -56,6 +56,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1.347 ms → 1.155 ms), 1280×720 −2.8% (table build amortises over the
   larger raster).
 
+- Round 419 (performance, output-invariant): paired symbol reads +
+  trusted bit consume on the decode critical path. A `sample` profile
+  attributed ~95% of post-cache decode wall to the per-symbol Huffman
+  loop, so (a) `tables::decode_pair` now decodes two consecutive
+  codewords from one 32-bit window peek when both fit the 16-bit
+  primary LUT (`l1 + 16 ≤ 32` keeps the second lookup's bits inside
+  the window), advancing the reader once per pair — the three field
+  decoders consume their fixed wire cycles as (Y₁U)(Y₂V) / (w0 w1)R /
+  (w0 w1)(RA) pairs with a sequential per-symbol fallback for > 16-bit
+  codes; and (b) the hot loops use `BitReader::consume_bits_trusted`
+  (`#[doc(hidden)]`), skipping the per-symbol range-check/`Result`
+  plumbing for lengths that provably come out of a built table.
+  Byte-identical output (pair/sequential equivalence test over 4 table
+  pairs including the long-code v1.x set B, plus golden pins).
+  Measured via interleaved same-thermal-window A/B (aarch64,
+  Criterion, ~1%/run drift subtracted): −2% to −5.5% decode wall
+  (yuy2 left 320×240 ≈ −2%, median ≈ −4.4%, rgb32 GradientDecorr
+  ≈ −5%, yuy2 1280×720 ≈ −4.8%).
+
 ### Fixed
 
 - Round 382: the `CustomV2` RLE length-table encoder

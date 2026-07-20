@@ -13,7 +13,7 @@ use crate::predict::{
     inverse_rgb_decorr_bgra, inverse_yuy2_left_macropixel,
 };
 use crate::tables::{
-    classic_blob_bytes, decode_one, rle_decode_one_channel, rle_decode_three_channels,
+    classic_blob_bytes, decode_one, decode_pair, rle_decode_one_channel, rle_decode_three_channels,
     v1x_codes_set_a, v1x_codes_set_b, v1x_lengths_set_a, v1x_lengths_set_b, v1x_table_from_pair,
     HuffTable,
 };
@@ -344,26 +344,47 @@ fn decode_yuy2_field(
     // robustness (e.g. malformed inputs where the seed write still
     // succeeded but `total_bytes` lands non-aligned in a future
     // pixel-family extension).
+    // Round-419: paired symbol reads. Each macropixel's four codewords
+    // are consumed as two `decode_pair` window reads — (Y₁, U) then
+    // (Y₂, V) — advancing the bit reader once per pair instead of once
+    // per symbol. `decode_pair` serves both symbols from the same
+    // 32-bit window (l1 ≤ 16 keeps the second lookup's 16 bits inside
+    // it), falling back to the sequential per-symbol path when either
+    // code is longer than 16 bits. Output is byte-identical (see
+    // `tables::decode_pair` docs + the round419 pair/sequential
+    // equivalence test in `tables.rs`).
     debug_assert!(total_bytes >= 4);
     let body_end = total_bytes - ((total_bytes - 4) & 3);
     let mut byte_idx = 4usize;
     while byte_idx < body_end {
-        // Y₁ → slot1
-        let (sym_y1, len_y1) = decode_one(&tables.slot1, reader.peek_window())?;
-        reader.consume_bits(len_y1 as u32)?;
-        pixels[byte_idx] = sym_y1;
-        // U → slot2
-        let (sym_u, len_u) = decode_one(&tables.slot2, reader.peek_window())?;
-        reader.consume_bits(len_u as u32)?;
-        pixels[byte_idx + 1] = sym_u;
-        // Y₂ → slot1
-        let (sym_y2, len_y2) = decode_one(&tables.slot1, reader.peek_window())?;
-        reader.consume_bits(len_y2 as u32)?;
-        pixels[byte_idx + 2] = sym_y2;
-        // V → slot3
-        let (sym_v, len_v) = decode_one(&tables.slot3, reader.peek_window())?;
-        reader.consume_bits(len_v as u32)?;
-        pixels[byte_idx + 3] = sym_v;
+        // (Y₁ → slot1, U → slot2)
+        let w = reader.peek_window();
+        if let Some((sym_y1, sym_u, n)) = decode_pair(&tables.slot1, &tables.slot2, w) {
+            reader.consume_bits_trusted(n);
+            pixels[byte_idx] = sym_y1;
+            pixels[byte_idx + 1] = sym_u;
+        } else {
+            let (sym_y1, len_y1) = decode_one(&tables.slot1, w)?;
+            reader.consume_bits_trusted(len_y1 as u32);
+            pixels[byte_idx] = sym_y1;
+            let (sym_u, len_u) = decode_one(&tables.slot2, reader.peek_window())?;
+            reader.consume_bits_trusted(len_u as u32);
+            pixels[byte_idx + 1] = sym_u;
+        }
+        // (Y₂ → slot1, V → slot3)
+        let w = reader.peek_window();
+        if let Some((sym_y2, sym_v, n)) = decode_pair(&tables.slot1, &tables.slot3, w) {
+            reader.consume_bits_trusted(n);
+            pixels[byte_idx + 2] = sym_y2;
+            pixels[byte_idx + 3] = sym_v;
+        } else {
+            let (sym_y2, len_y2) = decode_one(&tables.slot1, w)?;
+            reader.consume_bits_trusted(len_y2 as u32);
+            pixels[byte_idx + 2] = sym_y2;
+            let (sym_v, len_v) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits_trusted(len_v as u32);
+            pixels[byte_idx + 3] = sym_v;
+        }
         byte_idx += 4;
     }
     // Scalar fall-through for any 1..=3 trailing bytes (unreachable
@@ -376,7 +397,7 @@ fn decode_yuy2_field(
             _ => &tables.slot3,
         };
         let (sym, len) = decode_one(slot, reader.peek_window())?;
-        reader.consume_bits(len as u32)?;
+        reader.consume_bits_trusted(len as u32);
         pixels[byte_idx] = sym;
         byte_idx += 1;
     }
@@ -483,17 +504,27 @@ fn decode_rgb24_field(
         (&tables.slot1, 0usize, &tables.slot2, 1usize)
     };
     // Wire position +2 (R or R−G) → slot3, store +2 in both modes.
+    // Round-419: paired symbol reads — the first two wire positions
+    // (mode-resolved above) come out of one `decode_pair` window read;
+    // the +2 position stays a single read. See the YUY2 loop note.
     let n_pixels = width_us * height_us;
     for px in 1..n_pixels {
         let bgr_off = px * 3;
-        let (v0, l0) = decode_one(s_w0, reader.peek_window())?;
-        reader.consume_bits(l0 as u32)?;
-        pixels[bgr_off + o_w0] = v0;
-        let (v1, l1) = decode_one(s_w1, reader.peek_window())?;
-        reader.consume_bits(l1 as u32)?;
-        pixels[bgr_off + o_w1] = v1;
+        let w = reader.peek_window();
+        if let Some((v0, v1, n)) = decode_pair(s_w0, s_w1, w) {
+            reader.consume_bits_trusted(n);
+            pixels[bgr_off + o_w0] = v0;
+            pixels[bgr_off + o_w1] = v1;
+        } else {
+            let (v0, l0) = decode_one(s_w0, w)?;
+            reader.consume_bits_trusted(l0 as u32);
+            pixels[bgr_off + o_w0] = v0;
+            let (v1, l1) = decode_one(s_w1, reader.peek_window())?;
+            reader.consume_bits_trusted(l1 as u32);
+            pixels[bgr_off + o_w1] = v1;
+        }
         let (v2, l2) = decode_one(&tables.slot3, reader.peek_window())?;
-        reader.consume_bits(l2 as u32)?;
+        reader.consume_bits_trusted(l2 as u32);
         pixels[bgr_off + 2] = v2;
     }
 
@@ -583,22 +614,38 @@ fn decode_rgb32_field(
     } else {
         (&tables.slot1, 0usize, &tables.slot2, 1usize)
     };
+    // Round-419: paired symbol reads — (w0, w1) then (R/R−G, A), each
+    // pair off one `decode_pair` window read. See the YUY2 loop note.
     for px in 1..n_pixels {
         let off = px * 4;
-        let (v0, l0) = decode_one(s_w0, reader.peek_window())?;
-        reader.consume_bits(l0 as u32)?;
-        pixels[off + o_w0] = v0;
-        let (v1, l1) = decode_one(s_w1, reader.peek_window())?;
-        reader.consume_bits(l1 as u32)?;
-        pixels[off + o_w1] = v1;
-        // Wire position +2 (R or R−G) → slot3, store +2.
-        let (v2, l2) = decode_one(&tables.slot3, reader.peek_window())?;
-        reader.consume_bits(l2 as u32)?;
-        pixels[off + 2] = v2;
-        // Wire position +3 (A) reuses the slot-3 codebook, store +3.
-        let (v3, l3) = decode_one(&tables.slot3, reader.peek_window())?;
-        reader.consume_bits(l3 as u32)?;
-        pixels[off + 3] = v3;
+        let w = reader.peek_window();
+        if let Some((v0, v1, n)) = decode_pair(s_w0, s_w1, w) {
+            reader.consume_bits_trusted(n);
+            pixels[off + o_w0] = v0;
+            pixels[off + o_w1] = v1;
+        } else {
+            let (v0, l0) = decode_one(s_w0, w)?;
+            reader.consume_bits_trusted(l0 as u32);
+            pixels[off + o_w0] = v0;
+            let (v1, l1) = decode_one(s_w1, reader.peek_window())?;
+            reader.consume_bits_trusted(l1 as u32);
+            pixels[off + o_w1] = v1;
+        }
+        // Wire positions +2 (R or R−G) and +3 (A) both use the slot-3
+        // codebook (spec/03 §1.2; alpha shares slot 3 in both modes).
+        let w = reader.peek_window();
+        if let Some((v2, v3, n)) = decode_pair(&tables.slot3, &tables.slot3, w) {
+            reader.consume_bits_trusted(n);
+            pixels[off + 2] = v2;
+            pixels[off + 3] = v3;
+        } else {
+            let (v2, l2) = decode_one(&tables.slot3, w)?;
+            reader.consume_bits_trusted(l2 as u32);
+            pixels[off + 2] = v2;
+            let (v3, l3) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits_trusted(l3 as u32);
+            pixels[off + 3] = v3;
+        }
     }
 
     let consumed = 4 + reader.bytes_consumed();
