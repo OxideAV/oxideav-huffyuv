@@ -19,6 +19,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   regeneration path exists via `OXIDEAV_HUFFYUV_GOLDEN_DUMP=1` but must
   never be needed inside a profile round).
 
+- Round 419: three large-frame bench scenarios where coverage was
+  thin (the only ≥ HD gate was YUY2 Left decode/encode):
+  `decode_rgb32_1280x720_gradient_decorr_classic` (~20.8 ms, wide-stride
+  family + decorr/gradient post-passes at HD, interlaced by height),
+  `encode_rgb24_1280x720_left_decorr_classic` (~6.45 ms, ~409 MiB/s),
+  and `encode_yuy2_1280x720_auto_custom` (~6.49 ms, ~271 MiB/s — ties
+  the package-merge rewrite to an HD whole-frame number). Raster-scaling
+  regressions on the RGB families and the auto-selector are now
+  visible.
+
 ### Changed
 
 - Round 419 (performance, output-invariant): count-based package-merge

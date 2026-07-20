@@ -318,6 +318,44 @@ fn bench_rgb24_320x240_auto_custom(c: &mut Criterion) {
     );
 }
 
+// ───────── Round-419 large-frame additions ─────────
+//
+// Before round 419 the only ≥ HD encode scenario was YUY2 Left — the
+// RGB families and the auto-selector had no large-frame gate, so a
+// regression that scaled with raster size (allocation churn, cache
+// behaviour of the 64-Ki LUTs, package-merge per candidate) could
+// hide behind the 320-class scenarios. 1280×720 crosses the
+// `is_interlaced_height` threshold, so these also exercise the
+// field-split encode path on the wider-stride families.
+
+fn bench_rgb24_1280x720_left_decorr_classic(c: &mut Criterion) {
+    // Large-raster RGB24 decorrelated encode (interlaced by height).
+    bench_fixed(
+        c,
+        "encode_rgb24_1280x720_left_decorr_classic",
+        PixelFamily::Rgb24,
+        Method::LeftDecorr,
+        1280,
+        720,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_yuy2_1280x720_auto_custom(c: &mut Criterion) {
+    // Large-raster auto-selector gate: 3 candidate methods × 3-channel
+    // histograms + package-merge on a 1.8-MiB raster, then the winner's
+    // CustomV2 emit. Ties the round-419 package-merge rewrite to an
+    // HD-sized whole-frame number.
+    bench_auto(
+        c,
+        "encode_yuy2_1280x720_auto_custom",
+        PixelFamily::Yuy2,
+        1280,
+        720,
+        ExtradataMode::CustomV2,
+    );
+}
+
 criterion_group!(
     benches,
     bench_yuy2_320x240_left_classic,
@@ -336,5 +374,7 @@ criterion_group!(
     bench_yuy2_320x320_left_interlaced,
     bench_yuy2_320x240_auto_custom,
     bench_rgb24_320x240_auto_custom,
+    bench_rgb24_1280x720_left_decorr_classic,
+    bench_yuy2_1280x720_auto_custom,
 );
 criterion_main!(benches);

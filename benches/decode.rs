@@ -285,6 +285,23 @@ fn bench_rgb24_320x320_left_decorr_interlaced(c: &mut Criterion) {
     );
 }
 
+fn bench_rgb32_1280x720_gradient_decorr_classic(c: &mut Criterion) {
+    // Round-419: large-frame RGB decode gate. Before r419 the only
+    // ≥ HD decode scenario was YUY2 Left, so a raster-scaling
+    // regression on the wider-stride families (4-byte wire cycle,
+    // decorrelation + gradient post-passes over a 3.5-MiB raster) had
+    // no baseline. 720 > 288 also engages the interlaced field split.
+    bench_scenario(
+        c,
+        "decode_rgb32_1280x720_gradient_decorr_classic",
+        PixelFamily::Rgb32,
+        Method::GradientDecorr,
+        1280,
+        720,
+        ExtradataMode::ClassicV2,
+    );
+}
+
 criterion_group!(
     benches,
     bench_yuy2_320x240_left_classic,
@@ -298,5 +315,6 @@ criterion_group!(
     bench_yuy2_320x288_left_progressive,
     bench_yuy2_320x320_left_interlaced,
     bench_rgb24_320x320_left_decorr_interlaced,
+    bench_rgb32_1280x720_gradient_decorr_classic,
 );
 criterion_main!(benches);
