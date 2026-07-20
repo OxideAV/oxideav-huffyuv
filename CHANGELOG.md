@@ -19,6 +19,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   regeneration path exists via `OXIDEAV_HUFFYUV_GOLDEN_DUMP=1` but must
   never be needed inside a profile round).
 
+### Changed
+
+- Round 419 (performance, output-invariant): count-based package-merge
+  in `tables::compute_canonical_lengths`. The length-limited Huffman
+  builder no longer carries a per-package member list (`Vec<u16>`
+  cloned + re-sorted on every pairing across all 30 tiers); it keeps
+  only per-tier weights plus an `is_package` flag vector and resolves
+  per-symbol code lengths in one top-down prefix walk. Output is
+  byte-identical for every histogram (the merge order, tie-breaks and
+  `2n − 2` selection are preserved verbatim; guarded by a 206-case
+  equivalence test against the inlined pre-r419 member-list reference
+  plus the round-419 golden pins). Measured (aarch64, Criterion):
+  `tables_compute_canonical_lengths` peaked 577.7 µs → 20.7 µs (−96.5%),
+  flat 415.2 µs → 16.7 µs, sparse 7.55 µs → 1.36 µs; whole-frame
+  `encode_yuy2_320x240_auto_custom` 1.361 ms → 0.741 ms (107.7 →
+  197.8 MiB/s, +83%), `encode_rgb24_320x240_auto_custom` 1.967 ms →
+  1.166 ms (111.7 → 188.5 MiB/s, +69%).
+
 ### Fixed
 
 - Round 382: the `CustomV2` RLE length-table encoder

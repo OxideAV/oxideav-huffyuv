@@ -403,85 +403,115 @@ pub fn compute_canonical_lengths(histogram: &[u32; 256]) -> Result<[u8; 256]> {
     // Sort active symbols by frequency ascending (then by symbol).
     active.sort_by_key(|&(s, f)| (f, s));
 
-    // package-merge state: per length-tier `tier`, a vector of
-    // "packages" each carrying weight + a bitset (or list) of which
-    // original symbols it contributed to. Since n ≤ 256, we can store
-    // package memberships compactly as `Vec<u16>` (sorted symbol ids).
-    #[derive(Clone)]
-    struct Pkg {
-        weight: u64,
-        // List of original symbol indices (sorted) contributing to this package.
-        members: Vec<u16>,
-    }
+    // Round-419 count-based package-merge. The pre-r419 body carried a
+    // per-package member list (`Vec<u16>`, cloned + `sort_unstable`'d
+    // on every pairing) up all 30 tiers — O(n²·L) allocation/copy
+    // churn that BENCHMARKS.md ranked as the encoder's #1 hotspot
+    // (~578 µs peaked / ~1.8 ms per 3-channel CustomV2 frame; the
+    // whole `encode_frame_auto` 3–3.5× cost multiplier).
+    //
+    // The member lists are redundant. Two order facts make a
+    // counts-only walk equivalent (both preserved verbatim from the
+    // pre-r419 merge):
+    //
+    // 1. The merge is monotone and stable — packages win weight ties
+    //    (`packaged[a].weight <= leaves[b].weight`), and both inputs
+    //    are already weight-ascending — so the leaf items appearing
+    //    among the first `k` positions of any merged tier are exactly
+    //    `leaves[0..l]` (the cheapest `l` leaves, in order), and the
+    //    package items are exactly `packaged[0..p]` (the pairs
+    //    `tier_prev[0..2p]`).
+    // 2. Selecting the cheapest `take = 2n - 2` items of the top tier
+    //    therefore decomposes tier-by-tier: at each tier the selected
+    //    leaves contribute +1 code-length to the `l` cheapest active
+    //    symbols, and the `p` selected packages demand the first `2p`
+    //    items of the tier below.
+    //
+    // So we keep only per-tier weights plus a per-tier `is_package`
+    // flag vector (built bottom-up), then resolve the per-symbol
+    // counts in one top-down prefix walk — identical output to the
+    // member-list version for every histogram (regression-guarded by
+    // `round419_count_based_matches_member_reference` below and the
+    // round-419 golden pins), at O(n·L) time with zero per-package
+    // allocations.
+    let leaf_w: Vec<u64> = active.iter().map(|&(_, f)| f as u64).collect();
 
-    // Tier 0 (deepest): one package per active symbol with weight = freq.
-    let mut tier: Vec<Pkg> = active
-        .iter()
-        .map(|&(s, f)| Pkg {
-            weight: f as u64,
-            members: vec![s],
-        })
-        .collect();
-
-    let leaves: Vec<Pkg> = tier.clone();
+    // Tier 0 (deepest): one item per active symbol, weight = freq.
+    let mut tier: Vec<u64> = leaf_w.clone();
+    // flags[k][i] == true ⇔ item `i` of the tier produced by merge
+    // step `k` is a package (a pair from the previous tier) rather
+    // than a leaf.
+    let mut flags: Vec<Vec<bool>> = Vec::with_capacity(MAX_L - 1);
 
     // Iterate up MAX_L - 1 levels; each level packages the previous
     // tier (consecutive pairs) and merges with the leaf list.
     for _ in 0..(MAX_L - 1) {
-        // Package: pair up tier[0..2*k] into k packages.
-        let mut packaged: Vec<Pkg> = Vec::with_capacity(tier.len() / 2);
-        let mut i = 0;
-        while i + 1 < tier.len() {
-            let mut members = tier[i].members.clone();
-            members.extend_from_slice(&tier[i + 1].members);
-            members.sort_unstable();
-            packaged.push(Pkg {
-                weight: tier[i].weight + tier[i + 1].weight,
-                members,
-            });
-            i += 2;
-        }
-        // Merge with leaves (both already sorted by weight ascending).
-        let mut merged: Vec<Pkg> = Vec::with_capacity(packaged.len() + leaves.len());
+        let n_pkg = tier.len() / 2;
+        let mut merged: Vec<u64> = Vec::with_capacity(n_pkg + leaf_w.len());
+        let mut is_pkg: Vec<bool> = Vec::with_capacity(n_pkg + leaf_w.len());
         let mut a = 0usize;
         let mut b = 0usize;
-        while a < packaged.len() && b < leaves.len() {
-            if packaged[a].weight <= leaves[b].weight {
-                merged.push(packaged[a].clone());
+        while a < n_pkg && b < leaf_w.len() {
+            let pw = tier[2 * a] + tier[2 * a + 1];
+            if pw <= leaf_w[b] {
+                merged.push(pw);
+                is_pkg.push(true);
                 a += 1;
             } else {
-                merged.push(leaves[b].clone());
+                merged.push(leaf_w[b]);
+                is_pkg.push(false);
                 b += 1;
             }
         }
-        while a < packaged.len() {
-            merged.push(packaged[a].clone());
+        while a < n_pkg {
+            merged.push(tier[2 * a] + tier[2 * a + 1]);
+            is_pkg.push(true);
             a += 1;
         }
-        while b < leaves.len() {
-            merged.push(leaves[b].clone());
+        while b < leaf_w.len() {
+            merged.push(leaf_w[b]);
+            is_pkg.push(false);
             b += 1;
         }
         tier = merged;
+        flags.push(is_pkg);
     }
 
-    // Take the cheapest 2*n - 2 packages from the final tier; for each,
-    // each contributing leaf gets +1 length contribution.
-    // Actually the standard formulation: take 2*n - 2 cheapest from the
-    // top tier; symbol's length = number of times it appears among the
-    // 2n-2 selected packages.
+    // Standard formulation: take the 2*n - 2 cheapest items from the
+    // top tier; a symbol's length = number of selected items (across
+    // all tiers, after package expansion) that are that symbol's leaf.
     let take = 2 * n - 2;
     if tier.len() < take {
         return Err(Error::invalid(
             "package-merge: insufficient packages — alphabet too small for max length",
         ));
     }
-    // tier is already sorted by weight ascending.
+    // Top-down prefix walk (see order facts above): at each tier the
+    // first `needed` items split into `l` leaves (+1 length for the
+    // `l` cheapest active symbols) and `p` packages (`needed = 2p`
+    // items of the tier below).
     let mut counts = [0u8; 256];
-    for pkg in tier.iter().take(take) {
-        for &s in pkg.members.iter() {
+    let mut needed = take;
+    for is_pkg in flags.iter().rev() {
+        let mut pkgs = 0usize;
+        for &p in is_pkg.iter().take(needed) {
+            if p {
+                pkgs += 1;
+            }
+        }
+        let leaves_sel = needed - pkgs;
+        for &(s, _) in active.iter().take(leaves_sel) {
             counts[s as usize] = counts[s as usize].saturating_add(1);
         }
+        needed = 2 * pkgs;
+        if needed == 0 {
+            break;
+        }
+    }
+    // Tier 0 is all leaves: the remaining demand lands on the
+    // `needed` cheapest active symbols directly.
+    for &(s, _) in active.iter().take(needed) {
+        counts[s as usize] = counts[s as usize].saturating_add(1);
     }
     for &(s, _) in active.iter() {
         let l = counts[s as usize];
@@ -1329,6 +1359,194 @@ mod tests {
             for (i, slot) in three.iter().enumerate() {
                 check(slot, &format!("classic-slot-{i}"));
             }
+        }
+    }
+
+    // ───────── Round-419: count-based package-merge equivalence ─────────
+
+    /// Pre-r419 member-list package-merge, inlined verbatim as the
+    /// reference oracle for the round-419 counts-only rewrite. Same
+    /// early-outs, same sort key, same pairing, same tie-break
+    /// (`packaged.weight <= leaf.weight` → package first), same
+    /// `take = 2n - 2` selection — the only difference is that this
+    /// body carries explicit per-package member lists and counts each
+    /// symbol's occurrences among the selected top-tier packages.
+    fn compute_canonical_lengths_member_reference(histogram: &[u32; 256]) -> Result<[u8; 256]> {
+        let mut active: Vec<(u16, u32)> = Vec::new();
+        for (sym, &f) in histogram.iter().enumerate() {
+            if f > 0 {
+                active.push((sym as u16, f));
+            }
+        }
+        let mut lengths = [0u8; 256];
+        if active.is_empty() {
+            return Ok(lengths);
+        }
+        if active.len() == 1 {
+            let only = active[0].0 as usize;
+            lengths[only] = 1;
+            let dummy = if only == 0 { 1 } else { 0 };
+            lengths[dummy] = 1;
+            return Ok(lengths);
+        }
+        if active.len() == 2 {
+            lengths[active[0].0 as usize] = 1;
+            lengths[active[1].0 as usize] = 1;
+            return Ok(lengths);
+        }
+        const MAX_L: usize = 31;
+        let n = active.len();
+        active.sort_by_key(|&(s, f)| (f, s));
+        #[derive(Clone)]
+        struct Pkg {
+            weight: u64,
+            members: Vec<u16>,
+        }
+        let mut tier: Vec<Pkg> = active
+            .iter()
+            .map(|&(s, f)| Pkg {
+                weight: f as u64,
+                members: vec![s],
+            })
+            .collect();
+        let leaves: Vec<Pkg> = tier.clone();
+        for _ in 0..(MAX_L - 1) {
+            let mut packaged: Vec<Pkg> = Vec::with_capacity(tier.len() / 2);
+            let mut i = 0;
+            while i + 1 < tier.len() {
+                let mut members = tier[i].members.clone();
+                members.extend_from_slice(&tier[i + 1].members);
+                members.sort_unstable();
+                packaged.push(Pkg {
+                    weight: tier[i].weight + tier[i + 1].weight,
+                    members,
+                });
+                i += 2;
+            }
+            let mut merged: Vec<Pkg> = Vec::with_capacity(packaged.len() + leaves.len());
+            let mut a = 0usize;
+            let mut b = 0usize;
+            while a < packaged.len() && b < leaves.len() {
+                if packaged[a].weight <= leaves[b].weight {
+                    merged.push(packaged[a].clone());
+                    a += 1;
+                } else {
+                    merged.push(leaves[b].clone());
+                    b += 1;
+                }
+            }
+            while a < packaged.len() {
+                merged.push(packaged[a].clone());
+                a += 1;
+            }
+            while b < leaves.len() {
+                merged.push(leaves[b].clone());
+                b += 1;
+            }
+            tier = merged;
+        }
+        let take = 2 * n - 2;
+        if tier.len() < take {
+            return Err(Error::invalid(
+                "package-merge: insufficient packages — alphabet too small for max length",
+            ));
+        }
+        let mut counts = [0u8; 256];
+        for pkg in tier.iter().take(take) {
+            for &s in pkg.members.iter() {
+                counts[s as usize] = counts[s as usize].saturating_add(1);
+            }
+        }
+        for &(s, _) in active.iter() {
+            let l = counts[s as usize];
+            if l == 0 || l > MAX_L as u8 {
+                return Err(Error::invalid(format!(
+                    "package-merge: symbol {s} got out-of-range length {l}"
+                )));
+            }
+            lengths[s as usize] = l;
+        }
+        let mut kraft: u64 = 0;
+        for &l in lengths.iter() {
+            if l > 0 {
+                kraft = kraft.saturating_add(1u64 << (MAX_L as u8 - l));
+            }
+        }
+        if kraft != 1u64 << (MAX_L as u8) {
+            return Err(Error::invalid("package-merge: Kraft sum mismatch"));
+        }
+        Ok(lengths)
+    }
+
+    /// The round-419 counts-only body must produce byte-identical
+    /// length tables to the pre-r419 member-list reference across a
+    /// battery of histogram shapes: frame-realistic peaked, flat
+    /// (balanced-tree worst case), sparse, heavy-outlier skew, ties
+    /// everywhere (all-equal frequencies force every tie-break), a
+    /// two-tier step distribution, geometric decay (deep codes /
+    /// length-limit pressure), and 200 xorshift-random histograms with
+    /// varying live-symbol counts.
+    #[test]
+    fn round419_count_based_matches_member_reference() {
+        let mut cases: Vec<[u32; 256]> = Vec::new();
+        // Peaked (geometric decay outward from 0 / 255, all live).
+        let mut peaked = [0u32; 256];
+        for (s, slot) in peaked.iter_mut().enumerate() {
+            let d = s.min(256 - s) as u32;
+            *slot = 1_000_000 / (1 + d * d);
+        }
+        cases.push(peaked);
+        // Flat (all equal — maximal tie-breaking).
+        cases.push([7u32; 256]);
+        // Sparse (5 live).
+        let mut sparse = [0u32; 256];
+        for (i, s) in [3usize, 40, 41, 200, 255].into_iter().enumerate() {
+            sparse[s] = (i as u32 + 1) * 13;
+        }
+        cases.push(sparse);
+        // Heavy outlier.
+        let mut skew = [1u32; 256];
+        skew[0] = u32::MAX;
+        cases.push(skew);
+        // Two-tier step.
+        let mut step = [0u32; 256];
+        for (s, slot) in step.iter_mut().enumerate() {
+            *slot = if s < 128 { 10 } else { 1000 };
+        }
+        cases.push(step);
+        // Geometric doubling (length-limit pressure: unbounded Huffman
+        // would exceed 31 bits well before 256 doublings saturate).
+        let mut geo = [0u32; 256];
+        let mut w = 1u32;
+        for slot in geo.iter_mut() {
+            *slot = w;
+            w = w.saturating_mul(2);
+        }
+        cases.push(geo);
+        // 200 xorshift-random histograms, varying live-symbol counts.
+        let mut s: u32 = 0x419_419;
+        for round in 0..200u32 {
+            let mut h = [0u32; 256];
+            let live = 3 + (round % 254) as usize;
+            for slot in h.iter_mut().take(live) {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                *slot = 1 + (s % 100_000);
+            }
+            cases.push(h);
+        }
+        for (i, h) in cases.iter().enumerate() {
+            let fast = compute_canonical_lengths(h).unwrap_or_else(|e| {
+                panic!("case {i}: count-based body errored: {e:?}");
+            });
+            let reference = compute_canonical_lengths_member_reference(h).unwrap_or_else(|e| {
+                panic!("case {i}: member reference errored: {e:?}");
+            });
+            assert_eq!(
+                fast, reference,
+                "case {i}: count-based lengths must match member-list reference"
+            );
         }
     }
 
