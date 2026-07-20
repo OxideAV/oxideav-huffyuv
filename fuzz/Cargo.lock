@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "oxideav-huffyuv"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "oxideav-core",
 ]

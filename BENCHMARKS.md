@@ -33,6 +33,7 @@ progressive/interlaced split:
 | LeftDecorr (`0x40`)  | RGB24  | ClassicV2 | 320×240   | no         |
 | LeftDecorr           | RGB24  | ClassicV2 | 320×320   | **yes**    |
 | GradientDecorr (`0x41`) | RGB32 | ClassicV2 | 320×240 | no         |
+| GradientDecorr       | RGB32  | ClassicV2 | 1280×720  | **yes**    |
 
 The 320×288 (largest progressive raster, `height == 288` is NOT
 `> 288`) / 320×320 (first interlaced raster) Left pair isolates the
@@ -44,8 +45,8 @@ three families:
 
 | family | methods                                   | modes               |
 | ------ | ----------------------------------------- | ------------------- |
-| YUY2   | Left, Gradient, Median, Left(interlaced)  | ClassicV2, V1xCompat, CustomV2(auto) |
-| RGB24  | Left, LeftDecorr, GradientDecorr          | ClassicV2, V1xCompat, CustomV2(auto) |
+| YUY2   | Left, Gradient, Median, Left(interlaced)  | ClassicV2, V1xCompat, CustomV2(auto; 320×240 + 1280×720) |
+| RGB24  | Left, LeftDecorr (320×240 + 1280×720), GradientDecorr | ClassicV2, V1xCompat, CustomV2(auto) |
 | RGB32  | Left, LeftDecorr, GradientDecorr          | ClassicV2, V1xCompat |
 
 **Table-build primitives** (`benches/tables.rs`) — the per-channel,
@@ -70,143 +71,153 @@ fast path).
 ## Ranked hotspot table
 
 Measured on aarch64 (Apple, macOS), Criterion 0.5, dev machine,
-`--measurement-time 3 --sample-size 20`. Absolute wall times are
-hardware-relative; the **throughput column and the cross-scenario
-ranking are the stable, machine-independent signal** for picking the
-next PROFILE-OPT target.
+`--measurement-time 3 --sample-size 20`, post-round-419. Absolute wall
+times are hardware-relative; the **throughput column and the
+cross-scenario ranking are the stable, machine-independent signal**
+for picking the next PROFILE-OPT target.
+
+Round 419 landed four output-invariant rewrites (all pinned by
+`tests/golden_pins.rs`): a decode-side built-tables cache (v2.x keyed
+by RLE table bytes; v1.x per-family `OnceLock`s) that the encoder's
+ClassicV2/V1xCompat arms share, paired symbol reads
+(`tables::decode_pair`, two codewords per 32-bit window) + trusted bit
+consume in the decode loops, a 64-bit-accumulator `BitWriter`, and a
+count-based package-merge (`compute_canonical_lengths`, 577.7 µs →
+20.7 µs peaked).
 
 ### Decode (cost ranked slowest → fastest per byte)
 
-Post-round-310 (refilling 64-bit `bitio::BitReader`). The pre-r310
-column is retained alongside so the bit-reader win is readable inline;
-the round-310 rewrite eliminated the per-symbol from-scratch window
-reconstruction that set the flat pre-r310 ~100–123 MiB/s ceiling.
-
-| scenario                                | wall (r310)   | throughput (r310) | wall (pre-r310) |
-| --------------------------------------- | ------------- | ----------------- | --------------- |
-| rgb24 320×240 LeftDecorr                 | 1.29 ms       | 170 MiB/s         | 2.17 ms         |
-| rgb32 320×240 GradientDecorr             | 1.50 ms       | 196 MiB/s         | 2.60 ms         |
-| yuy2  320×240 Median                     | 0.87 ms       | 168 MiB/s         | 1.43 ms         |
-| yuy2  320×320 Left (interlaced)          | 0.91 ms       | 215 MiB/s         | 1.69 ms         |
-| yuy2  320×288 Left (progressive ctrl)    | 0.82 ms       | 214 MiB/s         | 1.53 ms         |
-| yuy2  320×240 predict_old                | 0.72 ms       | 203 MiB/s         | 1.28 ms         |
-| yuy2  320×240 Gradient                   | 0.71 ms       | 207 MiB/s         | 1.27 ms         |
-| yuy2  320×240 Left                       | 0.68 ms       | 217 MiB/s         | 1.18 ms         |
-| yuy2  320×240 Left (v1.x)                | 0.65 ms       | 226 MiB/s         | 1.28 ms         |
-| yuy2  1280×720 Left (interlaced)         | 7.44 ms       | 236 MiB/s         | 13.81 ms        |
-
-The decode rate roughly doubled across the board (~35–46% wall
-reduction) and is now no longer the pre-r310 flat ceiling; the
-predictor-post-pass differences (Median / decorr still the per-byte
-laggards) are starting to surface above the bit-read floor.
+| scenario                                 | wall (r419)   | throughput (r419) | (r310)    |
+| ---------------------------------------- | ------------- | ----------------- | --------- |
+| rgb24 320×320 LeftDecorr (interlaced)    | 1.70 ms       | 173 MiB/s         | —         |
+| rgb24 320×240 LeftDecorr                 | 1.26 ms       | 174 MiB/s         | 170 MiB/s |
+| yuy2  320×240 Median                     | 0.75 ms       | 197 MiB/s         | 168 MiB/s |
+| rgb32 1280×720 GradientDecorr (interlaced) | 17.2 ms     | 205 MiB/s         | —         |
+| rgb32 320×240 GradientDecorr             | 1.41 ms       | 207 MiB/s         | 196 MiB/s |
+| yuy2  320×320 Left (interlaced)          | 0.86 ms       | 228 MiB/s         | 215 MiB/s |
+| yuy2  320×240 Left                       | 0.64 ms       | 230 MiB/s         | 217 MiB/s |
+| yuy2  1280×720 Left (interlaced)         | 7.62 ms       | 231 MiB/s         | 236 MiB/s |
+| yuy2  320×288 Left (progressive ctrl)    | 0.76 ms       | 232 MiB/s         | 214 MiB/s |
+| yuy2  320×240 predict_old                | 0.63 ms       | 234 MiB/s         | 203 MiB/s |
+| yuy2  320×240 Gradient                   | 0.60 ms       | 243 MiB/s         | 207 MiB/s |
+| yuy2  320×240 Left (v1.x)                | 0.59 ms       | 247 MiB/s         | 226 MiB/s |
 
 ### Encode (cost ranked slowest → fastest per byte)
 
-| scenario                                | wall (median) | throughput   |
-| --------------------------------------- | ------------- | ------------ |
-| **auto-select RGB24 CustomV2**          | 2.11 ms       | **108 MiB/s** |
-| **auto-select YUY2 CustomV2**           | 1.43 ms       | **104 MiB/s** |
-| rgb32 320×240 GradientDecorr            | 1.19 ms       | 244 MiB/s    |
-| yuy2  320×240 Median                    | 0.58 ms       | 243 MiB/s    |
-| rgb24 320×240 GradientDecorr           | 0.86 ms       | 253 MiB/s    |
-| rgb24 320×240 LeftDecorr               | 0.76 ms       | 270 MiB/s    |
-| rgb32 320×240 LeftDecorr               | 0.96 ms       | 276 MiB/s    |
-| yuy2  320×240 Gradient                  | 0.47 ms       | 295 MiB/s    |
-| rgb24 320×240 Left v1.x                 | 0.73 ms       | 309 MiB/s    |
-| rgb32 320×240 Left v1.x                 | 0.92 ms       | 317 MiB/s    |
-| rgb32 320×240 Left                      | 0.93 ms       | 320 MiB/s    |
-| rgb24 320×240 Left                      | 0.66 ms       | 336 MiB/s    |
-| yuy2  320×320 Left (interlaced)         | 0.55 ms       | 351 MiB/s    |
-| yuy2  320×240 Left                      | 0.42 ms       | 355 MiB/s    |
-| yuy2  1280×720 Left (interlaced)        | 4.50 ms       | 376 MiB/s    |
-| yuy2  320×240 Left v1.x                 | 0.37 ms       | 384 MiB/s    |
+The encode side moved the most in round 419 (BitWriter + table cache +
+package-merge): every scenario is 1.9–2.9× its pre-r419 rate.
+
+| scenario                                 | wall (r419)   | throughput      | (pre-r419) |
+| ---------------------------------------- | ------------- | --------------- | ---------- |
+| **auto-select RGB24 CustomV2**           | 0.94 ms       | **233 MiB/s**   | 112 MiB/s  |
+| **auto-select YUY2 CustomV2**            | 0.59 ms       | **250 MiB/s**   | 108 MiB/s  |
+| auto-select YUY2 CustomV2 1280×720       | 6.17 ms       | 285 MiB/s       | —          |
+| rgb32 320×240 GradientDecorr             | 0.76 ms       | 385 MiB/s       | 262 MiB/s  |
+| rgb24 1280×720 LeftDecorr (interlaced)   | 6.07 ms       | 434 MiB/s       | —          |
+| rgb24 320×240 GradientDecorr             | 0.47 ms       | 468 MiB/s       | 278 MiB/s  |
+| rgb32 320×240 Left v1.x                  | 0.60 ms       | 489 MiB/s       | 322 MiB/s  |
+| rgb24 320×240 Left v1.x                  | 0.44 ms       | 496 MiB/s       | 321 MiB/s  |
+| yuy2  320×240 Median                     | 0.28 ms       | 516 MiB/s       | 267 MiB/s  |
+| rgb24 320×240 LeftDecorr                 | 0.40 ms       | 549 MiB/s       | 301 MiB/s  |
+| rgb32 320×240 LeftDecorr                 | 0.52 ms       | 568 MiB/s       | 324 MiB/s  |
+| rgb32 320×240 Left                       | 0.48 ms       | 614 MiB/s       | 338 MiB/s  |
+| yuy2  1280×720 Left (interlaced)         | 2.73 ms       | 645 MiB/s       | 401 MiB/s  |
+| rgb24 320×240 Left                       | 0.31 ms       | 706 MiB/s       | 353 MiB/s  |
+| yuy2  320×240 Gradient                   | 0.20 ms       | 727 MiB/s       | 324 MiB/s  |
+| yuy2  320×240 Left v1.x                  | 0.18 ms       | 825 MiB/s       | 408 MiB/s  |
+| yuy2  320×320 Left (interlaced)          | 0.22 ms       | 887 MiB/s       | 364 MiB/s  |
+| yuy2  320×240 Left                       | 0.14 ms       | **1.04 GiB/s**  | 364 MiB/s  |
+
+### Roundtrip (encode → decode, decode-dominated)
+
+| scenario                                 | wall (r419)   | throughput |
+| ---------------------------------------- | ------------- | ---------- |
+| yuy2  320×240 Left ClassicV2             | 0.79 ms       | 185 MiB/s  |
+| yuy2  320×240 Gradient ClassicV2         | 0.83 ms       | 177 MiB/s  |
+| yuy2  320×240 Median ClassicV2           | 1.05 ms       | 139 MiB/s  |
+| rgb24 320×240 LeftDecorr ClassicV2       | 1.69 ms       | 130 MiB/s  |
+| rgb32 320×240 GradientDecorr ClassicV2   | 2.13 ms       | 137 MiB/s  |
 
 ### Table-build primitives (per channel, per frame)
 
-| scenario                                       | wall (median) |
-| ---------------------------------------------- | ------------- |
-| `compute_canonical_lengths` peaked             | 589 µs        |
-| `compute_canonical_lengths` flat               | 415 µs        |
-| `compute_canonical_lengths` sparse             | 7.6 µs        |
-| `build_from_lengths` peaked                     | 30 µs         |
-| `build_from_lengths` flat                       | 27 µs         |
-| `build_from_lengths` sparse                     | 28 µs         |
-| histogram → table (fused) peaked                | 633 µs        |
-| histogram → table (fused) flat                  | 472 µs        |
-| RLE round-trip peaked                           | 209 ns        |
-| RLE round-trip flat                             | 164 ns        |
-| RLE round-trip sparse                           | 177 ns        |
+| scenario                                       | wall (r419)  | (pre-r419) |
+| ---------------------------------------------- | ------------ | ---------- |
+| `compute_canonical_lengths` peaked             | 20.6 µs      | 577.7 µs   |
+| `compute_canonical_lengths` flat               | 16.0 µs      | 415.2 µs   |
+| `compute_canonical_lengths` sparse             | 1.32 µs      | 7.55 µs    |
+| `build_from_lengths` peaked                     | 25.8 µs      | 24.8 µs    |
+| `build_from_lengths` flat                       | 26.8 µs      | 26.1 µs    |
+| `build_from_lengths` sparse                     | 24.4 µs      | 24.6 µs    |
+| histogram → table (fused) peaked                | 46.5 µs      | 628 µs     |
+| histogram → table (fused) flat                  | 41.5 µs      | 469 µs     |
+| RLE round-trip peaked                           | 210 ns       | 209 ns     |
+| RLE round-trip flat                             | 160 ns       | 153 ns     |
+| RLE round-trip sparse                           | 258 ns       | 241 ns     |
 
-**Headline finding:** the package-merge length builder
-(`compute_canonical_lengths`, ~589 µs peaked) dominates the table-build
-pipeline by ~20× over the decoder-side `build_from_lengths` (~30 µs) and
-by ~2800× over the RLE codec (~209 ns). For a 3-channel CustomV2 frame
-the encoder pays ~1.8 ms in package-merge alone — which is why
-`encode_frame_auto` (one length-table build per candidate method) is the
-3–3.5× encode-side outlier. Any auto-select speedup should target this
-primitive; the decode-side table build and the RLE codec are negligible.
+**Headline finding (r419):** the round-419 count-based package-merge
+removed the table-build hotspot outright — `compute_canonical_lengths`
+peaked went 577.7 µs → 20.6 µs (−96%), so the whole
+histogram-to-decode-ready-table pipeline is now ~46 µs/channel and
+`build_from_lengths` (unchanged, ~26 µs, dominated by its 64-Ki
+primary-LUT fill) is the new largest primitive. Decode/encode no
+longer pay `build_from_lengths` per frame at all outside CustomV2
+(built-tables cache).
 
 ## Interpretation
 
-1. **Decode is still the whole-pipeline floor, but the floor moved.**
-   Round 310's refilling bit reader lifted decode from the flat pre-r310
-   ~100–123 MiB/s ceiling to ~170–236 MiB/s. Encode of the same frame
-   is now ~1.3–2× faster per byte (was 2–3.5×); end-to-end
-   (`roundtrip`) cost remains decode-dominated but by a smaller margin.
+1. **Encode is no longer the cheap side by a small margin — it is
+   2–4.6× faster per byte than decode.** The 64-bit `BitWriter`
+   (−20% to −52% per scenario), the shared table cache (ClassicV2
+   −15% to −30% on top), and the package-merge rewrite (auto-custom
+   +83%/+69% throughput) compounded to 1.9–2.9× on every encode
+   scenario; YUY2 Left ClassicV2 crossed 1 GiB/s.
 
-2. **Decode throughput is no longer flat across predictors.** Pre-r310
-   the rate was uniform (101–116 MiB/s for YUY2 Left / Gradient /
-   Median / predict_old / v1.x) — the strongest evidence that the
-   per-symbol Huffman read, not the `inverse_*_post` predictor pass,
-   governed throughput. Round 310 removed that bottleneck (per-symbol
-   from-scratch window reconstruction → a 64-bit accumulator topped up
-   one word per ~32 consumed bits), and the predictor post-passes now
-   surface above the bit-read floor: Median (0.87 ms, its own
-   gradient/median scan) and the RGB-decorr passes (LeftDecorr 1.29 ms,
-   GradientDecorr 1.50 ms — extra per-byte reconstruction work) are
-   measurably the per-byte laggards, while the cheap LEFT/v1.x paths
-   run fastest.
+2. **Decode is the whole-pipeline floor everywhere now** (see the
+   roundtrip table: every roundtrip number is within ~25% of its
+   decode-only number). The round-419 decode levers (table cache
+   −11% to −21% on 320-class rasters; paired symbol reads + trusted
+   consume −2% to −5.5%) moved the floor to ~173–247 MiB/s, and the
+   per-symbol Huffman read still dominates: the r419 `sample` profile
+   attributes ~95% of a LEFT-path decode to the symbol loop even
+   after pairing.
 
-3. **Interlaced overhead is ~11%** (320×320 interlaced 0.91 ms vs
-   320×288 progressive control 0.82 ms — close to the +11% row delta,
-   so the field-split + `interleave_fields` row-gather is near-free per
-   extra row; the cost is the raster, not the split).
+3. **The predictor post-pass spread is unchanged** — Median and the
+   RGB-decorr inverses remain the per-byte laggards (173–207 MiB/s
+   vs 230–247 MiB/s for LEFT-family paths), matching the r310
+   observation; those passes are already SWAR / macropixel-step
+   rewritten (r91 / r181 / r255 / r304).
 
-4. **The encode auto-selector is the encode-side hotspot** — CustomV2
-   `encode_frame_auto` runs at ~104–108 MiB/s, a clean 3–3.5× slower
-   than any single-method fixed encode, because it builds a
-   package-merge length table per candidate method.
+4. **Interlaced overhead stays ~1–2%** beyond the extra rows (320×320
+   interlaced 228 MiB/s vs 320×288 progressive 232 MiB/s), so the
+   field split + `interleave_fields` row-gather remains near-free.
 
 ## Next PROFILE-OPT target
 
-**Primary (encode): the `compute_canonical_lengths` package-merge
-length builder.** With the round-310 decode bit-read bottleneck cleared,
-the encode auto-selector is the workspace's largest remaining
-per-byte cost. The isolated table-build bench (`benches/tables.rs`)
-confirms this primitive (~589 µs peaked, ~1.8 ms for a 3-channel frame)
-is the entire table-build cost — `build_from_lengths` (~30 µs) and the
-RLE codec (~209 ns) are noise beside it. At 3–3.5× the cost of
-fixed-method encode it dominates any auto-selected encode; caching /
-reusing per-candidate length-table work across the method sweep, or a
-cheaper bounded-depth length algorithm, is the lever. Gate the
-whole-frame effect on `encode_yuy2_320x240_auto_custom` and the
-isolated primitive on `tables_compute_canonical_lengths/peaked`.
+**Primary (decode): amortise the per-symbol LUT dependency chain
+further.** After r419's pairing, each 2-symbol step still carries a
+serialized LUT-load → shift → LUT-load chain. The two candidate
+levers, in order of expected value: (a) a second-level pair LUT
+(16-bit window → both symbols + combined length in one load) built
+lazily behind the round-419 built-tables cache so its ~256-KiB/table
+cost is paid once per stream, not per frame; (b) decoding the two
+independent field bitstreams of an interlaced frame on two threads
+(the fields are independent by wire design — spec/02 §2 — so this is
+parallelism the format offers for free, but it needs a decision about
+threading policy in a decoder that is currently allocation-light and
+thread-free). Gate on `decode_yuy2_320x240_left_classic` and the
+1280×720 scenarios.
 
-**Secondary (decode): the predictor inverse post-passes now visible
-above the round-310 bit-read floor.** Median (`inverse_yuy2_median`)
-and the RGB-decorr inverses (`inverse_rgb_decorr_bgr/bgra`,
-`inverse_gradient_post`) are the per-byte laggards in the post-r310
-decode table; a profile run on `decode_rgb24_320x240_left_decorr` or
-`decode_yuy2_320x240_median_classic` should now attribute the spread
-above the LEFT path to the post-pass rather than the symbol read. The
-LEFT / gradient / median / decorr inverses are already SWAR /
-macropixel-step / `chunks_exact_mut` rewritten (r91 / r181 / r255 /
-r304), so the next decode win is likely batching the macropixel
-symbol read (decode N codewords before applying the predictor) rather
-than another post-pass rewrite.
+**Secondary (encode, CustomV2 only): skip the dead 64-Ki primary-LUT
+fill.** CustomV2 still builds three decode-grade `HuffTable`s per
+frame, but the emit path only reads `entries` — ~26 µs × 3 of
+`build_from_lengths` per frame is LUT fill the encoder never uses. A
+lean encoder-side table type (entries-only) would cut ~50–75 µs from
+every CustomV2 frame (~10% of the 320×240 auto-custom scenario) at
+the cost of a second table shape; only worth it if CustomV2 encode
+becomes a measured consumer bottleneck.
 
-*(Superseded) Primary pre-r310 target — the inner per-symbol Huffman
-read in `decoder::decode_{yuy2,rgb24,rgb32}_field` — was landed in
-round 310 (refilling 64-bit `bitio::BitReader`): ≈ 35–46% decode
-wall reduction, ~115 → ~217 MiB/s on the YUY2 Left 320×240 headline
-gate.)*
+*(Superseded) The pre-r419 primary target — `compute_canonical_lengths`
+package-merge — landed in round 419 as the count-based rewrite
+(−96%, auto-custom throughput +83%/+69%). The pre-r310 target — the
+per-symbol window reconstruction — landed in round 310 (refilling
+64-bit `BitReader`, ≈ 35–46% decode wall reduction).*

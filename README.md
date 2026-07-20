@@ -101,10 +101,16 @@ HuffYUV stream's `biCompression` straight through `CodecResolver`.
 The full Criterion suite and the ranked hotspot table live in
 [`BENCHMARKS.md`](BENCHMARKS.md). Four bench targets
 (`benches/{decode,encode,roundtrip,tables}.rs`) cover the
-`(family, method, extradata-mode, raster)` matrix; inputs are
-synthesised on the fly from a deterministic xorshift32 +
+`(family, method, extradata-mode, raster)` matrix up to 1280×720;
+inputs are synthesised on the fly from a deterministic xorshift32 +
 diagonal-gradient pattern (no committed fixtures). On Apple Silicon
-the YUY2-LEFT 320×240 decode runs around 0.7 ms/frame.
+(post-round-419: built-tables cache shared by decode + encode, paired
+symbol reads, 64-bit-accumulator `BitWriter`, count-based
+package-merge) YUY2-LEFT 320×240 decodes at ~0.64 ms/frame
+(~230 MiB/s) and encodes at ~0.14 ms/frame (~1.0 GiB/s); decode runs
+~173–247 MiB/s and encode ~233 MiB/s–1.0 GiB/s across the matrix. All
+round-419 performance work is output-invariant, pinned by the 78-entry
+golden-hash suite in `tests/golden_pins.rs`.
 
 ## Fuzzing
 
