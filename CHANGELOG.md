@@ -75,6 +75,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (yuy2 left 320×240 ≈ −2%, median ≈ −4.4%, rgb32 GradientDecorr
   ≈ −5%, yuy2 1280×720 ≈ −4.8%).
 
+- Round 419 (performance, output-invariant): 64-bit accumulator
+  `bitio::BitWriter`. The 32-bit writer split every codeword across a
+  data-dependent 1–2-iteration loop (chunk carve, two conditional
+  shifts, in-loop flush test) — per-residual-byte work on the encoder
+  emit hot path. The widened accumulator buffers bits in the top half
+  of a u64, so a write is one shift+or plus a single "≥ 32 buffered →
+  flush LE word" test; the MSB-alignment contract (zero bits below
+  `32 − n_bits`, satisfied by every in-crate code producer) is pinned
+  by a `debug_assert`. Emitted byte stream is identical (writer/reader
+  round-trip tests + golden pins). Measured (aarch64, Criterion,
+  same-thermal-window A/B): encode wall −20% to −52% across all
+  scenarios — e.g. `encode_yuy2_320x240_left_v1x` 360.1 µs → 184.3 µs
+  (−51%, ~800 MiB/s), `encode_yuy2_320x240_left_classic` 410.8 µs →
+  228.3 µs (−44%), `encode_yuy2_1280x720_left_classic` 4.486 ms →
+  2.803 ms (−38%, ~630 MiB/s), auto-custom scenarios a further −20%
+  to −22% on top of the package-merge win.
+
 ### Fixed
 
 - Round 382: the `CustomV2` RLE length-table encoder

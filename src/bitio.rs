@@ -184,12 +184,33 @@ impl<'a> BitReader<'a> {
 /// MSB-first bit writer that flushes to a `Vec<u8>` as 32-bit LE
 /// words. spec/02 §4: each codeword's bits flow into the stream in
 /// reading order; flushed words are LE-stored.
+///
+/// # Accumulator model (round 419)
+///
+/// The pre-r419 writer kept a 32-bit accumulator and split each code
+/// across a data-dependent 1–2-iteration loop (chunk carve, two
+/// conditional shifts, an in-loop flush test) — per-codeword work on
+/// the encoder's emit hot path (one `write_msb` per residual byte).
+///
+/// Round 419 widens the accumulator to 64 bits with the buffered bits
+/// occupying the TOP `bits_buffered` positions. A write becomes
+/// branch-free bit placement — the MSB-aligned 32-bit code is placed
+/// at bit `63 - bits_buffered` with one shift+or (`bits_buffered < 32`
+/// always holds on entry, and `n_bits ≤ 32`, so nothing ever falls off
+/// the low end) — followed by a single "≥ 32 buffered → flush top LE
+/// word" test. The emitted byte stream is identical: whole 32-bit LE
+/// words in the same order, partial-word tail zero-padded, exactly as
+/// the 32-bit writer produced (regression-guarded by the existing
+/// writer/reader round-trip tests and the round-419 golden pins).
 pub struct BitWriter {
     out: Vec<u8>,
-    /// 32-bit accumulator; bits placed top-down (newest at bit
-    /// position `(31 - bits_buffered)`).
-    acc: u32,
-    /// Number of bits currently held in `acc` (0..32).
+    /// 64-bit accumulator; buffered bits sit in the TOP
+    /// `bits_buffered` positions (newest at bit `63 - bits_buffered`),
+    /// all lower bits zero.
+    acc: u64,
+    /// Number of bits currently held in `acc` (0..32 outside
+    /// `write_msb`; a flush inside `write_msb` restores the invariant
+    /// before returning).
     bits_buffered: u32,
 }
 
@@ -204,44 +225,27 @@ impl BitWriter {
 
     /// Write the top `n_bits` of `code` (an MSB-aligned 32-bit value).
     /// `n_bits` is in 1..=32.
+    #[inline]
     pub fn write_msb(&mut self, code: u32, n_bits: u32) {
         debug_assert!((1..=32).contains(&n_bits));
-        let mut bits_remaining = n_bits;
-        let mut payload = code;
-        while bits_remaining > 0 {
-            let space = 32 - self.bits_buffered;
-            let take = bits_remaining.min(space);
-            // The next `take` bits to write are the top `take` of
-            // `payload`. Shift them into the accumulator at position
-            // `(31 - bits_buffered)..(31 - bits_buffered - take + 1)`.
-            let chunk = if take == 32 {
-                payload
-            } else {
-                payload >> (32 - take)
-            };
-            // Mask out any low bits below `take` then shift into
-            // position.
-            let shift = 32 - self.bits_buffered - take;
-            self.acc |= chunk << shift;
-            self.bits_buffered += take;
-            // Consume `take` bits from `payload`.
-            if take == 32 {
-                payload = 0;
-            } else {
-                payload <<= take;
-            }
-            bits_remaining -= take;
-            if self.bits_buffered == 32 {
-                self.flush_word();
-            }
+        debug_assert!(self.bits_buffered < 32);
+        // MSB-alignment contract: bits below `32 - n_bits` must be
+        // zero (they are ORed into the accumulator's zero region).
+        // Every in-crate producer satisfies this (`HuffEntry::code`
+        // and the v1.x builder both left-align with a zero tail).
+        debug_assert!(n_bits == 32 || code & ((1u32 << (32 - n_bits)) - 1) == 0);
+        // `code` is MSB-aligned with zeros below bit `32 - n_bits`, so
+        // the whole 32-bit value can be placed as-is: its significant
+        // bits land at `63 - bits_buffered` downward and the zero tail
+        // merges into the accumulator's zero region.
+        self.acc |= ((code as u64) << 32) >> self.bits_buffered;
+        self.bits_buffered += n_bits;
+        if self.bits_buffered >= 32 {
+            let word = (self.acc >> 32) as u32;
+            self.out.extend_from_slice(&word.to_le_bytes());
+            self.acc <<= 32;
+            self.bits_buffered -= 32;
         }
-    }
-
-    fn flush_word(&mut self) {
-        let bytes = self.acc.to_le_bytes();
-        self.out.extend_from_slice(&bytes);
-        self.acc = 0;
-        self.bits_buffered = 0;
     }
 
     /// Finalise the stream — flush any partial word as a 4-byte LE
@@ -250,7 +254,10 @@ impl BitWriter {
     /// §4 permits).
     pub fn finish(mut self) -> Vec<u8> {
         if self.bits_buffered > 0 {
-            self.flush_word();
+            let word = (self.acc >> 32) as u32;
+            self.out.extend_from_slice(&word.to_le_bytes());
+            self.acc = 0;
+            self.bits_buffered = 0;
         }
         self.out
     }
