@@ -508,6 +508,12 @@ pub(crate) struct ThreeTables {
     /// built on first budget-≥ 2 interlaced decode of the stream and
     /// reused for its lifetime via the round-419 table cache.
     pub(crate) scan_luts: ScanLuts,
+    /// Round-429: lazily-built full pair LUTs for the serial decode
+    /// loops (see [`PairSymLuts`]) — both symbols + combined length in
+    /// one 32-bit load. `Default`-initialised empty; built on the
+    /// first decode of the stream that walks the pair and reused for
+    /// its lifetime via the round-419 table cache.
+    pub(crate) pair_sym_luts: PairSymLuts,
 }
 
 /// Lazily-built scan-side pair-length LUTs
@@ -532,7 +538,48 @@ pub(crate) struct ScanLuts {
     s3s3: std::sync::OnceLock<Box<[u8]>>,
 }
 
+/// Lazily-built decode-side full pair LUTs
+/// ([`crate::tables::build_pair_sym_lut`]): the r419 profile pinned
+/// ~95% of a LEFT-family decode in the per-symbol loop even after the
+/// paired reads, with the serialized LUT-load → shift → LUT-load
+/// chain of [`crate::tables::decode_pair`] on the critical path. Each
+/// entry maps the top 16 window bits to BOTH symbols + the combined
+/// length of the next two codewords in one 32-bit load (`0` =
+/// unresolvable from 16 known bits → exact `decode_pair` /
+/// `decode_one` fallback). Same (first-slot, second-slot) pairs as
+/// [`ScanLuts`]; 256 KiB per pair, built at most once per cached
+/// `ThreeTables` (`OnceLock`) and only for the pairs the stream's
+/// family actually decodes with.
+#[derive(Debug, Default)]
+pub(crate) struct PairSymLuts {
+    s1s2: std::sync::OnceLock<Box<[u32]>>,
+    s1s3: std::sync::OnceLock<Box<[u32]>>,
+    s2s1: std::sync::OnceLock<Box<[u32]>>,
+    s3s3: std::sync::OnceLock<Box<[u32]>>,
+}
+
 impl ThreeTables {
+    fn pair_sym_lut_s1s2(&self) -> &[u32] {
+        self.pair_sym_luts
+            .s1s2
+            .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot1, &self.slot2))
+    }
+    fn pair_sym_lut_s1s3(&self) -> &[u32] {
+        self.pair_sym_luts
+            .s1s3
+            .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot1, &self.slot3))
+    }
+    fn pair_sym_lut_s2s1(&self) -> &[u32] {
+        self.pair_sym_luts
+            .s2s1
+            .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot2, &self.slot1))
+    }
+    fn pair_sym_lut_s3s3(&self) -> &[u32] {
+        self.pair_sym_luts
+            .s3s3
+            .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot3, &self.slot3))
+    }
+
     fn scan_lut_s1s2(&self) -> &[u8] {
         self.scan_luts
             .s1s2
@@ -615,6 +662,7 @@ pub(crate) mod table_cache {
             slot2: HuffTable::build_from_lengths(&lengths[1])?,
             slot3: HuffTable::build_from_lengths(&lengths[2])?,
             scan_luts: ScanLuts::default(),
+            pair_sym_luts: PairSymLuts::default(),
         });
         if let Ok(mut map) = extradata_cache().lock() {
             if map.len() >= EXTRADATA_CACHE_CAP {
@@ -655,6 +703,7 @@ pub(crate) mod table_cache {
                 slot2: table_a.clone(),
                 slot3: table_a,
                 scan_luts: ScanLuts::default(),
+                pair_sym_luts: PairSymLuts::default(),
             });
         }
         let mut cursor: &[u8] = v1x_lengths_set_b();
@@ -668,6 +717,7 @@ pub(crate) mod table_cache {
             slot2: table_b.clone(),
             slot3: table_b,
             scan_luts: ScanLuts::default(),
+            pair_sym_luts: PairSymLuts::default(),
         })
     }
 }
@@ -767,13 +817,30 @@ fn decode_yuy2_field(
     // code is longer than 16 bits. Output is byte-identical (see
     // `tables::decode_pair` docs + the round419 pair/sequential
     // equivalence test in `tables.rs`).
+    // Round-429: full pair LUTs on the serial critical path. The r419
+    // profile still pinned ~95% of a LEFT-family decode in this loop,
+    // with `decode_pair`'s serialized load-A → shift → load-B chain as
+    // the dependency spine. Each macropixel half now tries ONE 32-bit
+    // load (top 16 window bits → both symbols + combined length,
+    // `tables::build_pair_sym_lut` soundness note); `0` falls back to
+    // the exact `decode_pair` / `decode_one` walk, so long codes and
+    // 16-bit-straddling pairs are served unchanged. Byte-identical
+    // output (r419 golden matrix + randomized LUT/pair equivalence
+    // sweep below).
+    let lut_y1u = tables.pair_sym_lut_s1s2();
+    let lut_y2v = tables.pair_sym_lut_s1s3();
     debug_assert!(total_bytes >= 4);
     let body_end = total_bytes - ((total_bytes - 4) & 3);
     let mut byte_idx = 4usize;
     while byte_idx < body_end {
         // (Y₁ → slot1, U → slot2)
         let w = reader.peek_window();
-        if let Some((sym_y1, sym_u, n)) = decode_pair(&tables.slot1, &tables.slot2, w) {
+        let e = lut_y1u[(w >> 16) as usize];
+        if e != 0 {
+            reader.consume_bits_trusted(e >> 16);
+            pixels[byte_idx] = e as u8;
+            pixels[byte_idx + 1] = (e >> 8) as u8;
+        } else if let Some((sym_y1, sym_u, n)) = decode_pair(&tables.slot1, &tables.slot2, w) {
             reader.consume_bits_trusted(n);
             pixels[byte_idx] = sym_y1;
             pixels[byte_idx + 1] = sym_u;
@@ -787,7 +854,12 @@ fn decode_yuy2_field(
         }
         // (Y₂ → slot1, V → slot3)
         let w = reader.peek_window();
-        if let Some((sym_y2, sym_v, n)) = decode_pair(&tables.slot1, &tables.slot3, w) {
+        let e = lut_y2v[(w >> 16) as usize];
+        if e != 0 {
+            reader.consume_bits_trusted(e >> 16);
+            pixels[byte_idx + 2] = e as u8;
+            pixels[byte_idx + 3] = (e >> 8) as u8;
+        } else if let Some((sym_y2, sym_v, n)) = decode_pair(&tables.slot1, &tables.slot3, w) {
             reader.consume_bits_trusted(n);
             pixels[byte_idx + 2] = sym_y2;
             pixels[byte_idx + 3] = sym_v;
@@ -921,11 +993,26 @@ fn decode_rgb24_field(
     // Round-419: paired symbol reads — the first two wire positions
     // (mode-resolved above) come out of one `decode_pair` window read;
     // the +2 position stays a single read. See the YUY2 loop note.
+    // Round-429: the pair read is fronted by the full pair LUT — one
+    // 32-bit load resolves both symbols + the combined length when
+    // the pair fits in the 16 known window bits; `0` falls back to
+    // the exact `decode_pair` / `decode_one` walk. See the YUY2 loop
+    // note.
+    let lut_w01 = if decorrelate {
+        tables.pair_sym_lut_s2s1()
+    } else {
+        tables.pair_sym_lut_s1s2()
+    };
     let n_pixels = width_us * height_us;
     for px in 1..n_pixels {
         let bgr_off = px * 3;
         let w = reader.peek_window();
-        if let Some((v0, v1, n)) = decode_pair(s_w0, s_w1, w) {
+        let e = lut_w01[(w >> 16) as usize];
+        if e != 0 {
+            reader.consume_bits_trusted(e >> 16);
+            pixels[bgr_off + o_w0] = e as u8;
+            pixels[bgr_off + o_w1] = (e >> 8) as u8;
+        } else if let Some((v0, v1, n)) = decode_pair(s_w0, s_w1, w) {
             reader.consume_bits_trusted(n);
             pixels[bgr_off + o_w0] = v0;
             pixels[bgr_off + o_w1] = v1;
@@ -1030,10 +1117,25 @@ fn decode_rgb32_field(
     };
     // Round-419: paired symbol reads — (w0, w1) then (R/R−G, A), each
     // pair off one `decode_pair` window read. See the YUY2 loop note.
+    // Round-429: full pair LUTs front both pair reads — one 32-bit
+    // load resolves both symbols + the combined length when the pair
+    // fits in the 16 known window bits; `0` falls back to the exact
+    // `decode_pair` / `decode_one` walk. See the YUY2 loop note.
+    let lut_w01 = if decorrelate {
+        tables.pair_sym_lut_s2s1()
+    } else {
+        tables.pair_sym_lut_s1s2()
+    };
+    let lut_ra = tables.pair_sym_lut_s3s3();
     for px in 1..n_pixels {
         let off = px * 4;
         let w = reader.peek_window();
-        if let Some((v0, v1, n)) = decode_pair(s_w0, s_w1, w) {
+        let e = lut_w01[(w >> 16) as usize];
+        if e != 0 {
+            reader.consume_bits_trusted(e >> 16);
+            pixels[off + o_w0] = e as u8;
+            pixels[off + o_w1] = (e >> 8) as u8;
+        } else if let Some((v0, v1, n)) = decode_pair(s_w0, s_w1, w) {
             reader.consume_bits_trusted(n);
             pixels[off + o_w0] = v0;
             pixels[off + o_w1] = v1;
@@ -1048,7 +1150,12 @@ fn decode_rgb32_field(
         // Wire positions +2 (R or R−G) and +3 (A) both use the slot-3
         // codebook (spec/03 §1.2; alpha shares slot 3 in both modes).
         let w = reader.peek_window();
-        if let Some((v2, v3, n)) = decode_pair(&tables.slot3, &tables.slot3, w) {
+        let e = lut_ra[(w >> 16) as usize];
+        if e != 0 {
+            reader.consume_bits_trusted(e >> 16);
+            pixels[off + 2] = e as u8;
+            pixels[off + 3] = (e >> 8) as u8;
+        } else if let Some((v2, v3, n)) = decode_pair(&tables.slot3, &tables.slot3, w) {
             reader.consume_bits_trusted(n);
             pixels[off + 2] = v2;
             pixels[off + 3] = v3;
@@ -2635,6 +2742,107 @@ mod round420_pair_len_lut_tests {
         // A CustomV2 encode derives per-channel tables from the frame
         // histograms — three genuinely distinct codebooks.
         let mut s: u32 = 0xBEEF_0042;
+        let mut pixels = vec![0u8; 64 * 300 * 2];
+        for slot in pixels.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        let (strf, _) = encode_frame_with_mode(
+            PixelFamily::Yuy2,
+            Method::Median,
+            64,
+            300,
+            &pixels,
+            ExtradataMode::CustomV2,
+        )
+        .expect("encode");
+        let cfg = StreamConfig::parse_bitmapinfoheader(&strf).expect("parse");
+        let tables = build_three_tables(&cfg).expect("tables");
+        check_pair(&tables.slot1, &tables.slot2, "custom s1s2");
+        check_pair(&tables.slot1, &tables.slot3, "custom s1s3");
+        check_pair(&tables.slot2, &tables.slot1, "custom s2s1");
+        check_pair(&tables.slot3, &tables.slot3, "custom s3s3");
+    }
+}
+
+#[cfg(test)]
+mod round429_pair_sym_lut_tests {
+    //! Round-429 soundness guard for the decode-side full pair LUTs
+    //! (`tables::build_pair_sym_lut`): a non-zero entry claims that
+    //! EVERY 32-bit window sharing the entry's 16-bit prefix decodes
+    //! its next two codewords to those exact `(symbol, symbol,
+    //! combined length)` values. Verify the claim against the
+    //! production `decode_pair` / `decode_one` walk across randomised
+    //! low window bits, for all four (first, second) slot pairs the
+    //! serial decode loops consume, on both the v1.x compiled-in
+    //! tables and a histogram-derived CustomV2 set. Zero entries are
+    //! checked too: they must occur only where the exact walk needs
+    //! more than 16 known bits (`l1 + l2 > 16` or a primary-LUT
+    //! overflow), so the fallback arm — not silence — serves them.
+
+    use super::*;
+    use crate::tables::{build_pair_sym_lut, decode_one, decode_pair};
+
+    fn check_pair(a: &HuffTable, b: &HuffTable, label: &str) {
+        let lut = build_pair_sym_lut(a, b);
+        let mut s: u32 = 0x0429_5eed;
+        for (p, &entry) in lut.iter().enumerate() {
+            if entry == 0 {
+                // Zero ⇒ the pair must genuinely be unresolvable from
+                // 16 known bits (overflow or straddling): reproduce
+                // the builder's decision from the zero-completed
+                // window and assert one of those two conditions.
+                let w = (p as u32) << 16;
+                if let Some((_, _, n)) = decode_pair(a, b, w) {
+                    assert!(
+                        n > 16,
+                        "{label}: prefix 0x{p:04x}: zero entry but pair fits 16 bits"
+                    );
+                }
+                continue;
+            }
+            for _ in 0..4 {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let w = ((p as u32) << 16) | (s & 0xFFFF);
+                // Reference: the exact walk the decode loops fall
+                // back to.
+                let (ra, rb, n) = if let Some(hit) = decode_pair(a, b, w) {
+                    hit
+                } else {
+                    let (sa, l0) = decode_one(a, w).expect("code A must decode");
+                    let (sb, l1) =
+                        decode_one(b, w << l0).expect("code B must decode within window");
+                    (sa, sb, (l0 + l1) as u32)
+                };
+                assert_eq!(
+                    (entry as u8, (entry >> 8) as u8, entry >> 16),
+                    (ra, rb, n),
+                    "{label}: prefix 0x{p:04x} low 0x{:04x}: LUT entry vs walk diverged",
+                    w & 0xFFFF
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round429_pair_sym_lut_sound_v1x_tables() {
+        let yuv = table_cache::v1x_tables(PixelFamily::Yuy2).expect("tables");
+        check_pair(&yuv.slot1, &yuv.slot2, "v1x yuv s1s2");
+        check_pair(&yuv.slot1, &yuv.slot3, "v1x yuv s1s3");
+        let rgb = table_cache::v1x_tables(PixelFamily::Rgb24).expect("tables");
+        check_pair(&rgb.slot2, &rgb.slot1, "v1x rgb s2s1");
+        check_pair(&rgb.slot3, &rgb.slot3, "v1x rgb s3s3");
+    }
+
+    #[test]
+    fn round429_pair_sym_lut_sound_custom_tables() {
+        use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+        use crate::header::Method;
+        let mut s: u32 = 0xBEEF_0429;
         let mut pixels = vec![0u8; 64 * 300 * 2];
         for slot in pixels.iter_mut() {
             s ^= s << 13;

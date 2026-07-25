@@ -968,6 +968,48 @@ pub fn decode_pair(a: &HuffTable, b: &HuffTable, window: u32) -> Option<(u8, u8,
 /// bit 16) stays `0` and the scanner falls back to the exact
 /// [`decode_pair`] / [`decode_one`] path. 64 KiB per table pair,
 /// built lazily once per stream behind the round-419 table cache.
+/// Round-429 full pair LUT for the serial decode loops: maps the top
+/// 16 window bits to BOTH symbols and the combined bit length of the
+/// next TWO codewords (first from `a`, second from `b`) in one 32-bit
+/// load — `sym_a | sym_b << 8 | (l1 + l2) << 16` — or `0` when the
+/// pair cannot be resolved from 16 known bits alone.
+///
+/// Same soundness argument as [`build_pair_len_lut`]: an entry is
+/// non-zero only when `l1 + l2 ≤ 16`, i.e. both codewords lie
+/// entirely inside the 16 known bits, so every 32-bit window sharing
+/// those top 16 bits decodes to the same two `(symbol, length)`
+/// pairs. `0` is unreachable for a resolvable pair (lengths are
+/// ≥ 1, so the packed value has a non-zero bit 16..21 field).
+/// Everything else falls back to the exact [`decode_pair`] (which
+/// still serves straddling pairs from the true 32-bit window) or the
+/// sequential [`decode_one`] path — byte-identical output either
+/// way, pinned by the r419 golden matrix and the randomized
+/// equivalence sweep in `decoder::round429_pair_sym_lut_tests`.
+///
+/// 256 KiB per (first-slot, second-slot) pair, built lazily at most
+/// once per cached `ThreeTables` behind the round-419 table cache —
+/// paid once per stream, not per frame.
+pub(crate) fn build_pair_sym_lut(a: &HuffTable, b: &HuffTable) -> Box<[u32]> {
+    let mut lut = vec![0u32; 65536].into_boxed_slice();
+    for (p, slot) in lut.iter_mut().enumerate() {
+        let slot_a = a.primary_lut[p];
+        if slot_a == PRIMARY_LUT_OVERFLOW {
+            continue;
+        }
+        let l1 = (slot_a >> 8) as u32;
+        let w = (p as u32) << 16;
+        let slot_b = b.primary_lut[((w << l1) >> 16) as usize];
+        if slot_b == PRIMARY_LUT_OVERFLOW {
+            continue;
+        }
+        let l2 = (slot_b >> 8) as u32;
+        if l1 + l2 <= 16 {
+            *slot = (slot_a & 0xFF) as u32 | (((slot_b & 0xFF) as u32) << 8) | ((l1 + l2) << 16);
+        }
+    }
+    lut
+}
+
 pub(crate) fn build_pair_len_lut(a: &HuffTable, b: &HuffTable) -> Box<[u8]> {
     let mut sums = vec![0u8; 65536].into_boxed_slice();
     for (p, slot) in sums.iter_mut().enumerate() {

@@ -57,6 +57,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte-identical across budgets on every auto pin scenario at both
   pin sizes (r429 budget sweep).
 
+- Round 429: serial-decode full pair LUTs — the r419 profile's
+  remaining lever. Each (first-slot, second-slot) pair the decode
+  loops consume gets a lazily-built 65 536-entry LUT mapping the top
+  16 window bits to BOTH symbols plus the combined length in one
+  32-bit load (sound only when the pair fits the 16 known bits; `0`
+  falls back to the exact `decode_pair` / `decode_one` walk, which
+  still serves long codes and straddling pairs from the true 32-bit
+  window). Built at most once per cached `ThreeTables` behind the
+  r419 table cache (256 KiB per pair, paid per stream, not per
+  frame) and wired into all three family loops (YUY2 both halves,
+  RGB24 first pair, RGB32 both pairs). Output byte-identical —
+  guarded by the r419 golden matrix, the r420 invariance suites, and
+  a new randomized LUT-vs-walk equivalence sweep (non-zero entries
+  must match the exact walk under random low bits; zero entries must
+  be genuinely unresolvable from 16 bits). Measured (Apple Silicon,
+  sample-size 20): YUY2 Left 320×240 0.64 → 0.43 ms (−33%), YUY2
+  Median 320×240 −23%, YUY2 Left 1280×720 interlaced 7.73 → 5.31 ms
+  (−31%), RGB24 LeftDecorr 320×240 1.26 → 0.95 ms (−25%), RGB32
+  GradientDecorr 1280×720 interlaced −25%.
+
 - Round 420: two-worker interlaced decode. New public
   `decode_frame_with_workers(config, frame_bytes, worker_budget)`
   decodes the two independently-coded fields of an interlaced stream
