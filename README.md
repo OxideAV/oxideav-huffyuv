@@ -178,6 +178,13 @@ Round 429 extends the budget to the auto-selector
 workers; an interlaced RGB32 960×400 auto encode reaches 2.15×
 (6.29 → 2.93 ms) at 3 workers with scoring and emit both fanned out.
 
+Round 429 also lands the r419 serial-decode lever: full pair LUTs
+(16-bit window → both symbols + combined length in one 32-bit load,
+lazily built per stream behind the table cache) cut serial decode
+23–33% across the gates — YUY2 Left 320×240 0.64 → 0.43 ms
+(345 MiB/s), YUY2 Left 720p interlaced 7.73 → 5.31 ms, RGB24
+LeftDecorr 1.26 → 0.95 ms — with byte-identical output.
+
 ## Fuzzing
 
 `fuzz/` ships three cargo-fuzz targets driven daily by

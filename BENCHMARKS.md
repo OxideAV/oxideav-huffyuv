@@ -265,14 +265,23 @@ sweep), and the budget-1 path is the exact pre-r429 serial selector.
 
 ## Next PROFILE-OPT target
 
-**Primary (decode): amortise the per-symbol LUT dependency chain
-further.** After r419's pairing, each 2-symbol step still carries a
-serialized LUT-load → shift → LUT-load chain. The remaining lever:
-a second-level pair LUT (16-bit window → both symbols + combined
-length in one load) built lazily behind the round-419 built-tables
-cache so its ~256-KiB/table cost is paid once per stream, not per
-frame. Gate on `decode_yuy2_320x240_left_classic` and the 1280×720
-scenarios.
+*(Landed r429)* The r419 primary target — a second-level full pair
+LUT (16-bit window → both symbols + combined length in one 32-bit
+load), built lazily behind the round-419 built-tables cache — shipped
+in round 429 (`tables::build_pair_sym_lut`, wired into all three
+family loops). Measured on the r419 gates: yuy2 320×240 Left
+0.64 → 0.43 ms (−33%, 230 → 345 MiB/s), yuy2 320×240 Median −23%,
+yuy2 1280×720 Left interlaced 7.73 → 5.31 ms (−31%), rgb24 320×240
+LeftDecorr 1.26 → 0.95 ms (−25%, 174 → 232 MiB/s), rgb32 1280×720
+GradientDecorr interlaced −25%. Byte-identical output (golden matrix
++ randomized LUT-vs-walk sweep).
+
+**Primary (decode): RGB24's third codeword is still a lone
+`decode_one`.** The 3-code wire cycle pairs (w0, w1) but leaves the
+`+2 → slot3` position on the sequential path; pairing it across the
+pixel boundary — `(R/R−G, next pixel's w0)` — would need a
+per-iteration phase flip but would put ALL RGB24 codewords on pair
+reads. Gate on `decode_rgb24_320x240_left_decorr_classic`.
 
 *(Landed r420)* The r419 candidate lever (b) — decoding the two
 independent field bitstreams of an interlaced frame on two threads —
