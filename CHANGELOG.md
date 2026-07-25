@@ -8,6 +8,55 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 429: registry `Encoder` implementation — dual-API closure on
+  the encode side. `register()` now wires an encoder factory next to
+  the decoder (`CodecCapabilities` gains `with_encode()`), and the
+  factory is also exposed directly as `make_encoder(params)` (with
+  `make_decoder` now public too, per the workspace dual-API
+  convention). The encoder drives the existing direct-API engine
+  through the `send_frame` / `receive_packet` / `flush` lifecycle:
+  intra-only keyframe packets with verbatim pts passthrough
+  (`dts == pts`), a packet time base derived from
+  `CodecParameters::frame_rate` (microsecond fallback), and
+  `output_params()` carrying the AVI `strf` payload as extradata —
+  final from construction for a fixed method with `classic-v2` /
+  `v1x` extradata, finalized by the first `send_frame` otherwise. The
+  options bag (`HuffYuvEncoderOptions`, schema-registered) mirrors
+  the direct API's three axes: `format` (`auto`|`yuy2`|`rgb24`|
+  `rgb32`, `auto` derives from `CodecParameters::pixel_format` —
+  `Yuyv422`/`Bgr24`/`Bgra`), `method` (`auto` = bit-cost selection on
+  the first frame, pinned for the stream since the method byte is
+  stream-level per spec/01 §3), and `mode` (`classic-v2`|`custom-v2`|
+  `v1x`). `custom-v2` streams pin the first frame's Huffman tables
+  (extradata is stream-level, spec/01 §5): repeat frames re-encode
+  byte-identically against the pinned tables, and frames whose
+  residuals need symbols the tables never assigned codes to are
+  rejected instead of emitting an undecodable stream. Trait-path
+  output is byte-identical to the direct API on the full r419
+  golden-pin matrix (new trait-path pin suite) and the registry loop
+  (encode → `output_params` → `make_decoder` → decode) is pinned
+  lossless end-to-end.
+
+- Round 429: encode-side `ExecutionContext` through the trait. The
+  registry `Encoder` implements `set_execution_context`, storing the
+  advisory thread budget (default 1 = serial, per the contract) and
+  routing it into every encode dispatch — budgets ≥ 2 engage the
+  r420 field-parallel interlaced encode and the new parallel
+  auto-selector scoring through the registry path, with wire bytes
+  byte-identical across budgets (trait-level invariance tests +
+  budget-2 sweep over the full golden-pin matrix).
+
+- Round 429: `encode_frame_auto_workers(..., worker_budget)` — the
+  auto-selector under an explicit worker budget. Candidate scoring
+  (residual + package-merge bit cost per legal method, `units =
+  candidates`) fans out across the granted workers with a serial
+  in-order reduction, so winner, tie-break, and error order match the
+  serial selector exactly; the winner's emit gets the same
+  `units = 2` interlaced clamp as `encode_frame_with_mode_workers`.
+  `encode_frame_auto` is now a `worker_budget = 1` alias. Output is
+  byte-identical across budgets on every auto pin scenario at both
+  pin sizes (r429 budget sweep).
+
 - Round 420: two-worker interlaced decode. New public
   `decode_frame_with_workers(config, frame_bytes, worker_budget)`
   decodes the two independently-coded fields of an interlaced stream

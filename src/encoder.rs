@@ -141,6 +141,78 @@ pub fn encode_frame_with_mode_workers(
     encode_with_precomputed(family, method, width, height, &frame, mode, workers)
 }
 
+/// Encode one frame's wire bytes against caller-pinned per-slot
+/// Huffman tables (round 429).
+///
+/// Stream-encode support for the registry `Encoder`: HuffYUV Huffman
+/// tables are STREAM-level (they travel in the `BITMAPINFOHEADER`
+/// extradata, not per frame), so a multi-frame `CustomV2` stream must
+/// emit every frame with the tables pinned from its first frame —
+/// re-deriving per-frame-optimal tables (what
+/// [`encode_frame_with_mode`] does with [`ExtradataMode::CustomV2`])
+/// would change the extradata mid-stream and make frames 2..N
+/// undecodable. The residual + emit pipeline is exactly the
+/// [`encode_frame_with_mode_workers`] one (same clamp, same r420
+/// two-worker interlaced arms); only the table sourcing differs.
+///
+/// Because pinned first-frame tables assign length 0 to symbols the
+/// first frame never emitted, the body is verified against the tables
+/// before emit — a later frame whose residuals need an uncovered
+/// symbol returns `Error::Unsupported` instead of writing an
+/// undecodable zero-length codeword.
+///
+/// Only the `registry` stream encoder needs pinned-table emission, so
+/// the function is compiled out of standalone builds.
+#[cfg(feature = "registry")]
+pub(crate) fn encode_body_with_pinned_tables(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    tabs: &crate::decoder::ThreeTables,
+    worker_budget: usize,
+) -> Result<Vec<u8>> {
+    if family.is_rgb() && !method.is_rgb_legal() {
+        return Err(Error::invalid("encoder: method not legal for RGB"));
+    }
+    if !family.is_rgb() && !method.is_yuv_legal() {
+        return Err(Error::invalid("encoder: method not legal for YUV"));
+    }
+    // Inline worker clamp per the ExecutionContext threading contract
+    // (`threads.min(units).max(1)`, `units = 2` interlaced fields).
+    let workers = worker_budget.clamp(1, 2);
+    let frame = if workers >= 2 {
+        compute_frame_residuals_parallel(family, method, width, height, pixels)?
+    } else {
+        compute_frame_residuals(family, method, width, height, pixels)?
+    };
+    verify_body_in_table(
+        family,
+        method,
+        &frame.combined_body,
+        &tabs.slot1,
+        &tabs.slot2,
+        &tabs.slot3,
+    )
+    .map_err(|_| {
+        Error::unsupported(
+            "stream tables: frame emits residual symbols absent from the pinned \
+             first-frame Huffman tables (custom-v2 tables are stream-level and \
+             derive from the first frame; use classic-v2 for drifting content)",
+        )
+    })?;
+    emit_frame_bytes(
+        family,
+        method,
+        &frame,
+        &tabs.slot1,
+        &tabs.slot2,
+        &tabs.slot3,
+        workers,
+    )
+}
+
 /// Emit one wire frame from a pre-computed residual stream.
 ///
 /// Internal round-7 helper that lets the auto-selector reuse the
@@ -218,7 +290,32 @@ fn encode_with_precomputed(
         has_extradata,
     );
 
-    let frame_bytes = if frame.interlaced {
+    let frame_bytes = emit_frame_bytes(family, method, frame, slot1, slot2, slot3, workers)?;
+
+    let _ = (width, height);
+    Ok((strf, frame_bytes))
+}
+
+/// Emit the wire bytes for one pre-computed residual frame using the
+/// caller-supplied per-slot Huffman tables.
+///
+/// Round-429 extraction of the emit tail of
+/// [`encode_with_precomputed`] so the registry stream encoder's
+/// pinned-tables path ([`encode_body_with_pinned_tables`]) can reuse
+/// the exact serial / two-worker interlaced emit arms without
+/// re-deriving tables from an [`ExtradataMode`]. Byte-identical to the
+/// pre-extraction inline block for every input (r419 golden pins +
+/// r420 invariance matrix).
+fn emit_frame_bytes(
+    family: PixelFamily,
+    method: Method,
+    frame: &PrecomputedFrame,
+    slot1: &HuffTable,
+    slot2: &HuffTable,
+    slot3: &HuffTable,
+    workers: usize,
+) -> Result<Vec<u8>> {
+    if frame.interlaced {
         if let (2.., Some(bot_seed)) = (workers, frame.bot_seed_opt) {
             // Round-420 two-worker emit: the two per-field bit-streams
             // are packed into independent buffers from disjoint body
@@ -255,7 +352,7 @@ fn encode_with_precomputed(
             };
             let mut bot_bytes = bot_result?;
             out.append(&mut bot_bytes);
-            out
+            Ok(out)
         } else {
             let mut out = Vec::new();
             // Top field: pass the seed + the [..top_body_len] slice of
@@ -283,7 +380,7 @@ fn encode_with_precomputed(
                 )?;
                 out.append(&mut bot_bytes);
             }
-            out
+            Ok(out)
         }
     } else {
         emit_bitstream_parts(
@@ -294,11 +391,8 @@ fn encode_with_precomputed(
             slot1,
             slot2,
             slot3,
-        )?
-    };
-
-    let _ = (width, height);
-    Ok((strf, frame_bytes))
+        )
+    }
 }
 
 /// Round-7 residual carrier: holds the per-field seed(s) + a single
@@ -690,10 +784,67 @@ pub fn encode_frame_auto(
     pixels: &[u8],
     mode: ExtradataMode,
 ) -> Result<(Vec<u8>, Vec<u8>, Method)> {
+    encode_frame_auto_workers(family, selection, width, height, pixels, mode, 1)
+}
+
+/// Score one auto-selector candidate: residual stream + package-merge
+/// bit cost. Round-7 semantics unchanged — the returned
+/// [`PrecomputedFrame`] carries forward into the winner's final emit
+/// so the body bytes are never re-derived from `pixels`.
+fn score_candidate(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(u64, PrecomputedFrame)> {
+    let frame = compute_frame_residuals(family, method, width, height, pixels)?;
+    let (h1, h2, h3) = histogramise(family, method, &frame.combined_body);
+    Ok((bit_cost_from_histograms(&h1, &h2, &h3), frame))
+}
+
+/// [`encode_frame_auto`] under an explicit worker budget (round 429).
+///
+/// Same `(strf, wire bytes, chosen method)` as [`encode_frame_auto`]
+/// for every input — the budget only changes how the work is
+/// scheduled, following the `oxideav-core` `ExecutionContext`
+/// threading contract (serial until told otherwise; fan-out bounded
+/// inline by `budget.min(units).max(1)`). Two independent fan-outs
+/// are gated on the budget:
+///
+/// - **Candidate scoring** (`units = candidates.len()`): each legal
+///   method's residual + package-merge bit-cost evaluation is
+///   independent of the others, so the candidate list is split into
+///   contiguous chunks across the granted workers (caller thread
+///   included). Every candidate's result lands in its own slot, then
+///   a serial in-order reduction applies the exact round-7 rules —
+///   first error in candidate order surfaces, smallest cost wins,
+///   first-in-order wins ties — so the winner (and therefore the
+///   wire) cannot depend on scheduling.
+/// - **Winner emit** (`units = 2` interlaced fields): the final
+///   [`encode_with_precomputed`] pass gets the same clamp
+///   [`encode_frame_with_mode_workers`] applies, engaging the r420
+///   two-worker interlaced emit when the budget allows.
+///
+/// Byte-identity across budgets is guarded by the r429 auto-selector
+/// budget sweep in the golden-pin suite.
+pub fn encode_frame_auto_workers(
+    family: PixelFamily,
+    selection: MethodSelection,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    mode: ExtradataMode,
+    worker_budget: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Method)> {
     let candidates = selection.candidates(family);
     if candidates.is_empty() {
         return Err(Error::invalid("encode_frame_auto: no legal methods"));
     }
+    // Inline scoring fan-out clamp per the ExecutionContext threading
+    // contract — `threads.min(units).max(1)` with `units` = number of
+    // candidate methods.
+    let scoring_workers = worker_budget.min(candidates.len()).max(1);
     // Round-7: compute residuals ONCE per candidate (was: once per
     // candidate inside `bit_cost_for_method` PLUS once again inside
     // `encode_frame_with_mode` for the winner = N+1 traversals).
@@ -704,18 +855,61 @@ pub fn encode_frame_auto(
     // Tie-break: first in `candidates` order (so output is
     // deterministic).
     let mut best: Option<(Method, u64, PrecomputedFrame)> = None;
-    for &m in &candidates {
-        let frame = compute_frame_residuals(family, m, width, height, pixels)?;
-        let (h1, h2, h3) = histogramise(family, m, &frame.combined_body);
-        let cost = bit_cost_from_histograms(&h1, &h2, &h3);
-        match best {
-            None => best = Some((m, cost, frame)),
-            Some((_, prev_cost, _)) if cost < prev_cost => best = Some((m, cost, frame)),
-            _ => {}
+    if scoring_workers >= 2 {
+        // Parallel scoring: per-candidate result slots filled by
+        // contiguous chunks (first chunk on the caller thread, so at
+        // most `scoring_workers - 1` threads are spawned and the
+        // caller counts against the budget), then reduced serially in
+        // candidate order below — winner, tie-break, and error order
+        // all match the serial arm exactly.
+        let mut results: Vec<Option<Result<(u64, PrecomputedFrame)>>> =
+            std::iter::repeat_with(|| None)
+                .take(candidates.len())
+                .collect();
+        let chunk_len = candidates.len().div_ceil(scoring_workers);
+        std::thread::scope(|s| {
+            let (own_slots, mut slots_rest) = results.split_at_mut(chunk_len);
+            let (own_cands, mut cands_rest) = candidates.split_at(chunk_len);
+            while !cands_rest.is_empty() {
+                let n = chunk_len.min(cands_rest.len());
+                let (chunk_slots, tail) = slots_rest.split_at_mut(n);
+                slots_rest = tail;
+                let (chunk_cands, ctail) = cands_rest.split_at(n);
+                cands_rest = ctail;
+                s.spawn(move || {
+                    for (slot, &m) in chunk_slots.iter_mut().zip(chunk_cands) {
+                        *slot = Some(score_candidate(family, m, width, height, pixels));
+                    }
+                });
+            }
+            for (slot, &m) in own_slots.iter_mut().zip(own_cands) {
+                *slot = Some(score_candidate(family, m, width, height, pixels));
+            }
+        });
+        for (&m, slot) in candidates.iter().zip(results) {
+            let (cost, frame) = slot.expect("every scoring slot is filled by its chunk")?;
+            match best {
+                None => best = Some((m, cost, frame)),
+                Some((_, prev_cost, _)) if cost < prev_cost => best = Some((m, cost, frame)),
+                _ => {}
+            }
+        }
+    } else {
+        for &m in &candidates {
+            let (cost, frame) = score_candidate(family, m, width, height, pixels)?;
+            match best {
+                None => best = Some((m, cost, frame)),
+                Some((_, prev_cost, _)) if cost < prev_cost => best = Some((m, cost, frame)),
+                _ => {}
+            }
         }
     }
     let (chosen, _, frame) = best.expect("non-empty candidates → some winner");
-    let (strf, bytes) = encode_with_precomputed(family, chosen, width, height, &frame, mode, 1)?;
+    // Same emit clamp as `encode_frame_with_mode_workers` (`units = 2`
+    // interlaced fields).
+    let emit_workers = worker_budget.clamp(1, 2);
+    let (strf, bytes) =
+        encode_with_precomputed(family, chosen, width, height, &frame, mode, emit_workers)?;
     Ok((strf, bytes, chosen))
 }
 
