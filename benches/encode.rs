@@ -27,8 +27,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use oxideav_huffyuv::{
-    encode_frame_auto, encode_frame_with_mode, encode_frame_with_mode_workers, ExtradataMode,
-    Method, MethodSelection, PixelFamily,
+    encode_frame_auto, encode_frame_auto_workers, encode_frame_with_mode,
+    encode_frame_with_mode_workers, ExtradataMode, Method, MethodSelection, PixelFamily,
 };
 
 fn xorshift_byte(state: &mut u32) -> u8 {
@@ -405,6 +405,63 @@ fn bench_hd_interlaced_encode_worker_scaling(c: &mut Criterion) {
     }
 }
 
+/// Round-429 auto-selector worker-scaling gates: 1 vs 2 vs 3 workers
+/// on `encode_frame_auto_workers`. The budget fans the per-candidate
+/// scoring (3 legal methods per family = 3 work units) across the
+/// granted workers and hands the winner's emit the r420 interlaced
+/// clamp, so the progressive HD case reads as pure scoring
+/// parallelism and the interlaced case adds the two-worker emit on
+/// top. Output is wire-identical across budgets (golden-pin sweep);
+/// these gates measure the wall-time side of that invariance.
+fn bench_auto_worker_scaling(c: &mut Criterion) {
+    for (name, family, w, h) in [
+        (
+            "encode_auto_workers_yuy2_1280x720_custom",
+            PixelFamily::Yuy2,
+            1280u32,
+            720u32,
+        ),
+        (
+            "encode_auto_workers_yuy2_1280x720_classic",
+            PixelFamily::Yuy2,
+            1280,
+            720,
+        ),
+        (
+            "encode_auto_workers_rgb32_960x400_interlaced_classic",
+            PixelFamily::Rgb32,
+            960,
+            400,
+        ),
+    ] {
+        let mode = if name.ends_with("custom") {
+            ExtradataMode::CustomV2
+        } else {
+            ExtradataMode::ClassicV2
+        };
+        let pixels = build_pixels(w as usize, h as usize, bytes_per_pixel(family));
+        let mut g = c.benchmark_group(name);
+        g.throughput(Throughput::Bytes(pixels.len() as u64));
+        for workers in [1usize, 2, 3] {
+            g.bench_function(BenchmarkId::from_parameter(format!("{workers}w")), |b| {
+                b.iter(|| {
+                    encode_frame_auto_workers(
+                        family,
+                        MethodSelection::Auto,
+                        w,
+                        h,
+                        criterion::black_box(&pixels),
+                        mode,
+                        workers,
+                    )
+                    .expect("encode auto workers")
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
 criterion_group!(
     benches,
     bench_yuy2_320x240_left_classic,
@@ -426,5 +483,6 @@ criterion_group!(
     bench_rgb24_1280x720_left_decorr_classic,
     bench_yuy2_1280x720_auto_custom,
     bench_hd_interlaced_encode_worker_scaling,
+    bench_auto_worker_scaling,
 );
 criterion_main!(benches);
