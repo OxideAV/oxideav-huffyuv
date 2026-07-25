@@ -32,9 +32,9 @@
 //! and paste the emitted table over `EXPECTED` / `EXPECTED_AUTO`.
 
 use oxideav_huffyuv::{
-    decode_frame, decode_frame_with_workers, encode_frame_auto, encode_frame_with_mode,
-    encode_frame_with_mode_workers, ExtradataMode, Method, MethodSelection, PixelFamily,
-    StreamConfig,
+    decode_frame, decode_frame_with_workers, encode_frame_auto, encode_frame_auto_workers,
+    encode_frame_with_mode, encode_frame_with_mode_workers, make_encoder, ExtradataMode, Method,
+    MethodSelection, PixelFamily, StreamConfig,
 };
 
 /// FNV-1a 64-bit — dependency-free, deterministic across platforms.
@@ -745,5 +745,206 @@ fn golden_pins_auto_selector() {
             *frame_hash, *exp_frame,
             "{scenario}: frame wire bytes changed"
         );
+    }
+}
+
+// ───────────────── round-429 trait-path + auto-budget pins ─────────────────
+
+/// Option-bag value for a [`Method`] (the registry encoder's `method`
+/// option uses kebab-case where the pin scenarios use snake_case).
+fn method_option(m: Method) -> &'static str {
+    match m {
+        Method::PredictOld => "predict-old",
+        Method::Left => "left",
+        Method::Gradient => "gradient",
+        Method::Median => "median",
+        Method::LeftDecorr => "left-decorr",
+        Method::GradientDecorr => "gradient-decorr",
+    }
+}
+
+fn mode_option(m: ExtradataMode) -> &'static str {
+    match m {
+        ExtradataMode::ClassicV2 => "classic-v2",
+        ExtradataMode::CustomV2 => "custom-v2",
+        ExtradataMode::V1xCompat => "v1x",
+    }
+}
+
+fn family_option(f: PixelFamily) -> &'static str {
+    match f {
+        PixelFamily::Yuy2 => "yuy2",
+        PixelFamily::Rgb24 => "rgb24",
+        PixelFamily::Rgb32 => "rgb32",
+    }
+}
+
+/// Build a registry encoder for one pin scenario and push one frame
+/// through it, returning `(strf, wire bytes)` from the trait surface
+/// (`output_params().extradata` + the emitted packet).
+fn trait_encode(
+    family: PixelFamily,
+    method: Option<Method>,
+    mode: ExtradataMode,
+    w: u32,
+    h: u32,
+    pixels: &[u8],
+    budget: Option<usize>,
+) -> (Vec<u8>, Vec<u8>) {
+    use oxideav_core::{CodecId, CodecParameters, ExecutionContext, Frame, VideoFrame, VideoPlane};
+    let mut params = CodecParameters::video(CodecId::new(oxideav_huffyuv::CODEC_ID_STR));
+    params.width = Some(w);
+    params.height = Some(h);
+    params.options.insert("format", family_option(family));
+    params.options.insert("mode", mode_option(mode));
+    if let Some(m) = method {
+        params.options.insert("method", method_option(m));
+    }
+    let mut enc = make_encoder(&params).expect("make_encoder");
+    if let Some(threads) = budget {
+        enc.set_execution_context(&ExecutionContext { threads });
+    }
+    let frame = Frame::Video(VideoFrame {
+        pts: Some(0),
+        planes: vec![VideoPlane {
+            stride: family.row_bytes(w),
+            data: pixels.to_vec(),
+        }],
+    });
+    enc.send_frame(&frame).expect("send_frame");
+    let pkt = enc.receive_packet().expect("receive_packet");
+    (enc.output_params().extradata.clone(), pkt.data)
+}
+
+/// Round-429 trait-path pins: the registry `Encoder` must emit the
+/// EXACT r419 pinned bytes on every full-matrix scenario — strf via
+/// `output_params()`, wire bytes via the packet — at the default
+/// budget AND under budget 2 (interlaced pins exercise the r420
+/// field-parallel arms through the trait).
+#[test]
+fn golden_pins_trait_path_full_matrix() {
+    let mut seen = Vec::new();
+    for family in FAMILIES {
+        for &method in legal_methods(family) {
+            for mode in MODES {
+                for (w, h) in SIZES {
+                    let scenario = format!(
+                        "{}/{}/{}/{}x{}",
+                        family_name(family),
+                        method_name(method),
+                        mode_name(mode),
+                        w,
+                        h
+                    );
+                    let pixels = build_pixels(w as usize, h as usize, bpp(family));
+                    let (strf, frame) =
+                        trait_encode(family, Some(method), mode, w, h, &pixels, None);
+                    let (strf_b2, frame_b2) =
+                        trait_encode(family, Some(method), mode, w, h, &pixels, Some(2));
+                    assert_eq!(strf, strf_b2, "{scenario}: trait budget-2 strf diverged");
+                    assert_eq!(
+                        frame, frame_b2,
+                        "{scenario}: trait budget-2 wire bytes diverged"
+                    );
+                    seen.push((scenario, fnv1a64(&strf), fnv1a64(&frame)));
+                }
+            }
+        }
+    }
+    assert_eq!(seen.len(), EXPECTED.len(), "trait pin matrix drifted");
+    for ((scenario, strf_hash, frame_hash), (exp_scenario, exp_strf, exp_frame)) in
+        seen.iter().zip(EXPECTED.iter())
+    {
+        assert_eq!(scenario, exp_scenario, "scenario order drifted");
+        assert_eq!(
+            *strf_hash, *exp_strf,
+            "{scenario}: trait-path strf diverged from the pinned direct-API bytes"
+        );
+        assert_eq!(
+            *frame_hash, *exp_frame,
+            "{scenario}: trait-path wire bytes diverged from the pinned direct-API bytes"
+        );
+    }
+}
+
+/// Round-429 trait-path auto pins: a registry encoder with the default
+/// `method=auto` must reproduce the pinned auto-selector output
+/// (winner's strf + wire bytes) on its first frame.
+#[test]
+fn golden_pins_trait_path_auto_selector() {
+    let mut seen = Vec::new();
+    for family in FAMILIES {
+        for mode in [ExtradataMode::ClassicV2, ExtradataMode::CustomV2] {
+            let (w, h) = (48u32, 32u32);
+            let scenario = format!(
+                "{}/auto/{}/{}x{}",
+                family_name(family),
+                mode_name(mode),
+                w,
+                h
+            );
+            let pixels = build_pixels(w as usize, h as usize, bpp(family));
+            let (strf, frame) = trait_encode(family, None, mode, w, h, &pixels, None);
+            seen.push((scenario, fnv1a64(&strf), fnv1a64(&frame)));
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        EXPECTED_AUTO.len(),
+        "trait auto pin matrix drifted"
+    );
+    for ((scenario, strf_hash, frame_hash), (exp_scenario, _, exp_strf, exp_frame)) in
+        seen.iter().zip(EXPECTED_AUTO.iter())
+    {
+        assert_eq!(scenario, exp_scenario, "scenario order drifted");
+        assert_eq!(
+            *strf_hash, *exp_strf,
+            "{scenario}: trait auto strf diverged"
+        );
+        assert_eq!(
+            *frame_hash, *exp_frame,
+            "{scenario}: trait auto wire bytes diverged"
+        );
+    }
+}
+
+/// Round-429 auto-selector budget sweep: `encode_frame_auto_workers`
+/// must return the identical `(strf, wire bytes, chosen method)`
+/// triple under budgets 1 / 2 / 8 on every auto pin scenario at BOTH
+/// pin sizes — the parallel candidate scoring (progressive + interlaced)
+/// and the two-worker winner emit (interlaced) are wire-invariant.
+#[test]
+fn golden_pins_auto_budget_sweep() {
+    for family in FAMILIES {
+        for mode in [ExtradataMode::ClassicV2, ExtradataMode::CustomV2] {
+            for (w, h) in SIZES {
+                let scenario = format!(
+                    "{}/auto/{}/{}x{}",
+                    family_name(family),
+                    mode_name(mode),
+                    w,
+                    h
+                );
+                let pixels = build_pixels(w as usize, h as usize, bpp(family));
+                let serial = encode_frame_auto(family, MethodSelection::Auto, w, h, &pixels, mode)
+                    .unwrap_or_else(|e| panic!("{scenario}: serial auto failed: {e:?}"));
+                for budget in [1usize, 2, 8] {
+                    let budgeted = encode_frame_auto_workers(
+                        family,
+                        MethodSelection::Auto,
+                        w,
+                        h,
+                        &pixels,
+                        mode,
+                        budget,
+                    )
+                    .unwrap_or_else(|e| panic!("{scenario}: budget-{budget} auto failed: {e:?}"));
+                    assert_eq!(
+                        budgeted, serial,
+                        "{scenario}: budget-{budget} auto diverged from serial"
+                    );
+                }
+            }
+        }
     }
 }
