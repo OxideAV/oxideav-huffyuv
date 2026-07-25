@@ -86,12 +86,43 @@ No external library source consulted.
   `encode_frame_with_mode_workers`): with a thread budget ≥ 2 the two
   fields' residual and bit-pack phases run on parallel workers; wire
   bytes stay byte-identical to the serial encoder.
+- **Budgeted auto-selection** (round 429,
+  `encode_frame_auto_workers`): the per-candidate scoring fans out
+  across the granted workers (serial in-order reduction, so winner /
+  tie-break / error order match the serial selector exactly) and the
+  winner's emit gets the interlaced two-worker clamp — identical
+  `(strf, bytes, method)` across budgets.
+
+### Registry (round 429: full dual-API on both sides)
+
+- Registry `Decoder` **and** `Encoder` implementations wired by
+  `register()`, with `make_decoder` / `make_encoder` also exposed
+  directly. Both honour `set_execution_context` (serial default;
+  budget ≥ 2 engages the field-parallel interlaced paths and the
+  parallel auto scoring) with byte-identical output across budgets.
+- Encoder options bag (`HuffYuvEncoderOptions`, schema-registered):
+  `format` = `auto`|`yuy2`|`rgb24`|`rgb32` (`auto` derives from
+  `CodecParameters::pixel_format` — `Yuyv422`/`Bgr24`/`Bgra`),
+  `method` = `auto`|`predict-old`|`left`|`gradient`|`median`|
+  `left-decorr`|`gradient-decorr` (`auto` bit-cost-selects on the
+  first frame and pins the winner — the method byte is stream-level),
+  `mode` = `classic-v2`|`custom-v2`|`v1x`.
+- `output_params()` carries the AVI `strf` as extradata (final at
+  construction for a fixed method with `classic-v2`/`v1x`; finalized
+  by the first `send_frame` otherwise). `custom-v2` streams pin the
+  first frame's Huffman tables — repeat content re-encodes
+  byte-identically, and frames needing symbols the pinned tables
+  never coded are rejected instead of emitting an undecodable stream.
+- Packets are intra-only keyframes, pts passed through verbatim
+  (`dts == pts`), time base from `CodecParameters::frame_rate`.
 
 ### FourCCs
 
 Native FourCCs `HFYU` + `FFVH` are registered via `oxideav-core`'s
 codec registry (codec id `"huffyuv"`), so `oxideav-avi` resolves a
 HuffYUV stream's `biCompression` straight through `CodecResolver`.
+The encoder advertises `HFYU` on `output_params().tag` (matching the
+`biCompression` it writes).
 
 ## Public API
 
@@ -102,10 +133,14 @@ HuffYUV stream's `biCompression` straight through `CodecResolver`.
 - `encode_frame` / `encode_frame_with_mode` / `encode_frame_auto`
 - `encode_frame_with_mode_workers(..., worker_budget)` — budgeted
   field-parallel interlaced encode, wire-identical to the serial path
+- `encode_frame_auto_workers(..., worker_budget)` — budgeted
+  candidate scoring + winner emit, identical output across budgets
+  (`encode_frame_auto` ≡ budget 1)
 - `build_bitmapinfoheader`, `bit_cost_for_method`
 - `Method`, `PixelFamily`, `Predictor`, `StreamConfig`,
   `ExtradataMode`, `MethodSelection`
-- `register` / `register_codecs` / `CODEC_ID_STR`
+- `register` / `register_codecs` / `make_decoder` / `make_encoder` /
+  `HuffYuvEncoderOptions` / `CODEC_ID_STR`
 
 ## Cargo features
 
@@ -136,6 +171,12 @@ split scan) and encode 1.72–1.99× (RGB32 GradientDecorr
 10.78 → 5.43 ms) over the unchanged serial walls — byte-identical
 output across budgets. See the worker-scaling table in
 [`BENCHMARKS.md`](BENCHMARKS.md).
+
+Round 429 extends the budget to the auto-selector
+(`encode_frame_auto_workers`): 720p YUY2 auto encodes drop 6.42 →
+3.95 ms (custom, 1.62×) and 6.75 → 3.91 ms (classic, 1.73×) at 2
+workers; an interlaced RGB32 960×400 auto encode reaches 2.15×
+(6.29 → 2.93 ms) at 3 workers with scoring and emit both fanned out.
 
 ## Fuzzing
 

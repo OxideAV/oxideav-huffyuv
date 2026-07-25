@@ -210,6 +210,31 @@ before them the 2-worker decode wins were only 1.02× / 1.18× /
 all worker paths are byte-identical to serial (golden-pin invariance
 suites + fuzz differential oracles).
 
+### Auto-selector worker scaling (round 429)
+
+Round 429 threads the budget through `encode_frame_auto_workers`: the
+per-candidate scoring (3 legal methods per family, each a full
+residual + histogram + package-merge pass) fans out across the
+granted workers, and the winner's emit inherits the r420 interlaced
+clamp. Criterion gates `encode_auto_workers_*` (sample-size 20,
+Apple Silicon round machine):
+
+| scenario | 1 worker | 2 workers | 3 workers |
+| -------- | -------- | --------- | --------- |
+| yuy2 1280×720 auto CustomV2 (progressive) | 6.42 ms (274 MiB/s) | 3.95 ms (445 MiB/s), **1.62×** | 3.96 ms (flat) |
+| yuy2 1280×720 auto ClassicV2 (progressive) | 6.75 ms (260 MiB/s) | 3.91 ms (450 MiB/s), **1.73×** | 3.91 ms (flat) |
+| rgb32 960×400 auto ClassicV2 (interlaced) | 6.29 ms (233 MiB/s) | 3.50 ms (419 MiB/s), **1.80×** | 2.93 ms (499 MiB/s), **2.15×** |
+
+Reading the shape: at budget 2 the three candidates split 2 + 1, so
+the wall is the caller's two-candidate chunk — the ~1.6–1.8× is the
+scoring hiding behind the heavier chunk plus the (interlaced-only)
+two-worker emit. Budget 3 is flat on progressive scenarios because
+the wall becomes the single heaviest candidate (Median for YUY2)
+plus the serial winner emit; on the interlaced scenario budget 3
+keeps paying because the emit fans out too. Output is byte-identical
+across budgets on every scenario (r429 golden-pin auto budget
+sweep), and the budget-1 path is the exact pre-r429 serial selector.
+
 ## Interpretation
 
 1. **Encode is no longer the cheap side by a small margin — it is
