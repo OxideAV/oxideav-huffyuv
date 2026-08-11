@@ -8,6 +8,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 440: RGB24 phase-flip pairing — the r429 note's remaining
+  decode lever. The 3-code RGB24 wire cycle (spec/03 §1.4 `B, G, R`
+  no-decorr / `G, B−G, R−G` decorr; §1.2 slot mapping) paired only
+  the first two positions and left `+2 → slot3` on a lone
+  `decode_one`. The decode body now walks TWO pixels per iteration so
+  every codeword rides a pair read: the six codewords group as
+  `(w0, w1)`, `(w2, w0′)`, `(w1′, w2′)`, with the middle pair
+  crossing the pixel boundary. Three new full pair LUT combos serve
+  the flipped phases (`s3s1` + `s2s3` no-decorr, `s3s2` decorr — the
+  decorr third pair reuses the existing `s1s3`), each lazily built
+  behind the r419 table cache like the r429 originals, with the
+  exact `decode_pair` / `decode_one` walk as fallback — symbol
+  order, consumed bits, and error points are identical, and an
+  odd body-pixel count finishes on the pre-r440 single-pixel body.
+  Byte-identical output: r419 golden matrix, the r420 scan/decode
+  consumed-bytes equivalence suites, extended r420/r429 LUT
+  soundness sweeps covering the three new combos on v1.x and
+  CustomV2 tables, plus a new round440 witness that diffs the
+  production decode against a strict per-symbol `decode_one`
+  reference walk across both body parities, all legal RGB24
+  methods, and all three extradata modes (and an interlaced
+  budget-2 invariance check). Measured (Apple Silicon, shared host,
+  Criterion sample-size 20, same-session A/B): 320×240 LeftDecorr
+  ClassicV2 839 → 790 µs (−8.4%, 262 → 278 MiB/s), 320×320
+  LeftDecorr interlaced 1.148 → 1.072 ms (−5.4%). Lib tests
+  311 → 313.
+
 - Round 429: registry `Encoder` implementation — dual-API closure on
   the encode side. `register()` now wires an encoder factory next to
   the decoder (`CodecCapabilities` gains `with_encode()`), and the

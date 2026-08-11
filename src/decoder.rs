@@ -546,16 +546,30 @@ pub(crate) struct ScanLuts {
 /// entry maps the top 16 window bits to BOTH symbols + the combined
 /// length of the next two codewords in one 32-bit load (`0` =
 /// unresolvable from 16 known bits → exact `decode_pair` /
-/// `decode_one` fallback). Same (first-slot, second-slot) pairs as
-/// [`ScanLuts`]; 256 KiB per pair, built at most once per cached
-/// `ThreeTables` (`OnceLock`) and only for the pairs the stream's
-/// family actually decodes with.
+/// `decode_one` fallback). 256 KiB per pair, built at most once per
+/// cached `ThreeTables` (`OnceLock`) and only for the pairs the
+/// stream's family actually decodes with.
+///
+/// Round-440 adds the three phase-flip combos the RGB24 two-pixel
+/// step consumes (spec/03 §1.4 three-code wire cycle: pairing every
+/// codeword of two consecutive pixels yields `(w0, w1)`, `(w2, w0′)`,
+/// `(w1′, w2′)` — the +2 → slot3 position pairs across the pixel
+/// boundary with the next pixel's first position):
+///
+/// - `s3s1` — RGB24 no-decorr `(R → slot3, next B → slot1)`.
+/// - `s2s3` — RGB24 no-decorr `(next G → slot2, next R → slot3)`.
+/// - `s3s2` — RGB24 decorr `(R−G → slot3, next G → slot2)`; the
+///   decorr third pair `(next B−G → slot1, next R−G → slot3)` is the
+///   pre-existing `s1s3`.
 #[derive(Debug, Default)]
 pub(crate) struct PairSymLuts {
     s1s2: std::sync::OnceLock<Box<[u32]>>,
     s1s3: std::sync::OnceLock<Box<[u32]>>,
     s2s1: std::sync::OnceLock<Box<[u32]>>,
     s3s3: std::sync::OnceLock<Box<[u32]>>,
+    s3s1: std::sync::OnceLock<Box<[u32]>>,
+    s2s3: std::sync::OnceLock<Box<[u32]>>,
+    s3s2: std::sync::OnceLock<Box<[u32]>>,
 }
 
 impl ThreeTables {
@@ -578,6 +592,21 @@ impl ThreeTables {
         self.pair_sym_luts
             .s3s3
             .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot3, &self.slot3))
+    }
+    fn pair_sym_lut_s3s1(&self) -> &[u32] {
+        self.pair_sym_luts
+            .s3s1
+            .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot3, &self.slot1))
+    }
+    fn pair_sym_lut_s2s3(&self) -> &[u32] {
+        self.pair_sym_luts
+            .s2s3
+            .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot2, &self.slot3))
+    }
+    fn pair_sym_lut_s3s2(&self) -> &[u32] {
+        self.pair_sym_luts
+            .s3s2
+            .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot3, &self.slot2))
     }
 
     fn scan_lut_s1s2(&self) -> &[u8] {
@@ -1003,8 +1032,90 @@ fn decode_rgb24_field(
     } else {
         tables.pair_sym_lut_s1s2()
     };
+    // Round-440 phase-flip pairing: the 3-code RGB24 wire cycle left
+    // the +2 → slot3 position on a lone `decode_one` (the r429 note's
+    // remaining decode lever). Walking TWO pixels per outer iteration
+    // puts every codeword on a pair read — the six codewords of a
+    // pixel pair group as `(w0, w1)`, `(w2, w0′)`, `(w1′, w2′)`, where
+    // the middle pair crosses the pixel boundary (spec/03 §1.4 wire
+    // order `B, G, R` / `G, B−G, R−G`; §1.2 slot mapping). Each pair
+    // is fronted by its full pair LUT with the exact `decode_pair` /
+    // `decode_one` walk as fallback, so symbol order, consumed bits,
+    // and error points are identical to the per-pixel body (kept below
+    // as the odd-count tail). Byte-identical output — r419 golden
+    // matrix + the round440 per-symbol reference witness.
+    let (lut_2w0, lut_w12) = if decorrelate {
+        (tables.pair_sym_lut_s3s2(), tables.pair_sym_lut_s1s3())
+    } else {
+        (tables.pair_sym_lut_s3s1(), tables.pair_sym_lut_s2s3())
+    };
     let n_pixels = width_us * height_us;
-    for px in 1..n_pixels {
+    let mut px = 1usize;
+    while px + 1 < n_pixels {
+        let off_a = px * 3;
+        let off_b = off_a + 3;
+        // Pair 1: (w0, w1) of pixel A — mode-resolved slots.
+        let w = reader.peek_window();
+        let e = lut_w01[(w >> 16) as usize];
+        if e != 0 {
+            reader.consume_bits_trusted(e >> 16);
+            pixels[off_a + o_w0] = e as u8;
+            pixels[off_a + o_w1] = (e >> 8) as u8;
+        } else if let Some((v0, v1, n)) = decode_pair(s_w0, s_w1, w) {
+            reader.consume_bits_trusted(n);
+            pixels[off_a + o_w0] = v0;
+            pixels[off_a + o_w1] = v1;
+        } else {
+            let (v0, l0) = decode_one(s_w0, w)?;
+            reader.consume_bits_trusted(l0 as u32);
+            pixels[off_a + o_w0] = v0;
+            let (v1, l1) = decode_one(s_w1, reader.peek_window())?;
+            reader.consume_bits_trusted(l1 as u32);
+            pixels[off_a + o_w1] = v1;
+        }
+        // Pair 2 (phase flip): (w2 of A → slot3, w0 of B).
+        let w = reader.peek_window();
+        let e = lut_2w0[(w >> 16) as usize];
+        if e != 0 {
+            reader.consume_bits_trusted(e >> 16);
+            pixels[off_a + 2] = e as u8;
+            pixels[off_b + o_w0] = (e >> 8) as u8;
+        } else if let Some((v2, v0b, n)) = decode_pair(&tables.slot3, s_w0, w) {
+            reader.consume_bits_trusted(n);
+            pixels[off_a + 2] = v2;
+            pixels[off_b + o_w0] = v0b;
+        } else {
+            let (v2, l2) = decode_one(&tables.slot3, w)?;
+            reader.consume_bits_trusted(l2 as u32);
+            pixels[off_a + 2] = v2;
+            let (v0b, l0b) = decode_one(s_w0, reader.peek_window())?;
+            reader.consume_bits_trusted(l0b as u32);
+            pixels[off_b + o_w0] = v0b;
+        }
+        // Pair 3: (w1 of B, w2 of B → slot3).
+        let w = reader.peek_window();
+        let e = lut_w12[(w >> 16) as usize];
+        if e != 0 {
+            reader.consume_bits_trusted(e >> 16);
+            pixels[off_b + o_w1] = e as u8;
+            pixels[off_b + 2] = (e >> 8) as u8;
+        } else if let Some((v1b, v2b, n)) = decode_pair(s_w1, &tables.slot3, w) {
+            reader.consume_bits_trusted(n);
+            pixels[off_b + o_w1] = v1b;
+            pixels[off_b + 2] = v2b;
+        } else {
+            let (v1b, l1b) = decode_one(s_w1, w)?;
+            reader.consume_bits_trusted(l1b as u32);
+            pixels[off_b + o_w1] = v1b;
+            let (v2b, l2b) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits_trusted(l2b as u32);
+            pixels[off_b + 2] = v2b;
+        }
+        px += 2;
+    }
+    // Odd body-pixel count: the last pixel keeps the pre-r440
+    // per-pixel body (pair (w0, w1) + lone slot3 read).
+    if px < n_pixels {
         let bgr_off = px * 3;
         let w = reader.peek_window();
         let e = lut_w01[(w >> 16) as usize];
@@ -2733,6 +2844,10 @@ mod round420_pair_len_lut_tests {
         let rgb = table_cache::v1x_tables(PixelFamily::Rgb24).expect("tables");
         check_pair(&rgb.slot2, &rgb.slot1, "v1x rgb s2s1");
         check_pair(&rgb.slot3, &rgb.slot3, "v1x rgb s3s3");
+        // Round-440 RGB24 phase-flip combos.
+        check_pair(&rgb.slot3, &rgb.slot1, "v1x rgb s3s1");
+        check_pair(&rgb.slot2, &rgb.slot3, "v1x rgb s2s3");
+        check_pair(&rgb.slot3, &rgb.slot2, "v1x rgb s3s2");
     }
 
     #[test]
@@ -2764,6 +2879,10 @@ mod round420_pair_len_lut_tests {
         check_pair(&tables.slot1, &tables.slot3, "custom s1s3");
         check_pair(&tables.slot2, &tables.slot1, "custom s2s1");
         check_pair(&tables.slot3, &tables.slot3, "custom s3s3");
+        // Round-440 RGB24 phase-flip combos.
+        check_pair(&tables.slot3, &tables.slot1, "custom s3s1");
+        check_pair(&tables.slot2, &tables.slot3, "custom s2s3");
+        check_pair(&tables.slot3, &tables.slot2, "custom s3s2");
     }
 }
 
@@ -2836,6 +2955,10 @@ mod round429_pair_sym_lut_tests {
         let rgb = table_cache::v1x_tables(PixelFamily::Rgb24).expect("tables");
         check_pair(&rgb.slot2, &rgb.slot1, "v1x rgb s2s1");
         check_pair(&rgb.slot3, &rgb.slot3, "v1x rgb s3s3");
+        // Round-440 RGB24 phase-flip combos.
+        check_pair(&rgb.slot3, &rgb.slot1, "v1x rgb s3s1");
+        check_pair(&rgb.slot2, &rgb.slot3, "v1x rgb s2s3");
+        check_pair(&rgb.slot3, &rgb.slot2, "v1x rgb s3s2");
     }
 
     #[test]
@@ -2865,5 +2988,173 @@ mod round429_pair_sym_lut_tests {
         check_pair(&tables.slot1, &tables.slot3, "custom s1s3");
         check_pair(&tables.slot2, &tables.slot1, "custom s2s1");
         check_pair(&tables.slot3, &tables.slot3, "custom s3s3");
+        // Round-440 RGB24 phase-flip combos.
+        check_pair(&tables.slot3, &tables.slot1, "custom s3s1");
+        check_pair(&tables.slot2, &tables.slot3, "custom s2s3");
+        check_pair(&tables.slot3, &tables.slot2, "custom s3s2");
+    }
+}
+
+#[cfg(test)]
+mod round440_rgb24_phase_flip_tests {
+    //! Round-440 regression guard for the RGB24 two-pixel phase-flip
+    //! decode body: the six codewords of two consecutive wire pixels
+    //! are consumed as three pair reads — `(w0, w1)`, `(w2, w0′)`,
+    //! `(w1′, w2′)` — with the middle pair crossing the pixel
+    //! boundary. The witness decodes the entropy stream with a plain
+    //! per-symbol `decode_one` walk (the canonical spec/03 §1.4 /
+    //! §1.2 order: three codewords per pixel, mode-resolved slots) and
+    //! asserts the production `decode_frame` output matches
+    //! byte-for-byte, across widths that land both even and odd
+    //! body-pixel counts (exercising the single-pixel tail), all
+    //! legal RGB24 methods, and all three extradata modes (ClassicV2
+    //! classic blobs, CustomV2 content-distinct tables — a slot
+    //! mix-up in the phase-flip pairing surfaces as a Huffman-code
+    //! mismatch — and the v1.x content-identical triple).
+
+    use super::*;
+    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::header::{Method, StreamConfig};
+    use crate::tables::decode_one;
+
+    fn synth(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut out = vec![0u8; n];
+        for slot in out.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *slot = s as u8;
+        }
+        out
+    }
+
+    /// Reference entropy decode: strict per-symbol walk, one
+    /// `decode_one` per codeword in wire order, no pairing, no LUTs.
+    fn ref_decode_rgb24_per_symbol(
+        decorrelate: bool,
+        width: u32,
+        height: u32,
+        frame_bytes: &[u8],
+        tables: &ThreeTables,
+    ) -> Vec<u8> {
+        let n_pixels = (width as usize) * (height as usize);
+        let mut pixels = vec![0u8; n_pixels * 3];
+        pixels[0] = frame_bytes[1];
+        pixels[1] = frame_bytes[2];
+        pixels[2] = frame_bytes[3];
+        let mut reader = BitReader::new(&frame_bytes[4..]);
+        let (s_w0, o_w0, s_w1, o_w1) = if decorrelate {
+            (&tables.slot2, 1usize, &tables.slot1, 0usize)
+        } else {
+            (&tables.slot1, 0usize, &tables.slot2, 1usize)
+        };
+        for px in 1..n_pixels {
+            let off = px * 3;
+            let (v0, l0) = decode_one(s_w0, reader.peek_window()).expect("w0");
+            reader.consume_bits(l0 as u32).expect("consume w0");
+            pixels[off + o_w0] = v0;
+            let (v1, l1) = decode_one(s_w1, reader.peek_window()).expect("w1");
+            reader.consume_bits(l1 as u32).expect("consume w1");
+            pixels[off + o_w1] = v1;
+            let (v2, l2) = decode_one(&tables.slot3, reader.peek_window()).expect("w2");
+            reader.consume_bits(l2 as u32).expect("consume w2");
+            pixels[off + 2] = v2;
+        }
+        pixels
+    }
+
+    #[test]
+    fn round440_phase_flip_matches_per_symbol_reference() {
+        const MODES: [ExtradataMode; 3] = [
+            ExtradataMode::ClassicV2,
+            ExtradataMode::CustomV2,
+            ExtradataMode::V1xCompat,
+        ];
+        const METHODS: [Method; 4] = [
+            Method::PredictOld,
+            Method::Left,
+            Method::LeftDecorr,
+            Method::GradientDecorr,
+        ];
+        for &method in METHODS.iter() {
+            for mode in MODES {
+                // (w, h) sweep landing every body parity: n_pixels − 1
+                // odd (2×2 → 3, 4×4 → 15, 5×5 → 24 even, 3×7 → 20
+                // even, 16×3 → 47 odd, 1×1 → 0-body degenerate-ish,
+                // 1×2 → 1).
+                for (w, h) in [
+                    (1u32, 2u32),
+                    (2, 2),
+                    (3, 7),
+                    (4, 4),
+                    (5, 5),
+                    (16, 3),
+                    (48, 32),
+                ] {
+                    let src = synth((w as usize) * (h as usize) * 3, 0x0440_0001);
+                    let (bih, frame) =
+                        encode_frame_with_mode(PixelFamily::Rgb24, method, w, h, &src, mode)
+                            .expect("encode");
+                    let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+                    let tables = build_three_tables(&cfg).expect("tables");
+                    // Entropy-level witness: production field decode
+                    // (before predictor inverses) must equal the
+                    // per-symbol reference walk.
+                    let mut ref_pixels =
+                        ref_decode_rgb24_per_symbol(method.decorrelate(), w, h, &frame, &tables);
+                    // Apply the same inverse chain the production path
+                    // runs, then compare the whole frame.
+                    inverse_left_row(&mut ref_pixels, 3);
+                    if matches!(method.predictor(), Predictor::Gradient) {
+                        inverse_gradient_post(&mut ref_pixels, (w as usize) * 3, h as usize);
+                    }
+                    if method.decorrelate() {
+                        inverse_rgb_decorr_bgr(&mut ref_pixels);
+                    }
+                    assert_eq!(
+                        ref_pixels, src,
+                        "reference walk must round-trip: {method:?}/{mode:?}/{w}x{h}"
+                    );
+                    let prod = decode_frame(&cfg, &frame).expect("decode");
+                    assert_eq!(
+                        prod.pixels, src,
+                        "production phase-flip decode diverged: {method:?}/{mode:?}/{w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Interlaced RGB24: the phase-flip body runs per field; both the
+    /// serial and the budget-2 field-parallel paths must stay
+    /// lossless and identical (the two-worker split scan feeds the
+    /// bottom field from the top field's consumed-byte count, which
+    /// the phase-flip loop must not perturb).
+    #[test]
+    fn round440_phase_flip_interlaced_budget_invariance() {
+        for &method in [Method::Left, Method::LeftDecorr, Method::GradientDecorr].iter() {
+            for (w, h) in [(16u32, 293u32), (32, 292)] {
+                let src = synth((w as usize) * (h as usize) * 3, 0x0440_0002);
+                let (bih, frame) = encode_frame_with_mode(
+                    PixelFamily::Rgb24,
+                    method,
+                    w,
+                    h,
+                    &src,
+                    ExtradataMode::ClassicV2,
+                )
+                .expect("encode");
+                let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
+                assert!(cfg.is_interlaced());
+                let serial = decode_frame(&cfg, &frame).expect("serial");
+                let parallel = decode_frame_with_workers(&cfg, &frame, 2).expect("parallel");
+                assert_eq!(serial.pixels, src, "serial lossless: {method:?}/{w}x{h}");
+                assert_eq!(
+                    parallel.pixels, src,
+                    "budget-2 lossless: {method:?}/{w}x{h}"
+                );
+            }
+        }
     }
 }
