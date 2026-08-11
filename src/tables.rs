@@ -548,7 +548,7 @@ pub fn compute_canonical_lengths(histogram: &[u32; 256]) -> Result<[u8; 256]> {
 // MSB-aligned in 32-bit dwords.
 
 /// Per-symbol Huffman entry. `length == 0` means "absent symbol".
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HuffEntry {
     pub length: u8,
     /// MSB-aligned 32-bit code (the high `length` bits hold the code
@@ -606,72 +606,94 @@ pub struct OverflowEntry {
 /// longer than 16 bits; walk the slow path".
 pub const PRIMARY_LUT_OVERFLOW: u16 = 0x8000;
 
+/// Round-440 extraction of [`HuffTable::build_from_lengths`]'s
+/// canonical-assign phase: validate a 256-byte length table (spec/03
+/// §3.2.3 31-bit ceiling + the §3 exact Kraft-equality invariant) and
+/// assign the canonical MSB-aligned codes per spec/04 §2.6 (the
+/// LONGEST-LENGTH-FIRST variant), WITHOUT baking the 64-Ki primary
+/// decode LUT or the overflow slice.
+///
+/// The encoder's CustomV2 emit path only ever reads per-symbol
+/// `(code, length)` pairs (`encoder::lookup_code`), so building
+/// decode-grade `HuffTable`s per frame paid ~26 µs × 3 of dead LUT
+/// fill per CustomV2 frame (the r419 BENCHMARKS note's secondary
+/// target). Returns `(entries, max_length)`; identical validation,
+/// error messages, and assignment order to `build_from_lengths`,
+/// which now delegates here (pinned by the round440 equivalence test
+/// in this module).
+pub(crate) fn canonical_entries_from_lengths(
+    lengths: &[u8; 256],
+) -> Result<([HuffEntry; 256], u8)> {
+    // Validate lengths (spec/03 §3.2.3) + tally the exact Kraft
+    // sum in 64-bit fixed point (unit = 2⁻³², so a length-L code
+    // contributes 2³²⁻ᴸ and equality means the tally is exactly
+    // 2³² — spec/03 §3's "sum 2^-L_i == 1" invariant).
+    let mut kraft: u64 = 0;
+    for (i, &l) in lengths.iter().enumerate() {
+        if l > 31 {
+            return Err(Error::invalid(format!(
+                "code length {l} for symbol {i} exceeds 31-bit ceiling"
+            )));
+        }
+        if l > 0 {
+            kraft += 1u64 << (32 - l as u32);
+        }
+    }
+    let mut entries = [HuffEntry::default(); 256];
+    // Largest non-zero length first.
+    let mut max_length: u8 = 0;
+    for &l in lengths.iter() {
+        if l > max_length {
+            max_length = l;
+        }
+    }
+
+    // Walk length tiers from MAX down to 1; within each, ascending
+    // symbol index. Code accumulator is 32-bit MSB-aligned;
+    // wraps to 0 at the end (Kraft equality).
+    let mut code_acc: u32 = 0;
+    let mut tier = max_length as i32;
+    while tier > 0 {
+        let l = tier as u8;
+        let step: u32 = if l == 0 { 0 } else { 1u32 << (32 - l as u32) };
+        for sym in 0..256usize {
+            if lengths[sym] == l {
+                entries[sym] = HuffEntry {
+                    length: l,
+                    code: code_acc,
+                };
+                code_acc = code_acc.wrapping_add(step);
+            }
+        }
+        tier -= 1;
+    }
+    // Sanity: when the table is non-trivial, Kraft EQUALITY must
+    // hold exactly (spec/03 §3 "sum 2^-L_i == 1"). The exact
+    // 64-bit tally is required here — the pre-fix check tested
+    // only `code_acc != 0` on the 32-bit accumulator, which an
+    // over-subscribed distribution whose Kraft sum is an integer
+    // multiple of 1.0 aliases by wrapping to 0 more than once
+    // (fuzz-found 2026-06-09: four 2-bit lengths + two 1-bit
+    // lengths sum to 2.0, wrap the accumulator twice, and assign
+    // two symbols the same all-zero code — breaking the
+    // prefix-free decode contract). (When the table is empty —
+    // all lengths == 0 — the tally is 0 and no check applies.)
+    if max_length > 0 && kraft != 1u64 << 32 {
+        return Err(Error::invalid(
+            "non-canonical length distribution (Kraft sum != 1)",
+        ));
+    }
+    debug_assert!(max_length == 0 || code_acc == 0);
+    Ok((entries, max_length))
+}
+
 impl HuffTable {
     /// Build canonical-Huffman codes from a 256-byte length table per
     /// spec/03 §3 / spec/04 §2.6 (the LONGEST-LENGTH-FIRST variant
     /// the binary uses; verified empirically by the spec/04 §2.6
     /// Validator-corrected algorithm).
     pub fn build_from_lengths(lengths: &[u8; 256]) -> Result<Self> {
-        // Validate lengths (spec/03 §3.2.3) + tally the exact Kraft
-        // sum in 64-bit fixed point (unit = 2⁻³², so a length-L code
-        // contributes 2³²⁻ᴸ and equality means the tally is exactly
-        // 2³² — spec/03 §3's "sum 2^-L_i == 1" invariant).
-        let mut kraft: u64 = 0;
-        for (i, &l) in lengths.iter().enumerate() {
-            if l > 31 {
-                return Err(Error::invalid(format!(
-                    "code length {l} for symbol {i} exceeds 31-bit ceiling"
-                )));
-            }
-            if l > 0 {
-                kraft += 1u64 << (32 - l as u32);
-            }
-        }
-        let mut entries = [HuffEntry::default(); 256];
-        // Largest non-zero length first.
-        let mut max_length: u8 = 0;
-        for &l in lengths.iter() {
-            if l > max_length {
-                max_length = l;
-            }
-        }
-
-        // Walk length tiers from MAX down to 1; within each, ascending
-        // symbol index. Code accumulator is 32-bit MSB-aligned;
-        // wraps to 0 at the end (Kraft equality).
-        let mut code_acc: u32 = 0;
-        let mut tier = max_length as i32;
-        while tier > 0 {
-            let l = tier as u8;
-            let step: u32 = if l == 0 { 0 } else { 1u32 << (32 - l as u32) };
-            for sym in 0..256usize {
-                if lengths[sym] == l {
-                    entries[sym] = HuffEntry {
-                        length: l,
-                        code: code_acc,
-                    };
-                    code_acc = code_acc.wrapping_add(step);
-                }
-            }
-            tier -= 1;
-        }
-        // Sanity: when the table is non-trivial, Kraft EQUALITY must
-        // hold exactly (spec/03 §3 "sum 2^-L_i == 1"). The exact
-        // 64-bit tally is required here — the pre-fix check tested
-        // only `code_acc != 0` on the 32-bit accumulator, which an
-        // over-subscribed distribution whose Kraft sum is an integer
-        // multiple of 1.0 aliases by wrapping to 0 more than once
-        // (fuzz-found 2026-06-09: four 2-bit lengths + two 1-bit
-        // lengths sum to 2.0, wrap the accumulator twice, and assign
-        // two symbols the same all-zero code — breaking the
-        // prefix-free decode contract). (When the table is empty —
-        // all lengths == 0 — the tally is 0 and no check applies.)
-        if max_length > 0 && kraft != 1u64 << 32 {
-            return Err(Error::invalid(
-                "non-canonical length distribution (Kraft sum != 1)",
-            ));
-        }
-        debug_assert!(max_length == 0 || code_acc == 0);
+        let (entries, max_length) = canonical_entries_from_lengths(lengths)?;
         let primary_lut = build_primary_lut(&entries);
         let overflow_entries = std::sync::Arc::new(build_overflow_entries(&entries));
         Ok(Self {
@@ -1784,5 +1806,103 @@ mod tests {
         // And the region RLE-roundtrips to the exact three tables.
         let back = rle_decode_three_channels(&out).unwrap();
         assert_eq!(back, [s1, s2, s3], "three-channel RLE must roundtrip");
+    }
+
+    /// Round-440: `canonical_entries_from_lengths` (the encoder's
+    /// lean CustomV2 table build) must produce EXACTLY the entries +
+    /// max_length `build_from_lengths` produces — same assignment,
+    /// same validation, same errors — across every classic blob's
+    /// three channels, the two v1.x length sets, histogram-derived
+    /// tables (peaked / flat / sparse shapes), and the invalid-input
+    /// space (31-bit ceiling violation, Kraft under- and
+    /// over-subscription including the fuzz-found integer-multiple
+    /// alias).
+    #[test]
+    fn round440_canonical_entries_match_full_build() {
+        let mut cases: Vec<[u8; 256]> = Vec::new();
+        // Every classic blob channel.
+        for family in [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32] {
+            for method in [
+                Method::PredictOld,
+                Method::Left,
+                Method::Gradient,
+                Method::Median,
+                Method::LeftDecorr,
+                Method::GradientDecorr,
+            ] {
+                let legal = if family == PixelFamily::Yuy2 {
+                    method.is_yuv_legal()
+                } else {
+                    method.is_rgb_legal()
+                };
+                if !legal {
+                    continue;
+                }
+                let blob = classic_blob_bytes(family, method);
+                for lens in rle_decode_three_channels(blob).expect("classic decode") {
+                    cases.push(lens);
+                }
+            }
+        }
+        // v1.x length sets.
+        for raw in [v1x_lengths_set_a(), v1x_lengths_set_b()] {
+            let mut cursor = raw;
+            cases.push(rle_decode_one_channel(&mut cursor).expect("v1x decode"));
+        }
+        // Histogram-derived shapes (the CustomV2 reality).
+        let mut peaked = [0u32; 256];
+        for (i, slot) in peaked.iter_mut().enumerate() {
+            let d = (i as i32).min(256 - i as i32).unsigned_abs();
+            *slot = 100_000u32 >> d.min(16);
+        }
+        let flat = [7u32; 256];
+        let mut sparse = [0u32; 256];
+        for (i, w) in [(0usize, 1000u32), (17, 50), (128, 3), (200, 3), (255, 1)] {
+            sparse[i] = w;
+        }
+        for hist in [peaked, flat, sparse] {
+            cases.push(compute_canonical_lengths(&hist).expect("lengths"));
+        }
+        // Empty table (all lengths 0) — legal no-op build.
+        cases.push([0u8; 256]);
+
+        for (n, lens) in cases.iter().enumerate() {
+            let full = HuffTable::build_from_lengths(lens).expect("full build");
+            let (entries, max_length) = canonical_entries_from_lengths(lens).expect("lean build");
+            assert_eq!(
+                entries[..],
+                full.entries[..],
+                "case {n}: lean entries diverge from full build"
+            );
+            assert_eq!(max_length, full.max_length, "case {n}: max_length drift");
+        }
+
+        // Error parity: both builders must reject the same inputs
+        // with the same message.
+        let mut over_ceiling = [0u8; 256];
+        over_ceiling[3] = 32;
+        let mut undersub = [0u8; 256];
+        undersub[0] = 2; // Kraft sum 0.25
+        let mut integer_alias = [0u8; 256];
+        // Fuzz-found shape: four 2-bit + two 1-bit lengths = sum 2.0.
+        integer_alias[0] = 2;
+        integer_alias[1] = 2;
+        integer_alias[2] = 2;
+        integer_alias[3] = 2;
+        integer_alias[18] = 1;
+        integer_alias[19] = 1;
+        for (label, bad) in [
+            ("31-bit ceiling", over_ceiling),
+            ("undersubscribed", undersub),
+            ("integer Kraft alias", integer_alias),
+        ] {
+            let full_err = HuffTable::build_from_lengths(&bad).expect_err(label);
+            let lean_err = canonical_entries_from_lengths(&bad).expect_err(label);
+            assert_eq!(
+                format!("{full_err}"),
+                format!("{lean_err}"),
+                "{label}: error text drift between full and lean builders"
+            );
+        }
     }
 }

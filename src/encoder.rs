@@ -26,9 +26,21 @@ use crate::predict::{
     forward_median_subtract, forward_rgb_left_subtract_linear, forward_yuy2_left_subtract,
     interlace_flag_for_height, is_interlaced_height,
 };
+#[cfg(test)]
+use crate::tables::HuffTable;
 use crate::tables::{
-    classic_blob_bytes, compute_canonical_lengths, rle_encode_three_channels, HuffEntry, HuffTable,
+    classic_blob_bytes, compute_canonical_lengths, rle_encode_three_channels, HuffEntry,
 };
+
+/// Round-440: the emit pipeline's per-slot table view. The encoder
+/// only ever reads per-symbol `(code, length)` pairs — never the
+/// 64-Ki primary decode LUT or the overflow slice a full
+/// [`HuffTable`] carries — so every emit-side helper takes the bare
+/// entries array. ClassicV2 / V1xCompat borrow `.entries` out of the
+/// shared decode-table cache; CustomV2 builds the entries alone
+/// (`tables::canonical_entries_from_lengths`), skipping the dead LUT
+/// bake it used to pay per frame.
+type SlotEntries = [HuffEntry; 256];
 
 /// Selects which BIH/extradata path the encoder writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -191,9 +203,9 @@ pub(crate) fn encode_body_with_pinned_tables(
         family,
         method,
         &frame.combined_body,
-        &tabs.slot1,
-        &tabs.slot2,
-        &tabs.slot3,
+        &tabs.slot1.entries,
+        &tabs.slot2.entries,
+        &tabs.slot3.entries,
     )
     .map_err(|_| {
         Error::unsupported(
@@ -206,9 +218,9 @@ pub(crate) fn encode_body_with_pinned_tables(
         family,
         method,
         &frame,
-        &tabs.slot1,
-        &tabs.slot2,
-        &tabs.slot3,
+        &tabs.slot1.entries,
+        &tabs.slot2.entries,
+        &tabs.slot3.entries,
         workers,
     )
 }
@@ -238,30 +250,43 @@ fn encode_with_precomputed(
     // of being rebuilt — three `build_from_lengths` runs including the
     // 64-Ki primary-LUT fill, which the round-419 `sample` profile
     // attributed ~33% of a ClassicV2 320×240 encode to — or re-cloned
-    // (3 × 128-KiB LUT memcpy per V1xCompat frame) on every call. Only
-    // CustomV2 still builds per frame, since its tables derive from the
-    // frame's own histograms.
-    let (extradata_tables, tabs, has_extradata): (
-        Vec<u8>,
-        std::sync::Arc<crate::decoder::ThreeTables>,
-        bool,
-    ) = match mode {
+    // (3 × 128-KiB LUT memcpy per V1xCompat frame) on every call.
+    // Round-440: CustomV2 (the one per-frame build left) no longer
+    // builds decode-grade tables at all — the emit path only reads
+    // per-symbol `(code, length)` entries, so it takes the
+    // canonical-assign phase alone (`canonical_entries_from_lengths`)
+    // and skips the 64-Ki primary-LUT fill + overflow bake
+    // (~26 µs × 3 of dead work per frame, the r419 BENCHMARKS
+    // secondary target). Same assignment, same validation, same
+    // errors; byte-identical wire (golden pins + the round440
+    // entries-equivalence test in `tables`).
+    enum EncTables {
+        Shared(std::sync::Arc<crate::decoder::ThreeTables>),
+        Lean(Box<[SlotEntries; 3]>),
+    }
+    impl EncTables {
+        fn slots(&self) -> (&SlotEntries, &SlotEntries, &SlotEntries) {
+            match self {
+                EncTables::Shared(t) => (&t.slot1.entries, &t.slot2.entries, &t.slot3.entries),
+                EncTables::Lean(b) => (&b[0], &b[1], &b[2]),
+            }
+        }
+    }
+    let (extradata_tables, tabs, has_extradata): (Vec<u8>, EncTables, bool) = match mode {
         ExtradataMode::ClassicV2 => {
             let extra = classic_blob_bytes(family, method).to_vec();
             let tabs = crate::decoder::table_cache::extradata_tables(&extra)?;
-            (extra, tabs, true)
+            (extra, EncTables::Shared(tabs), true)
         }
         ExtradataMode::CustomV2 => {
             let lengths = compute_lengths_from_body(family, method, stats_body);
-            let tabs = std::sync::Arc::new(crate::decoder::ThreeTables {
-                slot1: HuffTable::build_from_lengths(&lengths[0])?,
-                slot2: HuffTable::build_from_lengths(&lengths[1])?,
-                slot3: HuffTable::build_from_lengths(&lengths[2])?,
-                scan_luts: crate::decoder::ScanLuts::default(),
-                pair_sym_luts: crate::decoder::PairSymLuts::default(),
-            });
+            let tabs = Box::new([
+                crate::tables::canonical_entries_from_lengths(&lengths[0])?.0,
+                crate::tables::canonical_entries_from_lengths(&lengths[1])?.0,
+                crate::tables::canonical_entries_from_lengths(&lengths[2])?.0,
+            ]);
             let extra = rle_encode_three_channels(&lengths)?;
-            (extra, tabs, true)
+            (extra, EncTables::Lean(tabs), true)
         }
         ExtradataMode::V1xCompat => {
             let tabs = crate::decoder::table_cache::v1x_tables(family)?;
@@ -273,14 +298,14 @@ fn encode_with_precomputed(
                 family,
                 method,
                 stats_body,
-                &tabs.slot1,
-                &tabs.slot2,
-                &tabs.slot3,
+                &tabs.slot1.entries,
+                &tabs.slot2.entries,
+                &tabs.slot3.entries,
             )?;
-            (Vec::new(), tabs, false)
+            (Vec::new(), EncTables::Shared(tabs), false)
         }
     };
-    let (slot1, slot2, slot3) = (&tabs.slot1, &tabs.slot2, &tabs.slot3);
+    let (slot1, slot2, slot3) = tabs.slots();
 
     let strf = build_bitmapinfoheader(
         family,
@@ -311,9 +336,9 @@ fn emit_frame_bytes(
     family: PixelFamily,
     method: Method,
     frame: &PrecomputedFrame,
-    slot1: &HuffTable,
-    slot2: &HuffTable,
-    slot3: &HuffTable,
+    slot1: &SlotEntries,
+    slot2: &SlotEntries,
+    slot3: &SlotEntries,
     workers: usize,
 ) -> Result<Vec<u8>> {
     if frame.interlaced {
@@ -1566,9 +1591,9 @@ fn verify_body_in_table(
     family: PixelFamily,
     method: Method,
     body: &[u8],
-    s1: &HuffTable,
-    s2: &HuffTable,
-    s3: &HuffTable,
+    s1: &SlotEntries,
+    s2: &SlotEntries,
+    s3: &SlotEntries,
 ) -> Result<()> {
     // Round-227: hoist YUY2 macropixel-step verification out of the
     // generic per-byte byte_idx-driven match. The other two pixel
@@ -1589,25 +1614,25 @@ fn verify_body_in_table(
         let mut i = 0usize;
         while i < body_aligned {
             let sym0 = body[i];
-            if s1.entries[sym0 as usize].length == 0 {
+            if s1[sym0 as usize].length == 0 {
                 return Err(Error::unsupported(format!(
                     "v1.x compat: residual symbol 0x{sym0:02x} not in v1.x codebook"
                 )));
             }
             let sym1 = body[i + 1];
-            if s2.entries[sym1 as usize].length == 0 {
+            if s2[sym1 as usize].length == 0 {
                 return Err(Error::unsupported(format!(
                     "v1.x compat: residual symbol 0x{sym1:02x} not in v1.x codebook"
                 )));
             }
             let sym2 = body[i + 2];
-            if s1.entries[sym2 as usize].length == 0 {
+            if s1[sym2 as usize].length == 0 {
                 return Err(Error::unsupported(format!(
                     "v1.x compat: residual symbol 0x{sym2:02x} not in v1.x codebook"
                 )));
             }
             let sym3 = body[i + 3];
-            if s3.entries[sym3 as usize].length == 0 {
+            if s3[sym3 as usize].length == 0 {
                 return Err(Error::unsupported(format!(
                     "v1.x compat: residual symbol 0x{sym3:02x} not in v1.x codebook"
                 )));
@@ -1622,7 +1647,7 @@ fn verify_body_in_table(
                 _ => s3,
             };
             let sym = body[i];
-            if slot.entries[sym as usize].length == 0 {
+            if slot[sym as usize].length == 0 {
                 return Err(Error::unsupported(format!(
                     "v1.x compat: residual symbol 0x{sym:02x} not in v1.x codebook"
                 )));
@@ -1671,7 +1696,7 @@ fn verify_body_in_table(
                 }
             }
         };
-        if slot.entries[sym as usize].length == 0 {
+        if slot[sym as usize].length == 0 {
             return Err(Error::unsupported(format!(
                 "v1.x compat: residual symbol 0x{sym:02x} not in v1.x codebook"
             )));
@@ -1698,9 +1723,9 @@ fn emit_bitstream_parts(
     method: Method,
     seed: &[u8; 4],
     body: &[u8],
-    slot1: &HuffTable,
-    slot2: &HuffTable,
-    slot3: &HuffTable,
+    slot1: &SlotEntries,
+    slot2: &SlotEntries,
+    slot3: &SlotEntries,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(seed);
@@ -1900,8 +1925,8 @@ fn emit_bitstream_parts(
     Ok(out)
 }
 
-fn lookup_code(table: &HuffTable, sym: u8) -> Result<(u32, u32)> {
-    let entry: HuffEntry = table.entries[sym as usize];
+fn lookup_code(table: &SlotEntries, sym: u8) -> Result<(u32, u32)> {
+    let entry: HuffEntry = table[sym as usize];
     if entry.length == 0 {
         return Err(Error::invalid(format!(
             "encoder: symbol 0x{:02x} not in Huffman table",
@@ -2027,9 +2052,9 @@ mod round221_yuy2_emit_macropixel_tests {
     fn ref_emit_yuy2_per_byte(
         seed: &[u8; 4],
         body: &[u8],
-        slot1: &HuffTable,
-        slot2: &HuffTable,
-        slot3: &HuffTable,
+        slot1: &SlotEntries,
+        slot2: &SlotEntries,
+        slot3: &SlotEntries,
     ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(seed);
@@ -2101,9 +2126,9 @@ mod round221_yuy2_emit_macropixel_tests {
             let ref_frame = ref_emit_yuy2_per_byte(
                 &frame.top_seed,
                 &frame.combined_body,
-                &slot1,
-                &slot2,
-                &slot3,
+                &slot1.entries,
+                &slot2.entries,
+                &slot3.entries,
             );
 
             // The production wire bytes start with the bih extradata
@@ -2117,9 +2142,9 @@ mod round221_yuy2_emit_macropixel_tests {
                 method,
                 &frame.top_seed,
                 &frame.combined_body,
-                &slot1,
-                &slot2,
-                &slot3,
+                &slot1.entries,
+                &slot2.entries,
+                &slot3.entries,
             )
             .expect("prod emit");
             assert_eq!(
@@ -2215,9 +2240,9 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
     /// error path so the diagnostic text stays stable.
     fn ref_verify_body_in_table_yuy2_per_byte(
         body: &[u8],
-        s1: &HuffTable,
-        s2: &HuffTable,
-        s3: &HuffTable,
+        s1: &SlotEntries,
+        s2: &SlotEntries,
+        s3: &SlotEntries,
     ) -> Result<()> {
         for (byte_idx, (_i, &sym)) in (4usize..).zip(body.iter().enumerate()) {
             let slot = match byte_idx & 3 {
@@ -2225,7 +2250,7 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
                 1 => s2,
                 _ => s3,
             };
-            if slot.entries[sym as usize].length == 0 {
+            if slot[sym as usize].length == 0 {
                 return Err(Error::unsupported(format!(
                     "v1.x compat: residual symbol 0x{sym:02x} not in v1.x codebook"
                 )));
@@ -2332,8 +2357,16 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
         let tabs = crate::decoder::table_cache::v1x_tables(PixelFamily::Yuy2).expect("v1x build");
         let (s1, s2, s3) = (tabs.slot1.clone(), tabs.slot2.clone(), tabs.slot3.clone());
         let body: Vec<u8> = (0u8..64).collect();
-        let prod = verify_body_in_table(PixelFamily::Yuy2, Method::Left, &body, &s1, &s2, &s3);
-        let refr = ref_verify_body_in_table_yuy2_per_byte(&body, &s1, &s2, &s3);
+        let prod = verify_body_in_table(
+            PixelFamily::Yuy2,
+            Method::Left,
+            &body,
+            &s1.entries,
+            &s2.entries,
+            &s3.entries,
+        );
+        let refr =
+            ref_verify_body_in_table_yuy2_per_byte(&body, &s1.entries, &s2.entries, &s3.entries);
         match (prod, refr) {
             (Ok(()), Ok(())) => {}
             (Err(e1), Err(e2)) => assert_eq!(format!("{e1}"), format!("{e2}")),
@@ -2370,8 +2403,20 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
             // every symbol).
             let mut body = vec![0u8; 8];
             body[1] = sym;
-            let prod = verify_body_in_table(PixelFamily::Yuy2, Method::Left, &body, &s1, &s2, &s3);
-            let refr = ref_verify_body_in_table_yuy2_per_byte(&body, &s1, &s2, &s3);
+            let prod = verify_body_in_table(
+                PixelFamily::Yuy2,
+                Method::Left,
+                &body,
+                &s1.entries,
+                &s2.entries,
+                &s3.entries,
+            );
+            let refr = ref_verify_body_in_table_yuy2_per_byte(
+                &body,
+                &s1.entries,
+                &s2.entries,
+                &s3.entries,
+            );
             match (prod, refr) {
                 (Err(e1), Err(e2)) => assert_eq!(format!("{e1}"), format!("{e2}")),
                 (a, b) => panic!("round227 verify failure-path drift: prod={a:?} ref={b:?}",),
@@ -2593,9 +2638,9 @@ mod round239_rgb24_emit_pixel_step_tests {
     fn ref_emit_rgb24_per_byte_loop(
         method: Method,
         body: &[u8],
-        slot1: &HuffTable,
-        slot2: &HuffTable,
-        slot3: &HuffTable,
+        slot1: &SlotEntries,
+        slot2: &SlotEntries,
+        slot3: &SlotEntries,
     ) -> Vec<u8> {
         let mut writer = BitWriter::new();
         for (i, &sym) in body.iter().enumerate() {
@@ -2663,7 +2708,13 @@ mod round239_rgb24_emit_pixel_step_tests {
             let s1 = HuffTable::build_from_lengths(&len1).expect("t1");
             let s2 = HuffTable::build_from_lengths(&len2).expect("t2");
             let s3 = HuffTable::build_from_lengths(&len3).expect("t3");
-            let ref_bits = ref_emit_rgb24_per_byte_loop(method, &residuals.body, &s1, &s2, &s3);
+            let ref_bits = ref_emit_rgb24_per_byte_loop(
+                method,
+                &residuals.body,
+                &s1.entries,
+                &s2.entries,
+                &s3.entries,
+            );
             // The production frame begins with the 4-byte uncompressed
             // seed; the emitted bit stream follows.
             let prod_bits = &frame[4..];
@@ -3072,9 +3123,9 @@ mod round245_rgb32_emit_pixel_step_tests {
     fn ref_emit_rgb32_per_byte_loop(
         method: Method,
         body: &[u8],
-        slot1: &HuffTable,
-        slot2: &HuffTable,
-        slot3: &HuffTable,
+        slot1: &SlotEntries,
+        slot2: &SlotEntries,
+        slot3: &SlotEntries,
     ) -> Vec<u8> {
         let mut writer = BitWriter::new();
         for (i, &sym) in body.iter().enumerate() {
@@ -3142,7 +3193,13 @@ mod round245_rgb32_emit_pixel_step_tests {
             let s1 = HuffTable::build_from_lengths(&len1).expect("t1");
             let s2 = HuffTable::build_from_lengths(&len2).expect("t2");
             let s3 = HuffTable::build_from_lengths(&len3).expect("t3");
-            let ref_bits = ref_emit_rgb32_per_byte_loop(method, &residuals.body, &s1, &s2, &s3);
+            let ref_bits = ref_emit_rgb32_per_byte_loop(
+                method,
+                &residuals.body,
+                &s1.entries,
+                &s2.entries,
+                &s3.entries,
+            );
             // The production frame begins with the 4-byte uncompressed
             // seed; the emitted bit stream follows.
             let prod_bits = &frame[4..];
@@ -3712,9 +3769,9 @@ mod round382_arbitrary_extradata_conformance_tests {
                 method,
                 &frame.top_seed,
                 &frame.combined_body[..frame.top_body_len],
-                &s1,
-                &s2,
-                &s3,
+                &s1.entries,
+                &s2.entries,
+                &s3.entries,
             )
             .expect("emit top");
             if let Some(bot_seed) = frame.bot_seed_opt {
@@ -3723,9 +3780,9 @@ mod round382_arbitrary_extradata_conformance_tests {
                     method,
                     &bot_seed,
                     &frame.combined_body[frame.top_body_len..],
-                    &s1,
-                    &s2,
-                    &s3,
+                    &s1.entries,
+                    &s2.entries,
+                    &s3.entries,
                 )
                 .expect("emit bot");
                 out.append(&mut bot);
@@ -3737,9 +3794,9 @@ mod round382_arbitrary_extradata_conformance_tests {
                 method,
                 &frame.top_seed,
                 &frame.combined_body,
-                &s1,
-                &s2,
-                &s3,
+                &s1.entries,
+                &s2.entries,
+                &s3.entries,
             )
             .expect("emit")
         };

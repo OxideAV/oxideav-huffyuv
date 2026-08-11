@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 440: lean CustomV2 encoder tables — the r419 BENCHMARKS
+  note's secondary encode target. The CustomV2 arm was the one
+  remaining per-frame table build, and it built three decode-grade
+  `HuffTable`s (canonical assign + 64-Ki primary-LUT fill + overflow
+  bake, ~26 µs each) although the emit pipeline only ever reads
+  per-symbol `(code, length)` entries. The canonical-assign phase is
+  now extracted as `tables::canonical_entries_from_lengths`
+  (identical validation — 31-bit ceiling, exact 64-bit-fixed-point
+  Kraft equality — identical assignment order, identical error
+  text; `build_from_lengths` delegates to it), and every emit-side
+  helper (`emit_bitstream_parts`, `emit_frame_bytes`,
+  `verify_body_in_table`, `lookup_code`) takes the bare
+  `[HuffEntry; 256]` slot view: ClassicV2 / V1xCompat borrow
+  `.entries` out of the shared r419 decode-table cache, CustomV2
+  builds entries alone and skips the dead LUT bake (and its
+  per-frame 128-KiB allocation) entirely. Byte-identical wire
+  (golden matrix + trait-path pins + a new equivalence test pinning
+  lean entries == full-build entries across every classic-blob
+  channel, both v1.x length sets, peaked / flat / sparse
+  histogram-derived tables, the empty table, and error-text parity
+  on the invalid space). Measured (Apple Silicon, shared host,
+  same-session A/B): 320×240 YUY2 auto-custom 579 → 521 µs
+  (**−10.0%**, 253 → 281 MiB/s), 320×240 RGB24 auto-custom
+  954 → 889 µs (−7.1%); 720p auto-custom neutral (the fixed ~78 µs
+  saving amortises over the larger raster). Lib tests 313 → 314.
+
 - Round 440: scan-side RGB24 phase-flip pairing. The interlaced
   split scanner (`decoder::scan_rgb_field`) mirrored the pre-r440
   decode body, so RGB24's `+2 → slot3` position stayed a lone
