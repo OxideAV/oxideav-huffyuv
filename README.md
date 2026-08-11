@@ -38,7 +38,11 @@ No external library source consulted.
   when the byte is `0x00` (the x86-64 build / clean-room default).
 - A 65 536-entry primary lookup table per Huffman table services codes
   ≤ 16 bits in a single indexed load; longer codes fall through to a
-  flat overflow table.
+  flat overflow table. Full pair LUTs (round 429) resolve two
+  codewords per 32-bit load on the serial decode critical path; round
+  440's phase-flip pairing extends this to RGB24's third codeword by
+  walking two pixels per step (the middle pair crosses the pixel
+  boundary), so every codeword of every family rides a pair read.
 - **Arbitrary v2.x extradata** (spec/04 §3.4): the decoder accepts
   *any* set of three RLE-compressed 256-entry length tables in the
   extradata — not only the six classic blobs — deriving per-symbol
@@ -184,6 +188,17 @@ lazily built per stream behind the table cache) cut serial decode
 23–33% across the gates — YUY2 Left 320×240 0.64 → 0.43 ms
 (345 MiB/s), YUY2 Left 720p interlaced 7.73 → 5.31 ms, RGB24
 LeftDecorr 1.26 → 0.95 ms — with byte-identical output.
+
+Round 440 closes the two levers the r429 notes left named:
+**RGB24 phase-flip pairing** (two pixels per decode step so the
+third codeword pairs across the pixel boundary — 320×240 LeftDecorr
+−8.4% serial, and mirrored into the split scanner so interlaced
+RGB24 gains a proper 2-worker win: 11.39 → 8.44 ms on 720p,
+**1.35×**, with a new `decode_workers_rgb24_*` gate) and **lean
+CustomV2 encoder tables** (the emit path reads only `(code, length)`
+entries, so the per-frame 64-Ki decode-LUT bake is skipped —
+320×240 auto-custom encodes −10.0% YUY2 / −7.1% RGB24). All
+byte-identical, golden-pinned.
 
 ## Fuzzing
 

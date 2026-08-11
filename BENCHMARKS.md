@@ -47,7 +47,10 @@ three interlaced 1280×720 scenarios each:
 `…_yuy2_1280x720_median_classic`, and
 `…_rgb32_1280x720_gradient_decorr_classic`. The `1w` arm routes
 through the identical serial code path, so each pair reads directly
-as the field-parallel delta.
+as the field-parallel delta. Round 440 adds
+`decode_workers_rgb24_1280x720_left_decorr_classic` — the 3-code
+family whose split scan previously left the `+2 → slot3` position on
+a lone `decode_one`.
 
 **Encode** (`benches/encode.rs`) — symmetric v1.x / v2.x across all
 three families:
@@ -192,6 +195,7 @@ All scenarios interlaced 1280×720 ClassicV2, 1 → 2 workers:
 | decode    | yuy2 Left                 | 7.91 ms (222 MiB/s)  | 5.47 ms (321 MiB/s)  | **1.45×** |
 | decode    | yuy2 Median               | 9.81 ms (179 MiB/s)  | 6.69 ms (263 MiB/s)  | **1.47×** |
 | decode    | rgb32 GradientDecorr      | 17.90 ms (196 MiB/s) | 13.45 ms (261 MiB/s) | **1.33×** |
+| decode    | rgb24 LeftDecorr (r440)   | 11.39 ms (231 MiB/s) | 8.44 ms (312 MiB/s)  | **1.35×** |
 | encode    | yuy2 Left                 | 2.95 ms (597 MiB/s)  | 1.59 ms (1.08 GiB/s) | **1.85×** |
 | encode    | yuy2 Median               | 4.82 ms (365 MiB/s)  | 2.79 ms (629 MiB/s)  | **1.72×** |
 | encode    | rgb32 GradientDecorr      | 10.78 ms (326 MiB/s) | 5.43 ms (648 MiB/s)  | **1.99×** |
@@ -276,12 +280,45 @@ LeftDecorr 1.26 → 0.95 ms (−25%, 174 → 232 MiB/s), rgb32 1280×720
 GradientDecorr interlaced −25%. Byte-identical output (golden matrix
 + randomized LUT-vs-walk sweep).
 
-**Primary (decode): RGB24's third codeword is still a lone
-`decode_one`.** The 3-code wire cycle pairs (w0, w1) but leaves the
-`+2 → slot3` position on the sequential path; pairing it across the
-pixel boundary — `(R/R−G, next pixel's w0)` — would need a
-per-iteration phase flip but would put ALL RGB24 codewords on pair
-reads. Gate on `decode_rgb24_320x240_left_decorr_classic`.
+*(Landed r440)* The r429 primary — RGB24's lone third `decode_one` —
+shipped as the round-440 phase-flip pairing: the decode body (and the
+split scanner) walk two pixels per step so the six codewords group as
+`(w0, w1)`, `(w2, w0′)`, `(w1′, w2′)`, with three new pair-LUT combos
+(`s3s1`, `s2s3`, `s3s2`) serving the flipped phases. Measured on the
+gates (shared round host, same-session A/B):
+`decode_rgb24_320x240_left_decorr_classic` 839 → 790 µs (−8.4%,
+262 → 278 MiB/s), 320×320 interlaced −5.4%, and the new RGB24
+worker gate reaches 1.35× at 2 workers (11.39 → 8.44 ms on 720p —
+the family previously had no worker gate at all).
+
+*(Landed r440)* The r419 secondary — CustomV2's dead 64-Ki
+primary-LUT fill — shipped as the lean encoder tables:
+`tables::canonical_entries_from_lengths` runs the canonical-assign
+phase alone and the emit-side helpers take bare `[HuffEntry; 256]`
+slot views. `encode_yuy2_320x240_auto_custom` 579 → 521 µs (−10.0%,
+253 → 281 MiB/s), `encode_rgb24_320x240_auto_custom` −7.1%; the 720p
+auto-custom scenarios are neutral (the fixed ~78 µs/frame saving
+amortises over the larger raster).
+
+**Remaining candidates (both unproven):**
+
+1. **Progressive-encode residual fan-out.** The forward predictor
+   passes read only source pixels (the sequential dependency is
+   decode-side only), so the residual phase could split across
+   `ExecutionContext` workers at row-aligned boundaries even on
+   progressive frames. Amdahl-bounded: the bit-emit stays serial
+   (one field = one bitstream; concatenation is only legal at the
+   per-field word-aligned boundaries the interlaced path already
+   exploits), so the win is capped at the residual phase's share —
+   worst for LEFT (SWAR-fast pass), best for MEDIAN. Needs
+   range-aware variants of the forward passes; only worth it if a
+   profile shows the residual share justifying the surface.
+
+2. **Serial decode is entropy-bound and near-saturated.** Every
+   family now consumes its whole wire cycle as LUT-fronted pair
+   reads; the predictor inverses are already SWAR / macropixel-step
+   rewritten (r91/r181/r255/r304). No named lever remains; further
+   serial-decode work should start from a fresh profile.
 
 *(Landed r420)* The r419 candidate lever (b) — decoding the two
 independent field bitstreams of an interlaced frame on two threads —
