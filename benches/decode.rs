@@ -333,6 +333,15 @@ fn bench_hd_interlaced_worker_scaling(c: &mut Criterion) {
             PixelFamily::Rgb32,
             Method::GradientDecorr,
         ),
+        // Round-440: RGB24 gate — the 3-code family whose scan left
+        // the +2 → slot3 position on a lone decode_one before the
+        // phase-flip pairing; the 2w arm reads directly as the
+        // split-scan improvement.
+        (
+            "decode_workers_rgb24_1280x720_left_decorr_classic",
+            PixelFamily::Rgb24,
+            Method::LeftDecorr,
+        ),
     ] {
         let (w, h) = (1280u32, 720u32);
         let (cfg, frame) = make_decode_input(family, method, w, h, ExtradataMode::ClassicV2);

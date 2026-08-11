@@ -8,6 +8,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 440: scan-side RGB24 phase-flip pairing. The interlaced
+  split scanner (`decoder::scan_rgb_field`) mirrored the pre-r440
+  decode body, so RGB24's `+2 → slot3` position stayed a lone
+  `decode_one` on the scan critical path — the prefix that bounds
+  the two-worker interlaced decode win (the bottom-field worker
+  starts only after the top field's codeword stream is
+  length-scanned). The scanner now walks the same two-pixel
+  phase-flip step as the decode body, riding one pair-length LUT
+  load per two codewords via three new `ScanLuts` combos (`s3s1` +
+  `s2s3` no-decorr, `s3s2` decorr; the decorr third pair reuses
+  `s1s3`), with the exact `decode_pair` / `decode_one` fallback —
+  consumed bit count identical (r420 scan/decode consumed-bytes
+  equivalence matrices, which cover every RGB24 method × mode on
+  progressive and both interlaced fields). A new
+  `decode_workers_rgb24_1280x720_left_decorr_classic` Criterion gate
+  pins the family's worker scaling: 11.39 → 8.44 ms at 1 → 2 workers
+  (**1.35×**, 231 → 312 MiB/s) on the shared round host.
+
 - Round 440: RGB24 phase-flip pairing — the r429 note's remaining
   decode lever. The 3-code RGB24 wire cycle (spec/03 §1.4 `B, G, R`
   no-decorr / `G, B−G, R−G` decorr; §1.2 slot mapping) paired only

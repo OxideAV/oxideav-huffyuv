@@ -449,29 +449,22 @@ fn scan_rgb_field(
     } else {
         tables.scan_lut_s1s2()
     };
-    let lut33 = if is_rgb32 {
-        tables.scan_lut_s3s3()
-    } else {
-        &[][..]
-    };
     let n_pixels = width_us * height_us;
-    for _px in 1..n_pixels {
-        let w = reader.peek_window();
-        let s = lut01[(w >> 16) as usize];
-        if s != 0 {
-            reader.consume_bits_trusted(s as u32);
-        } else if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
-            reader.consume_bits_trusted(n);
-        } else {
-            let (_, l0) = decode_one(s_w0, w)?;
-            reader.consume_bits_trusted(l0 as u32);
-            let (_, l1) = decode_one(s_w1, reader.peek_window())?;
-            reader.consume_bits_trusted(l1 as u32);
-        }
-        if !is_rgb32 {
-            let (_, l2) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits_trusted(l2 as u32);
-        } else {
+    if is_rgb32 {
+        let lut33 = tables.scan_lut_s3s3();
+        for _px in 1..n_pixels {
+            let w = reader.peek_window();
+            let s = lut01[(w >> 16) as usize];
+            if s != 0 {
+                reader.consume_bits_trusted(s as u32);
+            } else if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
+                reader.consume_bits_trusted(n);
+            } else {
+                let (_, l0) = decode_one(s_w0, w)?;
+                reader.consume_bits_trusted(l0 as u32);
+                let (_, l1) = decode_one(s_w1, reader.peek_window())?;
+                reader.consume_bits_trusted(l1 as u32);
+            }
             // Wire positions +2 (R or R−G) and +3 (A) both use the
             // slot-3 codebook (spec/03 §1.2; alpha shares slot 3).
             let w = reader.peek_window();
@@ -487,6 +480,81 @@ fn scan_rgb_field(
                 reader.consume_bits_trusted(l3 as u32);
             }
         }
+        return Ok(4 + reader.bytes_consumed());
+    }
+    // RGB24: round-440 phase-flip pairing, mirroring the decode
+    // body's two-pixel step — the six codewords of a pixel pair group
+    // as (w0, w1), (w2, w0′), (w1′, w2′) with the middle pair
+    // crossing the pixel boundary, so the scan's critical path rides
+    // one pair-length LUT load per two codewords instead of leaving
+    // every +2 → slot3 position on a lone `decode_one`. Fallbacks are
+    // the exact decode_pair / decode_one walk, so the consumed bit
+    // count stays identical (round420 scan/decode equivalence
+    // suites); an odd body-pixel count finishes on the single-pixel
+    // arm.
+    let (lut_2w0, lut_w12) = if decorrelate {
+        (tables.scan_lut_s3s2(), tables.scan_lut_s1s3())
+    } else {
+        (tables.scan_lut_s3s1(), tables.scan_lut_s2s3())
+    };
+    let mut px = 1usize;
+    while px + 1 < n_pixels {
+        // Pair 1: (w0, w1) of pixel A.
+        let w = reader.peek_window();
+        let s = lut01[(w >> 16) as usize];
+        if s != 0 {
+            reader.consume_bits_trusted(s as u32);
+        } else if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
+            reader.consume_bits_trusted(n);
+        } else {
+            let (_, l0) = decode_one(s_w0, w)?;
+            reader.consume_bits_trusted(l0 as u32);
+            let (_, l1) = decode_one(s_w1, reader.peek_window())?;
+            reader.consume_bits_trusted(l1 as u32);
+        }
+        // Pair 2 (phase flip): (w2 of A → slot3, w0 of B).
+        let w = reader.peek_window();
+        let s = lut_2w0[(w >> 16) as usize];
+        if s != 0 {
+            reader.consume_bits_trusted(s as u32);
+        } else if let Some((_, _, n)) = decode_pair(&tables.slot3, s_w0, w) {
+            reader.consume_bits_trusted(n);
+        } else {
+            let (_, l2) = decode_one(&tables.slot3, w)?;
+            reader.consume_bits_trusted(l2 as u32);
+            let (_, l0b) = decode_one(s_w0, reader.peek_window())?;
+            reader.consume_bits_trusted(l0b as u32);
+        }
+        // Pair 3: (w1 of B, w2 of B → slot3).
+        let w = reader.peek_window();
+        let s = lut_w12[(w >> 16) as usize];
+        if s != 0 {
+            reader.consume_bits_trusted(s as u32);
+        } else if let Some((_, _, n)) = decode_pair(s_w1, &tables.slot3, w) {
+            reader.consume_bits_trusted(n);
+        } else {
+            let (_, l1b) = decode_one(s_w1, w)?;
+            reader.consume_bits_trusted(l1b as u32);
+            let (_, l2b) = decode_one(&tables.slot3, reader.peek_window())?;
+            reader.consume_bits_trusted(l2b as u32);
+        }
+        px += 2;
+    }
+    if px < n_pixels {
+        let w = reader.peek_window();
+        let s = lut01[(w >> 16) as usize];
+        if s != 0 {
+            reader.consume_bits_trusted(s as u32);
+        } else if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
+            reader.consume_bits_trusted(n);
+        } else {
+            let (_, l0) = decode_one(s_w0, w)?;
+            reader.consume_bits_trusted(l0 as u32);
+            let (_, l1) = decode_one(s_w1, reader.peek_window())?;
+            reader.consume_bits_trusted(l1 as u32);
+        }
+        let (_, l2) = decode_one(&tables.slot3, reader.peek_window())?;
+        reader.consume_bits_trusted(l2 as u32);
     }
     Ok(4 + reader.bytes_consumed())
 }
@@ -522,9 +590,14 @@ pub(crate) struct ThreeTables {
 ///
 /// - `s1s2` — YUY2 `(Y₁ → slot1, U → slot2)`; also RGB no-decorr
 ///   `(B → slot1, G → slot2)`.
-/// - `s1s3` — YUY2 `(Y₂ → slot1, V → slot3)`.
+/// - `s1s3` — YUY2 `(Y₂ → slot1, V → slot3)`; also RGB24 decorr
+///   phase-flip `(next B−G → slot1, next R−G → slot3)` (round 440).
 /// - `s2s1` — RGB decorr `(G → slot2, B−G → slot1)`.
 /// - `s3s3` — RGB32 `(R/R−G → slot3, A → slot3)`.
+/// - `s3s1` / `s2s3` / `s3s2` — round-440 RGB24 phase-flip combos
+///   (see [`PairSymLuts`]): `(R → slot3, next B → slot1)` +
+///   `(next G → slot2, next R → slot3)` no-decorr, and
+///   `(R−G → slot3, next G → slot2)` decorr.
 ///
 /// Each is 64 KiB and built at most once per cached `ThreeTables`
 /// (`OnceLock`), only when the two-worker interlaced path actually
@@ -536,6 +609,9 @@ pub(crate) struct ScanLuts {
     s1s3: std::sync::OnceLock<Box<[u8]>>,
     s2s1: std::sync::OnceLock<Box<[u8]>>,
     s3s3: std::sync::OnceLock<Box<[u8]>>,
+    s3s1: std::sync::OnceLock<Box<[u8]>>,
+    s2s3: std::sync::OnceLock<Box<[u8]>>,
+    s3s2: std::sync::OnceLock<Box<[u8]>>,
 }
 
 /// Lazily-built decode-side full pair LUTs
@@ -628,6 +704,21 @@ impl ThreeTables {
         self.scan_luts
             .s3s3
             .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot3, &self.slot3))
+    }
+    fn scan_lut_s3s1(&self) -> &[u8] {
+        self.scan_luts
+            .s3s1
+            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot3, &self.slot1))
+    }
+    fn scan_lut_s2s3(&self) -> &[u8] {
+        self.scan_luts
+            .s2s3
+            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot2, &self.slot3))
+    }
+    fn scan_lut_s3s2(&self) -> &[u8] {
+        self.scan_luts
+            .s3s2
+            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot3, &self.slot2))
     }
 }
 
