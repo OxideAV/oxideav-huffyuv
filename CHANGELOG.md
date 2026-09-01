@@ -6,6 +6,40 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-huffyuv/compare/v0.0.3...v0.0.4) - 2026-09-01
+
+### Other
+
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+- r440 docs — phase-flip + lean-tables rollup, RGB24 worker gate, next-target supersede
+- lean CustomV2 encoder tables — skip the dead 64-Ki LUT bake per frame
+- scan-side RGB24 phase-flip — split-scan prefix on pair-length LUT loads
+- RGB24 phase-flip pairing — every codeword on a pair read
+- re-resolve fuzz/Cargo.lock to core 0.1.34 — unbreak scheduled Fuzz build
+- r429 benchmark docs — pair-LUT decode deltas, next-target supersede, RGB24 phase-flip pairing as the new lever
+- serial-decode full pair LUTs — both symbols + combined length in one load
+- r429 docs — registry dual-API closure, encoder options surface, auto-selector worker-scaling table
+- auto-selector worker-scaling encode gates — 1/2/3 workers on encode_frame_auto_workers
+- trait-path golden pins — registry Encoder locked to the r419 wire bytes
+- registry Encoder — dual-API closure on the encode side
+- r420 docs — worker-scaling table (decode 1.33-1.47x, encode 1.72-1.99x at 2 workers on interlaced 720p), README threading capabilities + API rows, next-target supersede note
+- scan-side pair-length LUTs — one 8-bit load per two codewords on the split-scan critical path; 2-worker interlaced decode 1.02-1.18x → 1.33-1.47x, serial path untouched, consumed-bits invariance pinned
+- fuzz targets grow budget-2 differential oracles — serial vs two-worker decode/encode disposition + byte equality asserted on every fuzz input
+- worker-scaling encode gates — 1 vs 2 workers on the interlaced HD encode scenarios
+- two-worker interlaced encode — field-parallel residual + emit phases behind encode_frame_with_mode_workers, wire-byte-identical across budgets (invariance matrix + golden-pin budget-2 sweep)
+- worker-scaling decode gates — 1 vs 2 workers on the three interlaced HD scenarios (yuy2 left/median, rgb32 gradient-decorr)
+- registry Decoder honours ExecutionContext — stored thread budget routes to field-parallel interlaced decode, serial default preserved, end-to-end budget-invariance test
+- budget-2 decode invariance over the full golden-pin matrix — every interlaced pin decodes byte-identically under 1 and 2 workers, progressive pins pinned as budget no-ops
+- two-worker interlaced decode — split-scan prefix + parallel field workers, budget-gated per the ExecutionContext contract, output-invariant (scan/decode consumed-equivalence + budget-invariance matrices)
+- r419 BENCHMARKS.md refresh — post-round ranked tables (encode 1.9–2.9× per scenario, decode floor 173–247 MiB/s), README perf headline, fuzz lock re-resolve
+- r419 bench extensions — HD RGB decode/encode + HD auto-custom gates (raster-scaling regressions now visible)
+- encoder shares the decode-table cache — ClassicV2 stops rebuilding 64Ki-LUT tables per frame (−15%..−30% ClassicV2 encode wall), V1x stops 3×128KiB clones; output-invariant
+- 64-bit accumulator BitWriter — branch-light emit path, encode wall −20%..−52% (v1x left 360µs→184µs), byte-identical stream
+- paired symbol reads (decode_pair) + trusted bit consume — one reader advance per 2 codewords, −2%..−5.5% decode wall (drift-controlled A/B), output-invariant
+- decode-side Huffman-table cache — v2.x keyed by RLE table bytes (bounded), v1.x once-per-process; 320-class decode −11%..−21% wall, output-invariant
+- count-based package-merge — compute_canonical_lengths 577.7µs→20.7µs peaked (−96.5%), auto-select encode +83%/+69% throughput, output-invariant (206-case member-list equivalence + golden pins)
+- r419 golden-output pins — 78 wire-hash + lossless-decode pins across the full method/mode/interlace matrix
+
 ### Added
 
 - Round 440: lean CustomV2 encoder tables — the r419 BENCHMARKS
