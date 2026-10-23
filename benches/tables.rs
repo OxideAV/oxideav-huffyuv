@@ -41,10 +41,10 @@
 //! Run with:
 //!     cargo bench -p oxideav-huffyuv --bench tables
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_huffyuv::tables::{
-    compute_canonical_lengths, rle_decode_one_channel, rle_encode_one_channel, HuffTable,
+    HuffTable, compute_canonical_lengths, rle_decode_one_channel, rle_encode_one_channel,
 };
 
 /// A peaked, long-tailed 256-entry frequency histogram approximating a
@@ -62,7 +62,7 @@ fn peaked_histogram(total: u32) -> [u32; 256] {
     let mut raw = [0u64; 256];
     for (s, slot) in raw.iter_mut().enumerate() {
         let d = (s.min(256 - s)) as u32; // 0 at s==0, small near 0 and 255
-                                         // Weight halves roughly every 4 symbols of distance; +1 floor.
+        // Weight halves roughly every 4 symbols of distance; +1 floor.
         let w = (1u64 << 20) >> (d / 4).min(20);
         *slot = w + 1;
         sum += w + 1;

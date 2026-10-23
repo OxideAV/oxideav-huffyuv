@@ -73,18 +73,18 @@ pub mod tables;
 #[cfg(test)]
 mod roundtrip_tests;
 
-pub use crate::decoder::{decode_frame, decode_frame_with_workers, DecodedFrame};
+pub use crate::decoder::{DecodedFrame, decode_frame, decode_frame_with_workers};
 pub use crate::encoder::{
-    bit_cost_for_method, build_bitmapinfoheader, encode_frame, encode_frame_auto,
-    encode_frame_auto_workers, encode_frame_with_mode, encode_frame_with_mode_workers,
-    ExtradataMode, MethodSelection,
+    ExtradataMode, MethodSelection, bit_cost_for_method, build_bitmapinfoheader, encode_frame,
+    encode_frame_auto, encode_frame_auto_workers, encode_frame_with_mode,
+    encode_frame_with_mode_workers,
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{Method, PixelFamily, Predictor, StreamConfig};
 
 #[cfg(feature = "registry")]
 pub use crate::registry::{
-    make_decoder, make_encoder, register, register_codecs, HuffYuvEncoderOptions, CODEC_ID_STR,
+    CODEC_ID_STR, HuffYuvEncoderOptions, make_decoder, make_encoder, register, register_codecs,
 };
 
 #[cfg(feature = "registry")]

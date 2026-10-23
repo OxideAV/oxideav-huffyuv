@@ -83,7 +83,7 @@ fn mux_one_frame(stream: &StreamInfo, frame_bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 use oxideav_huffyuv::decoder::decode_frame;
-use oxideav_huffyuv::encoder::{encode_frame, encode_frame_with_mode, ExtradataMode};
+use oxideav_huffyuv::encoder::{ExtradataMode, encode_frame, encode_frame_with_mode};
 use oxideav_huffyuv::header::{Method, PixelFamily, StreamConfig};
 
 fn synth_yuy2(width: usize, height: usize) -> Vec<u8> {

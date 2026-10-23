@@ -28,11 +28,7 @@ pub fn median3(l: u8, a: u8, g: u8) -> u8 {
     // clamp `hi` from above by `g`: result = min(hi, g)
     let mid = if g <= hi { g } else { hi };
     // clamp `mid` from below by `lo`: result = max(mid, lo)
-    if mid >= lo {
-        mid
-    } else {
-        lo
-    }
+    if mid >= lo { mid } else { lo }
 }
 
 /// Modular gradient predictor `L + A - AL` (mod 256), spec/03 §2.2.
@@ -319,7 +315,7 @@ pub fn inverse_median_post(out: &mut [u8], row_bytes: usize, height: usize) {
 /// input where `out.len() % 3 != 0`) is left untouched, exactly as the
 /// `i + 3 <= len` guard left it.
 pub fn inverse_rgb_decorr_bgr(out: &mut [u8]) {
-    for px in out.chunks_exact_mut(3) {
+    for px in out.as_chunks_mut::<3>().0 {
         let g = px[1];
         px[0] = px[0].wrapping_add(g);
         px[2] = px[2].wrapping_add(g);
@@ -337,7 +333,7 @@ pub fn inverse_rgb_decorr_bgr(out: &mut [u8]) {
 /// G at +1, R at +2, A at +3 left verbatim). Same independence argument
 /// and same remainder semantics as the BGR variant.
 pub fn inverse_rgb_decorr_bgra(out: &mut [u8]) {
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         let g = px[1];
         px[0] = px[0].wrapping_add(g);
         px[2] = px[2].wrapping_add(g);
@@ -864,7 +860,10 @@ pub fn interleave_fields(top: &[u8], bot: &[u8], row_bytes: usize, height: usize
 /// across full-frame, single-row, and row-1-first-8-bytes ranges.
 pub fn inverse_yuy2_left_macropixel(out: &mut [u8], begin: usize, end: usize) {
     debug_assert!(begin >= 4, "LEFT seed macropixel sits at indices 0..4");
-    debug_assert!(begin % 4 == 0, "begin must align to a macropixel boundary");
+    debug_assert!(
+        begin.is_multiple_of(4),
+        "begin must align to a macropixel boundary"
+    );
     let end = end.min(out.len());
     if end <= begin {
         return;
@@ -1477,7 +1476,7 @@ mod tests {
         forward_left_decorr_residuals(&pixels, &mut fused, 4);
         assert_eq!(fused[3], 0x40); // seed alpha verbatim
         assert_eq!(fused[7], 0x55u8.wrapping_sub(0x40)); // px1 alpha LEFT
-                                                         // Cross-check the whole buffer against the two-pass reference.
+        // Cross-check the whole buffer against the two-pass reference.
         let reference = naive_two_pass_decorr_left(&pixels, 4);
         assert_eq!(fused, reference);
     }
@@ -1557,7 +1556,7 @@ mod tests {
         assert_eq!(fused[0], 0x10u8.wrapping_sub(0x80)); // B−G
         assert_eq!(fused[1], 0x80); // G
         assert_eq!(fused[2], 0x05u8.wrapping_sub(0x80)); // R−G
-                                                         // Row 1 gradient-subtracted decorrelated values.
+        // Row 1 gradient-subtracted decorrelated values.
         assert_eq!(fused[3], 0xF0u8.wrapping_sub(0x90)); // B−G subtract
         assert_eq!(fused[4], 0x10u8.wrapping_sub(0x80)); // G subtract
         assert_eq!(fused[5], 0xE0u8.wrapping_sub(0x85)); // R−G subtract

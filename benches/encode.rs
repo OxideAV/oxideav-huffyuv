@@ -24,11 +24,11 @@
 //! Run with:
 //!     cargo bench -p oxideav-huffyuv --bench encode
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_huffyuv::{
-    encode_frame_auto, encode_frame_auto_workers, encode_frame_with_mode,
-    encode_frame_with_mode_workers, ExtradataMode, Method, MethodSelection, PixelFamily,
+    ExtradataMode, Method, MethodSelection, PixelFamily, encode_frame_auto,
+    encode_frame_auto_workers, encode_frame_with_mode, encode_frame_with_mode_workers,
 };
 
 fn xorshift_byte(state: &mut u32) -> u8 {

@@ -59,11 +59,11 @@
 //! Run with:
 //!     cargo bench -p oxideav-huffyuv --bench decode
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_huffyuv::{
-    decode_frame, decode_frame_with_workers, encode_frame_with_mode, ExtradataMode, Method,
-    PixelFamily, StreamConfig,
+    ExtradataMode, Method, PixelFamily, StreamConfig, decode_frame, decode_frame_with_workers,
+    encode_frame_with_mode,
 };
 
 /// Cheap deterministic xorshift32 — synthesises "natural-ish" per-pixel

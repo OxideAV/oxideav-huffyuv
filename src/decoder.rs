@@ -13,9 +13,9 @@ use crate::predict::{
     inverse_rgb_decorr_bgra, inverse_yuy2_left_macropixel,
 };
 use crate::tables::{
-    classic_blob_bytes, decode_one, decode_pair, rle_decode_one_channel, rle_decode_three_channels,
-    v1x_codes_set_a, v1x_codes_set_b, v1x_lengths_set_a, v1x_lengths_set_b, v1x_table_from_pair,
-    HuffTable,
+    HuffTable, classic_blob_bytes, decode_one, decode_pair, rle_decode_one_channel,
+    rle_decode_three_channels, v1x_codes_set_a, v1x_codes_set_b, v1x_lengths_set_a,
+    v1x_lengths_set_b, v1x_table_from_pair,
 };
 
 /// Reconstructed frame produced by [`decode_frame`].
@@ -326,7 +326,7 @@ fn scan_yuy2_field(
 ) -> Result<usize> {
     let width_us = width as usize;
     let height_us = height as usize;
-    if width_us % 2 != 0 {
+    if !width_us.is_multiple_of(2) {
         return Err(Error::invalid("YUY2 width must be even"));
     }
     let row_bytes = PixelFamily::Yuy2.row_bytes(width);
@@ -771,10 +771,10 @@ pub(crate) mod table_cache {
 
     /// v2.x: build-or-fetch the tables for one RLE table-bytes blob.
     pub(crate) fn extradata_tables(table_bytes: &[u8]) -> Result<Arc<ThreeTables>> {
-        if let Ok(map) = extradata_cache().lock() {
-            if let Some(hit) = map.get(table_bytes) {
-                return Ok(Arc::clone(hit));
-            }
+        if let Ok(map) = extradata_cache().lock()
+            && let Some(hit) = map.get(table_bytes)
+        {
+            return Ok(Arc::clone(hit));
         }
         let lengths = rle_decode_three_channels(table_bytes)?;
         let built = Arc::new(ThreeTables {
@@ -872,7 +872,7 @@ fn decode_yuy2_field(
 ) -> Result<(DecodedFrame, usize)> {
     let width_us = width as usize;
     let height_us = height as usize;
-    if width_us % 2 != 0 {
+    if !width_us.is_multiple_of(2) {
         return Err(Error::invalid("YUY2 width must be even"));
     }
     // Round-262: family → wire-stride via the round-261 accessor
@@ -1677,7 +1677,7 @@ mod round214_yuy2_decode_macropixel_tests {
     //! cannot silently swap two slots inside the unrolled body.
 
     use super::*;
-    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::encoder::{ExtradataMode, encode_frame_with_mode};
     use crate::header::{Method, StreamConfig};
 
     fn synth_yuy2(width: usize, height: usize) -> Vec<u8> {
@@ -1872,7 +1872,7 @@ mod round255_inverse_yuy2_median_step_tests {
     //! same YUY2 widths the r253 forward tests cover (so any drift
     //! between forward and inverse predictor would surface as a
     //! roundtrip mismatch even before the per-byte witness fires).
-    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::encoder::{ExtradataMode, encode_frame_with_mode};
     use crate::header::{Method, PixelFamily, StreamConfig};
     use crate::predict::median3;
 
@@ -2072,7 +2072,7 @@ mod round262_row_bytes_accessor_tests {
     //!   accessor (zero width / height still yields a too-small
     //!   raster → `Err`, never a panic).
 
-    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::encoder::{ExtradataMode, encode_frame_with_mode};
     use crate::header::{Method, PixelFamily, StreamConfig};
 
     fn synth(n: usize, mut s: u32) -> Vec<u8> {
@@ -2184,7 +2184,7 @@ mod round277_rgb_decode_binding_tests {
     //!   the production decode must reconstruct the source exactly.
 
     use super::*;
-    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::encoder::{ExtradataMode, encode_frame_with_mode};
     use crate::header::Method;
 
     fn synth(n: usize, seed: u32) -> Vec<u8> {
@@ -2574,7 +2574,7 @@ mod round420_field_parallel_tests {
     //!    the serial path fails on malformed input.
 
     use super::*;
-    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::encoder::{ExtradataMode, encode_frame_with_mode};
     use crate::header::{Method, StreamConfig};
 
     fn synth(n: usize, seed: u32) -> Vec<u8> {
@@ -2943,7 +2943,7 @@ mod round420_pair_len_lut_tests {
 
     #[test]
     fn round420_pair_len_lut_sound_custom_tables() {
-        use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+        use crate::encoder::{ExtradataMode, encode_frame_with_mode};
         use crate::header::Method;
         // A CustomV2 encode derives per-channel tables from the frame
         // histograms — three genuinely distinct codebooks.
@@ -3054,7 +3054,7 @@ mod round429_pair_sym_lut_tests {
 
     #[test]
     fn round429_pair_sym_lut_sound_custom_tables() {
-        use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+        use crate::encoder::{ExtradataMode, encode_frame_with_mode};
         use crate::header::Method;
         let mut s: u32 = 0xBEEF_0429;
         let mut pixels = vec![0u8; 64 * 300 * 2];
@@ -3104,7 +3104,7 @@ mod round440_rgb24_phase_flip_tests {
     //! mismatch — and the v1.x content-identical triple).
 
     use super::*;
-    use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+    use crate::encoder::{ExtradataMode, encode_frame_with_mode};
     use crate::header::{Method, StreamConfig};
     use crate::tables::decode_one;
 

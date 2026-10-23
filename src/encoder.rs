@@ -20,7 +20,7 @@
 
 use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
-use crate::header::{Method, PixelFamily, Predictor, StreamConfig, FOURCC_HFYU};
+use crate::header::{FOURCC_HFYU, Method, PixelFamily, Predictor, StreamConfig};
 use crate::predict::{
     forward_decorr_gradient_subtract, forward_gradient_subtract, forward_left_decorr_residuals,
     forward_median_subtract, forward_rgb_left_subtract_linear, forward_yuy2_left_subtract,
@@ -29,7 +29,7 @@ use crate::predict::{
 #[cfg(test)]
 use crate::tables::HuffTable;
 use crate::tables::{
-    classic_blob_bytes, compute_canonical_lengths, rle_encode_three_channels, HuffEntry,
+    HuffEntry, classic_blob_bytes, compute_canonical_lengths, rle_encode_three_channels,
 };
 
 /// Round-440: the emit pipeline's per-slot table view. The encoder
@@ -1059,7 +1059,7 @@ fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Res
             row_bytes * h
         )));
     }
-    if w % 2 != 0 {
+    if !w.is_multiple_of(2) {
         return Err(Error::invalid("encoder: YUY2 width must be even"));
     }
     let mut residuals = vec![0u8; row_bytes * h];
@@ -2719,7 +2719,8 @@ mod round239_rgb24_emit_pixel_step_tests {
             // seed; the emitted bit stream follows.
             let prod_bits = &frame[4..];
             assert_eq!(
-                prod_bits, ref_bits.as_slice(),
+                prod_bits,
+                ref_bits.as_slice(),
                 "round-239 step body must emit bit-identical wire bytes to the pre-r239 per-byte slot dispatch (method = {:?})",
                 method
             );
@@ -3204,7 +3205,8 @@ mod round245_rgb32_emit_pixel_step_tests {
             // seed; the emitted bit stream follows.
             let prod_bits = &frame[4..];
             assert_eq!(
-                prod_bits, ref_bits.as_slice(),
+                prod_bits,
+                ref_bits.as_slice(),
                 "round-245 step body must emit bit-identical wire bytes to the pre-r245 per-byte slot dispatch (method = {:?})",
                 method
             );
@@ -4038,26 +4040,30 @@ mod round420_encode_parallel_tests {
     #[test]
     fn round420_encode_workers_error_parity() {
         let pixels = synth(32 * 292 * 2, 0x0420_000A);
-        assert!(encode_frame_with_mode_workers(
-            PixelFamily::Yuy2,
-            Method::LeftDecorr,
-            32,
-            292,
-            &pixels,
-            ExtradataMode::ClassicV2,
-            2,
-        )
-        .is_err());
-        assert!(encode_frame_with_mode_workers(
-            PixelFamily::Rgb24,
-            Method::Median,
-            32,
-            292,
-            &pixels,
-            ExtradataMode::ClassicV2,
-            2,
-        )
-        .is_err());
+        assert!(
+            encode_frame_with_mode_workers(
+                PixelFamily::Yuy2,
+                Method::LeftDecorr,
+                32,
+                292,
+                &pixels,
+                ExtradataMode::ClassicV2,
+                2,
+            )
+            .is_err()
+        );
+        assert!(
+            encode_frame_with_mode_workers(
+                PixelFamily::Rgb24,
+                Method::Median,
+                32,
+                292,
+                &pixels,
+                ExtradataMode::ClassicV2,
+                2,
+            )
+            .is_err()
+        );
         // Odd YUY2 width errors from compute_residuals on both paths
         // (width 2·k+1 with an interlaced height).
         let odd = synth(31 * 292 * 2, 0x0420_000B);

@@ -11,10 +11,10 @@
 //! Run with:
 //!     cargo bench -p oxideav-huffyuv --bench roundtrip
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_huffyuv::{
-    decode_frame, encode_frame_with_mode, ExtradataMode, Method, PixelFamily, StreamConfig,
+    ExtradataMode, Method, PixelFamily, StreamConfig, decode_frame, encode_frame_with_mode,
 };
 
 fn xorshift_byte(state: &mut u32) -> u8 {

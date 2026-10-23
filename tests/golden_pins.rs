@@ -30,11 +30,12 @@
 //! ```
 //!
 //! and paste the emitted table over `EXPECTED` / `EXPECTED_AUTO`.
+#![cfg(feature = "registry")]
 
 use oxideav_huffyuv::{
-    decode_frame, decode_frame_with_workers, encode_frame_auto, encode_frame_auto_workers,
-    encode_frame_with_mode, encode_frame_with_mode_workers, make_encoder, ExtradataMode, Method,
-    MethodSelection, PixelFamily, StreamConfig,
+    ExtradataMode, Method, MethodSelection, PixelFamily, StreamConfig, decode_frame,
+    decode_frame_with_workers, encode_frame_auto, encode_frame_auto_workers,
+    encode_frame_with_mode, encode_frame_with_mode_workers, make_encoder,
 };
 
 /// FNV-1a 64-bit — dependency-free, deterministic across platforms.

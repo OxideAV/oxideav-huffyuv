@@ -9,8 +9,8 @@
 
 use crate::decoder::decode_frame;
 use crate::encoder::{
-    bit_cost_for_method, encode_for_test, encode_for_test_with_mode, encode_frame_auto,
-    encode_frame_with_mode, ExtradataMode, MethodSelection,
+    ExtradataMode, MethodSelection, bit_cost_for_method, encode_for_test,
+    encode_for_test_with_mode, encode_frame_auto, encode_frame_with_mode,
 };
 use crate::header::{Method, PixelFamily, StreamConfig};
 use crate::tables::{
@@ -697,7 +697,7 @@ fn roundtrip_rgb32_gradient_decorr_v1x_4x4() {
 
 #[test]
 fn primary_lut_matches_per_symbol_entries_classic_yuv_left() {
-    use crate::tables::{decode_one, rle_decode_three_channels, HuffTable};
+    use crate::tables::{HuffTable, decode_one, rle_decode_three_channels};
     // Use the YUV-LEFT classic blob's slot-1 (Y) length table.
     let blob = crate::tables::classic_blob_bytes(PixelFamily::Yuy2, Method::Left);
     let lengths = rle_decode_three_channels(blob).unwrap();
@@ -1768,7 +1768,7 @@ fn round91_classic_v2_overflow_entries_only_long_codes() {
     // blob's slot tables top out at length 17 (spec/04 §3
     // Extractor evidence), so this should hold for all three
     // slots without any short-code contamination.
-    use crate::tables::{rle_decode_three_channels, HuffTable};
+    use crate::tables::{HuffTable, rle_decode_three_channels};
     let blob = crate::tables::classic_blob_bytes(PixelFamily::Yuy2, Method::Left);
     let lengths = rle_decode_three_channels(blob).unwrap();
     for slot in lengths.iter() {

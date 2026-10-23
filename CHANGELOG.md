@@ -230,6 +230,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - Round 419 (performance, output-invariant): count-based package-merge
   in `tables::compute_canonical_lengths`. The length-limited Huffman
   builder no longer carries a per-package member list (`Vec<u16>`

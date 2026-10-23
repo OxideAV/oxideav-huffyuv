@@ -9,16 +9,16 @@
 use std::sync::Arc;
 
 use oxideav_core::{
-    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
-    CodecRegistry, CodecTag, Decoder, Encoder, Error as CoreError, ExecutionContext, Frame,
-    OptionField, OptionKind, OptionValue, Packet, PixelFormat, Rational, Result as CoreResult,
-    RuntimeContext, TimeBase, VideoFrame, VideoPlane,
+    CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters, CodecRegistry,
+    CodecTag, Decoder, Encoder, Error as CoreError, ExecutionContext, Frame, OptionField,
+    OptionKind, OptionValue, Packet, PixelFormat, Rational, Result as CoreResult, RuntimeContext,
+    TimeBase, VideoFrame, VideoPlane, parse_options,
 };
 
-use crate::decoder::{decode_frame_with_workers, table_cache, DecodedFrame, ThreeTables};
+use crate::decoder::{DecodedFrame, ThreeTables, decode_frame_with_workers, table_cache};
 use crate::encoder::{
-    build_bitmapinfoheader, encode_body_with_pinned_tables, encode_frame_auto_workers,
-    encode_frame_with_mode_workers, ExtradataMode, MethodSelection,
+    ExtradataMode, MethodSelection, build_bitmapinfoheader, encode_body_with_pinned_tables,
+    encode_frame_auto_workers, encode_frame_with_mode_workers,
 };
 use crate::header::{Method, PixelFamily, StreamConfig};
 use crate::tables::classic_blob_bytes;
@@ -326,7 +326,7 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
             return Err(CoreError::invalid(
                 "oxideav-huffyuv: encoder needs an input family — set \
                  CodecParameters::pixel_format or the `format` option",
-            ))
+            ));
         }
     };
     if family == PixelFamily::Yuy2 && width % 2 != 0 {
@@ -614,7 +614,7 @@ mod tests {
     /// progressive stream.
     #[test]
     fn round420_execution_context_budget_output_invariant() {
-        use crate::encoder::{encode_frame_with_mode, ExtradataMode};
+        use crate::encoder::{ExtradataMode, encode_frame_with_mode};
         use crate::header::Method;
         use oxideav_core::TimeBase;
 
@@ -981,11 +981,13 @@ mod tests {
         assert!(base(&|p| p.pixel_format = Some(PixelFormat::Yuyv422)).is_ok());
         // Method illegal for the family.
         assert!(base(&|p| p.options.insert("method", "median")).is_ok());
-        assert!(base(&|p| {
-            p.options.insert("format", "rgb24");
-            p.options.insert("method", "median");
-        })
-        .is_err());
+        assert!(
+            base(&|p| {
+                p.options.insert("format", "rgb24");
+                p.options.insert("method", "median");
+            })
+            .is_err()
+        );
 
         // No family from anywhere.
         let mut bare = CodecParameters::video(CodecId::new(CODEC_ID_STR));
