@@ -6,6 +6,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `StreamConfig::new(family, method, width, height)` plus
+  `with_has_extradata` / `with_extradata_tables` / `with_interlace_flag`,
+  and `HuffYuvEncoderOptions::with_format` / `with_method` / `with_mode`.
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on `Error`, `ExtradataMode`,
+  `MethodSelection`, `HuffYuvEncoderOptions`, `StreamConfig` and
+  `DecodedFrame`. `Method`, `Predictor` and `PixelFamily` stay
+  exhaustive (the bitstream fixes their value sets). No behaviour
+  change.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-huffyuv/compare/v0.0.3...v0.0.4) - 2026-10-23
 
 ### Other

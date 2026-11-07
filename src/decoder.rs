@@ -20,6 +20,7 @@ use crate::tables::{
 
 /// Reconstructed frame produced by [`decode_frame`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DecodedFrame {
     pub family: PixelFamily,
     pub width: u32,

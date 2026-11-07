@@ -104,6 +104,7 @@ fn mode_name(m: ExtradataMode) -> &'static str {
         ExtradataMode::ClassicV2 => "classic",
         ExtradataMode::CustomV2 => "custom",
         ExtradataMode::V1xCompat => "v1x",
+        _ => unreachable!("new ExtradataMode variant"),
     }
 }
 
@@ -769,6 +770,7 @@ fn mode_option(m: ExtradataMode) -> &'static str {
         ExtradataMode::ClassicV2 => "classic-v2",
         ExtradataMode::CustomV2 => "custom-v2",
         ExtradataMode::V1xCompat => "v1x",
+        _ => unreachable!("new ExtradataMode variant"),
     }
 }
 

@@ -6,6 +6,7 @@
 
 /// HuffYUV decode/encode error.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The input bytes did not parse against the wire format.
     InvalidData(String),

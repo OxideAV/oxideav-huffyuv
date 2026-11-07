@@ -44,6 +44,7 @@ type SlotEntries = [HuffEntry; 256];
 
 /// Selects which BIH/extradata path the encoder writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ExtradataMode {
     /// v2.x with the classic-table seed for this `(family, method)`
     /// pair (matches the proprietary's default; see spec/04 §3.4).
@@ -745,6 +746,7 @@ fn bit_cost_from_histograms(h1: &[u32; 256], h2: &[u32; 256], h3: &[u32; 256]) -
 /// Selects which `(family, method)` combination [`encode_frame_auto`]
 /// considers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum MethodSelection {
     /// Pin the predictor — same behaviour as the fixed-method
     /// `encode_frame_with_mode`.

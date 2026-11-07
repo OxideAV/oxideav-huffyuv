@@ -189,6 +189,7 @@ impl PixelFamily {
 /// table region). `extradata_tables` is `None` for v1.x streams
 /// (`biSize == 0x28`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamConfig {
     pub family: PixelFamily,
     pub method: Method,
@@ -211,6 +212,40 @@ pub struct StreamConfig {
     /// [`crate::predict::interlaced_from_flag_and_height`] — see
     /// [`StreamConfig::is_interlaced`].
     pub interlace_flag: u8,
+}
+
+impl StreamConfig {
+    /// Build a [`StreamConfig`] from its mandatory fields; no extradata, no
+    /// interlace flag.
+    pub fn new(family: PixelFamily, method: Method, width: u32, height: u32) -> Self {
+        Self {
+            family,
+            method,
+            width,
+            height,
+            has_extradata: false,
+            extradata_tables: Vec::new(),
+            interlace_flag: 0,
+        }
+    }
+
+    /// Set `has_extradata`.
+    pub fn with_has_extradata(mut self, v: bool) -> Self {
+        self.has_extradata = v;
+        self
+    }
+
+    /// Set `extradata_tables`.
+    pub fn with_extradata_tables(mut self, v: Vec<u8>) -> Self {
+        self.extradata_tables = v;
+        self
+    }
+
+    /// Set `interlace_flag`.
+    pub fn with_interlace_flag(mut self, v: u8) -> Self {
+        self.interlace_flag = v;
+        self
+    }
 }
 
 impl StreamConfig {

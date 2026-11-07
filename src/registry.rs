@@ -201,6 +201,7 @@ fn packet_time_base(frame_rate: Option<Rational>) -> TimeBase {
 /// (`encode_frame_with_mode_workers` / `encode_frame_auto_workers`):
 /// input pixel family, predictor method, extradata mode.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct HuffYuvEncoderOptions {
     /// Input pixel family. `None` (bag value `"auto"`, the default)
     /// derives it from `CodecParameters::pixel_format`.
@@ -214,6 +215,26 @@ pub struct HuffYuvEncoderOptions {
     /// Extradata mode: `"classic-v2"` (default), `"custom-v2"`, or
     /// `"v1x"`. Mirrors [`ExtradataMode`].
     pub mode: ExtradataMode,
+}
+
+impl HuffYuvEncoderOptions {
+    /// Set `format`.
+    pub fn with_format(mut self, v: Option<PixelFamily>) -> Self {
+        self.format = v;
+        self
+    }
+
+    /// Set `method`.
+    pub fn with_method(mut self, v: Option<Method>) -> Self {
+        self.method = v;
+        self
+    }
+
+    /// Set `mode`.
+    pub fn with_mode(mut self, v: ExtradataMode) -> Self {
+        self.mode = v;
+        self
+    }
 }
 
 impl CodecOptionsStruct for HuffYuvEncoderOptions {
