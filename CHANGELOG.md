@@ -6,6 +6,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-huffyuv/compare/v0.0.4...v0.0.5) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on growable enums and records
+
 ### Added
 
 - `StreamConfig::new(family, method, width, height)` plus
