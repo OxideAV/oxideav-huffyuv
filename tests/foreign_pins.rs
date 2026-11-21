@@ -145,6 +145,35 @@ fn ffvh_inside_the_hfyu_layout_decodes() {
     assert_eq!(pixels, FFVH_YUY2_LEFT_4X2_PIXELS);
 }
 
+/// Through the framework the same stream comes out top row first —
+/// the order a third-party decoder dumps it in — with its shape
+/// announced by the decoder.
+#[cfg(feature = "registry")]
+#[test]
+fn registry_decoder_emits_rgb_top_down_and_announces_shape() {
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+    let mut params = CodecParameters::video(CodecId::new(oxideav_huffyuv::CODEC_ID_STR));
+    params.extradata = RGB24_LEFT_4X3_STRF.to_vec();
+    let mut dec = oxideav_huffyuv::make_decoder(&params).unwrap();
+    let shape = dec.output_params().expect("known from the header");
+    assert_eq!(
+        (shape.width, shape.height, shape.pixel_format),
+        (Some(4), Some(3), Some(PixelFormat::Bgr24))
+    );
+    assert_eq!(dec.output_pixel_format(), Some(PixelFormat::Bgr24));
+    dec.send_packet(&Packet::new(
+        0,
+        TimeBase::MICROS,
+        RGB24_LEFT_4X3_FRAME.to_vec(),
+    ))
+    .unwrap();
+    let Frame::Video(frame) = dec.receive_frame().unwrap() else {
+        panic!("expected a video frame");
+    };
+    assert_eq!(frame.planes[0].stride, 12);
+    assert_eq!(frame.planes[0].data, RGB24_LEFT_4X3_PIXELS);
+}
+
 /// Extradata prefixes observed on `FFVH` streams the reference
 /// workspace does not specify (per-frame tables, planar 4:4:4, 10-bit
 /// with alpha). Each must be refused as unsupported, and the same

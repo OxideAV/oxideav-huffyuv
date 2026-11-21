@@ -785,6 +785,10 @@ fn family_option(f: PixelFamily) -> &'static str {
 /// Build a registry encoder for one pin scenario and push one frame
 /// through it, returning `(strf, wire bytes)` from the trait surface
 /// (`output_params().extradata` + the emitted packet).
+///
+/// `pixels` is the wire raster the direct API takes; a framework frame
+/// carries the top row first, so the RGB families (stored bottom row
+/// first, spec/02 §2) are handed over with their rows reversed.
 fn trait_encode(
     family: PixelFamily,
     method: Option<Method>,
@@ -811,7 +815,16 @@ fn trait_encode(
         pts: Some(0),
         planes: vec![VideoPlane {
             stride: family.row_bytes(w),
-            data: pixels.to_vec(),
+            data: if family.is_rgb() {
+                pixels
+                    .chunks_exact(family.row_bytes(w))
+                    .rev()
+                    .flatten()
+                    .copied()
+                    .collect()
+            } else {
+                pixels.to_vec()
+            },
         }],
     });
     enc.send_frame(&frame).expect("send_frame");

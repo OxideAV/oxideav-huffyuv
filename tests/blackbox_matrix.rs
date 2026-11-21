@@ -650,3 +650,188 @@ fn our_streams_decode_bit_exact_in_black_box() {
         failures.len()
     );
 }
+
+// ───────────────────────── registry path, both ways ─────────────────────────
+
+/// Framework frames carry the top row first. The registry decoder must
+/// hand out exactly the raster a black-box decoder dumps (no row flip
+/// left to the caller) and announce its size and pixel format; the
+/// registry encoder must turn such frames — including ones whose rows
+/// carry padding — into streams the black-box decoder reads back.
+#[cfg(feature = "registry")]
+#[test]
+fn registry_frames_are_top_down_both_ways() {
+    use oxideav_core::{
+        CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame, VideoPlane,
+    };
+    use oxideav_huffyuv::{CODEC_ID_STR, make_decoder, make_encoder};
+
+    if !ffmpeg_available() {
+        eprintln!("skip: ffmpeg not on PATH");
+        return;
+    }
+    let dir = TempDir::new("registry");
+    let (width, height, frames) = (36u32, 290u32, 3usize);
+    for (pix_fmt, raw_fmt, family, label, pred) in [
+        (
+            "yuv422p",
+            "yuyv422",
+            PixelFamily::Yuy2,
+            PixelFormat::Yuyv422,
+            "median",
+        ),
+        (
+            "rgb24",
+            "bgr24",
+            PixelFamily::Rgb24,
+            PixelFormat::Bgr24,
+            "plane",
+        ),
+        (
+            "bgra",
+            "bgra",
+            PixelFamily::Rgb32,
+            PixelFormat::Bgra,
+            "left",
+        ),
+    ] {
+        // Foreign file → registry decoder.
+        let graph = format!(
+            "testsrc2=size={width}x{height}:rate=5,noise=alls=12:allf=t:all_seed=3,format={pix_fmt}"
+        );
+        let avi = dir.path(&format!("{pix_fmt}.avi"));
+        let raw = dir.path(&format!("{pix_fmt}.raw"));
+        let n = frames.to_string();
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &graph,
+                "-frames:v",
+                &n,
+            ])
+            .args(["-c:v", "huffyuv", "-pred", pred, "-flags", "+ilme"])
+            .arg(&avi)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "{pix_fmt}: black-box encode");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &graph,
+                "-frames:v",
+                &n,
+            ])
+            .args(["-pix_fmt", raw_fmt, "-f", "rawvideo"])
+            .arg(&raw)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "{pix_fmt}: source dump");
+        let source = std::fs::read(&raw).unwrap();
+        let row_bytes = family.row_bytes(width);
+        let frame_len = row_bytes * height as usize;
+        assert_eq!(source.len(), frame_len * frames);
+
+        let stream = read_avi(&avi);
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.extradata = stream.strf.clone();
+        let mut dec = make_decoder(&params).expect("make_decoder");
+        let announced = dec.output_params().expect("output_params");
+        assert_eq!(
+            (announced.width, announced.height, announced.pixel_format),
+            (Some(width), Some(height), Some(label)),
+            "{pix_fmt}: announced output shape"
+        );
+        let mut decoded_frames = Vec::new();
+        for (i, chunk) in stream.frames.iter().enumerate() {
+            dec.send_packet(&Packet::new(0, TimeBase::MICROS, chunk.clone()))
+                .unwrap();
+            let Frame::Video(vf) = dec.receive_frame().unwrap() else {
+                panic!("{pix_fmt}: expected a video frame");
+            };
+            assert_eq!(vf.planes.len(), 1);
+            assert_eq!(vf.planes[0].stride, row_bytes);
+            assert_eq!(
+                vf.planes[0].data,
+                &source[i * frame_len..(i + 1) * frame_len],
+                "{pix_fmt}: registry frame {i} must equal the top-down source"
+            );
+            decoded_frames.push(vf.planes[0].data.clone());
+        }
+
+        // Registry encoder (rows padded by 5 bytes) → black-box decoder,
+        // as one multi-frame stream per extradata mode.
+        for mode in ["classic-v2", "custom-v2", "v1x"] {
+            let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            params.width = Some(width);
+            params.height = Some(height);
+            params.pixel_format = Some(label);
+            params.options.insert("mode", mode);
+            let mut enc = make_encoder(&params).expect("make_encoder");
+            let stride = row_bytes + 5;
+            let mut packets = Vec::new();
+            // custom-v2 pins the first frame's tables for the stream, so
+            // repeat one picture there; the other modes take all three.
+            for (i, top_down) in decoded_frames.iter().enumerate() {
+                let picture = if mode == "custom-v2" {
+                    &decoded_frames[0]
+                } else {
+                    top_down
+                };
+                let mut data = Vec::with_capacity(stride * height as usize);
+                for row in picture.chunks_exact(row_bytes) {
+                    data.extend_from_slice(row);
+                    data.extend_from_slice(&[0xA5; 5]);
+                }
+                let frame = Frame::Video(VideoFrame {
+                    pts: Some(i as i64),
+                    planes: vec![VideoPlane { stride, data }],
+                });
+                enc.send_frame(&frame).expect("send_frame");
+                packets.push(enc.receive_packet().expect("receive_packet").data.to_vec());
+            }
+            let ours = dir.path(&format!("{pix_fmt}-{mode}.avi"));
+            write_avi(
+                &ours,
+                &enc.output_params().extradata,
+                &packets,
+                width,
+                height,
+            );
+            let back = dir.path(&format!("{pix_fmt}-{mode}.raw"));
+            let out = Command::new("ffmpeg")
+                .args(["-v", "warning", "-y", "-i"])
+                .arg(&ours)
+                .args(["-pix_fmt", raw_fmt, "-f", "rawvideo"])
+                .arg(&back)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success() && out.stderr.is_empty(),
+                "{pix_fmt}/{mode}: black-box diagnostics: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let want: Vec<u8> = if mode == "custom-v2" {
+                decoded_frames[0].repeat(frames)
+            } else {
+                source.clone()
+            };
+            assert_eq!(
+                std::fs::read(&back).unwrap(),
+                want,
+                "{pix_fmt}/{mode}: black-box decode of the registry stream"
+            );
+        }
+    }
+}

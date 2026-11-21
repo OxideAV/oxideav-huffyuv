@@ -143,18 +143,49 @@ impl Decoder for HuffYuvDecoder {
         // but clamp defensively so a zero can never disable decode.
         self.worker_budget = ctx.threads.max(1);
     }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.stream_config
+            .as_ref()
+            .map(|cfg| pixel_format_for_family(cfg.family))
+    }
+
+    /// Size and packed pixel format of the emitted frames, known from
+    /// the stream header at construction (spec/01 §1–§4). The header
+    /// is stream-level and fixed (spec/02 §1.1), so the answer never
+    /// changes.
+    fn output_params(&self) -> Option<CodecParameters> {
+        let cfg = self.stream_config.as_ref()?;
+        let mut params = CodecParameters::video(self.codec_id.clone());
+        params.width = Some(cfg.width);
+        params.height = Some(cfg.height);
+        params.pixel_format = Some(pixel_format_for_family(cfg.family));
+        Some(params)
+    }
+}
+
+/// Reverse the row order of a packed raster of `row_bytes`-byte rows.
+/// The two RGB families are stored bottom row first on the wire
+/// (spec/02 §2); framework frames carry the top row first.
+fn reverse_rows(pixels: &[u8], row_bytes: usize) -> Vec<u8> {
+    if row_bytes == 0 {
+        return pixels.to_vec();
+    }
+    let mut out = Vec::with_capacity(pixels.len());
+    for row in pixels.chunks_exact(row_bytes).rev() {
+        out.extend_from_slice(row);
+    }
+    out
 }
 
 fn map_to_video_frame(frame: DecodedFrame, pts: Option<i64>) -> VideoFrame {
-    let stride = match frame.family {
-        PixelFamily::Yuy2 => frame.width as usize * 2,
-        PixelFamily::Rgb24 => frame.width as usize * 3,
-        PixelFamily::Rgb32 => frame.width as usize * 4,
+    let stride = frame.family.row_bytes(frame.width);
+    let data = if frame.family.is_rgb() {
+        reverse_rows(&frame.pixels, stride)
+    } else {
+        frame.pixels
     };
-    let planes = vec![VideoPlane {
-        stride,
-        data: frame.pixels,
-    }];
+    let planes = vec![VideoPlane { stride, data }];
     VideoFrame { pts, planes }
 }
 
@@ -556,24 +587,47 @@ impl Encoder for HuffYuvEncoder {
         }
         let plane = &planes[0];
         let row_bytes = self.family.row_bytes(self.width);
-        if plane.stride != row_bytes {
+        let rows = self.height as usize;
+        if plane.stride < row_bytes {
             return Err(CoreError::invalid(format!(
-                "oxideav-huffyuv: plane stride {} ≠ packed row bytes {row_bytes} for \
+                "oxideav-huffyuv: plane stride {} < packed row bytes {row_bytes} for \
                  {:?} at width {}",
                 plane.stride, self.family, self.width
             )));
         }
-        let expected = row_bytes * self.height as usize;
-        if plane.data.len() != expected {
+        // Rows may carry padding beyond the visible width; the last
+        // row only needs its visible bytes.
+        let needed = plane.stride * (rows - 1) + row_bytes;
+        if plane.data.len() < needed {
             return Err(CoreError::invalid(format!(
-                "oxideav-huffyuv: plane size {} ≠ expected {expected} ({}×{} {:?})",
+                "oxideav-huffyuv: plane size {} < expected {needed} ({}×{} {:?}, stride {})",
                 plane.data.len(),
                 self.width,
                 self.height,
-                self.family
+                self.family,
+                plane.stride
             )));
         }
-        let (strf, bytes) = self.encode_pixels(&plane.data)?;
+        // Wire raster: tightly packed rows, top row first for YUY2 and
+        // bottom row first for the RGB families (spec/02 §2).
+        let gathered: Vec<u8>;
+        let pixels: &[u8] = if !self.family.is_rgb() && plane.stride == row_bytes {
+            &plane.data[..needed]
+        } else {
+            let mut buf = Vec::with_capacity(row_bytes * rows);
+            let mut push = |r: usize| {
+                let start = r * plane.stride;
+                buf.extend_from_slice(&plane.data[start..start + row_bytes]);
+            };
+            if self.family.is_rgb() {
+                (0..rows).rev().for_each(&mut push);
+            } else {
+                (0..rows).for_each(&mut push);
+            }
+            gathered = buf;
+            &gathered
+        };
+        let (strf, bytes) = self.encode_pixels(pixels)?;
         if self.output.extradata.is_empty() {
             self.output.extradata = strf;
         } else if self.output.extradata != strf {
@@ -701,6 +755,16 @@ mod tests {
         pixels
     }
 
+    /// The raster the direct API takes for a framework frame: rows as
+    /// they are for YUY2, bottom row first for RGB (spec/02 §2).
+    fn wire_raster(family: PixelFamily, width: u32, top_down: &[u8]) -> Vec<u8> {
+        if family.is_rgb() {
+            reverse_rows(top_down, family.row_bytes(width))
+        } else {
+            top_down.to_vec()
+        }
+    }
+
     fn family_opt(f: PixelFamily) -> &'static str {
         match f {
             PixelFamily::Yuy2 => "yuy2",
@@ -802,9 +866,15 @@ mod tests {
                         ExtradataMode::V1xCompat,
                     ] {
                         let scenario = format!("{family:?}/{method:?}/{mode:?}/{w}x{h}");
-                        let (strf, bytes) =
-                            encode_frame_with_mode(family, method, w, h, &pixels, mode)
-                                .expect("direct encode");
+                        let (strf, bytes) = encode_frame_with_mode(
+                            family,
+                            method,
+                            w,
+                            h,
+                            &wire_raster(family, w, &pixels),
+                            mode,
+                        )
+                        .expect("direct encode");
                         let params = encoder_params(family, w, h, Some(method), mode);
                         let mut enc = make_encoder(&params).expect("make_encoder");
                         let pkt = encode_one(&mut enc, &video_frame(family, w, pixels.clone(), 0));
@@ -881,13 +951,19 @@ mod tests {
                 MethodSelection::Auto,
                 w,
                 h,
-                &frame1,
+                &wire_raster(family, w, &frame1),
                 ExtradataMode::ClassicV2,
             )
             .expect("direct auto");
-            let (_, bytes2) =
-                encode_frame_with_mode(family, chosen, w, h, &frame2, ExtradataMode::ClassicV2)
-                    .expect("direct pinned second frame");
+            let (_, bytes2) = encode_frame_with_mode(
+                family,
+                chosen,
+                w,
+                h,
+                &wire_raster(family, w, &frame2),
+                ExtradataMode::ClassicV2,
+            )
+            .expect("direct pinned second frame");
 
             let params = encoder_params(family, w, h, None, ExtradataMode::ClassicV2);
             let mut enc = make_encoder(&params).expect("make_encoder");

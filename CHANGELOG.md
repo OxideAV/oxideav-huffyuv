@@ -37,6 +37,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decoding.
 - The encoder no longer underflows on an RGB raster with zero pixels
   (returns an error).
+- **Registry frames for the RGB families were upside down.** The wire
+  stores RGB24 / RGB32 bottom row first (spec/02 §2); the registry
+  decoder handed that raster out unchanged and the registry encoder
+  took a frame's first row as the bottom row. Both now convert, so a
+  framework frame is top row first like every other codec's. The
+  direct API (`decode_frame` / `encode_frame*`) keeps the wire raster.
 
 ### Changed
 
@@ -58,6 +64,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   streams accepted without a diagnostic and bit-exact.
 - `tests/foreign_pins.rs` — six tiny third-party streams pinned as
   bytes, one per bug above.
+- Registry decoder: `output_params()` / `output_pixel_format()` report
+  the frame size and packed pixel format (`Yuyv422` / `Bgr24` /
+  `Bgra`) from the stream header at construction.
+- Registry encoder: input planes whose stride exceeds the packed row
+  (row padding) are accepted.
 - `predict::{inverse_gradient_stride, forward_gradient_stride,
   forward_decorr_gradient_stride, forward_median_yuy2,
   inverse_median_yuy2}` — byte-position predictor passes taking the

@@ -100,6 +100,11 @@ No external library source consulted.
   never coded are rejected instead of emitting an undecodable stream.
 - Packets are intra-only keyframes, pts passed through verbatim
   (`dts == pts`), time base from `CodecParameters::frame_rate`.
+- Frames are top row first for all three families: the registry path
+  converts to and from the bottom-up RGB wire raster (the direct API
+  works on the wire raster as-is). The decoder announces size and
+  pixel format through `output_params()`; the encoder accepts planes
+  with row padding.
 
 ### FourCCs
 
@@ -125,6 +130,7 @@ skips when the tool is absent; nothing large is committed):
 | Foreign → ours: both black-box encoders × 3 packed formats × 3 predictors × field flag on/off × 13–18 rasters (2×1 … 720×576, odd widths and heights, both sides of 288 lines) × 1–3 frames | 380 writable `HFYU`-layout streams | **380 / 380 bit-exact** against the source raster (and against the black-box decoder wherever it accepts its own stream) |
 | Foreign → ours: `FFVH`-only variants (23 extra pixel formats × 3 predictors × per-frame tables on/off, plus per-frame tables on the packed formats) | 180 writable streams | **180 / 180 refused** cleanly (unspecified extensions) |
 | Ours → foreign: 3 families × 4 methods × 3 extradata modes × 12–13 rasters | 380 comparable streams | **380 / 380 accepted without a diagnostic and bit-exact** |
+| Registry path both ways: 3 families, 36×290 field-coded, 3 frames; foreign file → registry frames, registry packets (padded rows, 3 extradata modes) → black-box decoder | 3 + 9 streams | **12 / 12 bit-exact, frames top row first** |
 
 Not comparable (76 further cells): method byte `-2` (`predict_old`)
 next to extradata. spec/01 §3.1 makes it legal and equivalent to
