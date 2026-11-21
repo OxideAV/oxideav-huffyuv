@@ -51,6 +51,10 @@ No external library source consulted.
   extradata — not only the six classic blobs — deriving per-symbol
   codes by canonical-Huffman construction, and ignores the RGB24 "X"
   pad byte's value (spec/02 §8 #2).
+- **Truncated or mismatched chunks are errors**: a frame that ends
+  before the last pixel's codeword is reported as `InvalidData`, and
+  a chunk too small for the declared picture is rejected before the
+  raster is allocated.
 
 ### Encode
 

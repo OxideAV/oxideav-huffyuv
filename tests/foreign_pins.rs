@@ -292,6 +292,43 @@ fn registry_decoder_emits_rgb_top_down_and_announces_shape() {
     assert_eq!(frame.planes[0].data, RGB24_LEFT_4X3_PIXELS);
 }
 
+/// A chunk cut short is an error, not a picture with a made-up tail:
+/// every proper prefix of a real frame is rejected, the whole frame
+/// is accepted, and a header declaring a huge picture in front of a
+/// small chunk is rejected before any raster is allocated.
+#[test]
+fn truncated_frames_are_rejected() {
+    for (strf, frame) in [
+        (YUY2_MEDIAN_8X4_STRF, YUY2_MEDIAN_8X4_FRAME),
+        (RGB24_LEFT_4X3_STRF, RGB24_LEFT_4X3_FRAME),
+        (RGB32_PLANE_4X6_FIELDS_STRF, RGB32_PLANE_4X6_FIELDS_FRAME),
+    ] {
+        let config = StreamConfig::parse_bitmapinfoheader(strf).unwrap();
+        assert!(decode_frame(&config, frame).is_ok());
+        // The last 32-bit word may be partly padding; one whole word
+        // less always cuts into codewords on these streams.
+        for keep in 0..frame.len() - 4 {
+            assert!(
+                matches!(
+                    decode_frame(&config, &frame[..keep]),
+                    Err(Error::InvalidData(_))
+                ),
+                "{:?}: {keep} of {} bytes must not decode",
+                config.family,
+                frame.len()
+            );
+        }
+    }
+    let mut strf = YUY2_MEDIAN_8X4_STRF.to_vec();
+    strf[4..8].copy_from_slice(&60_000i32.to_le_bytes());
+    strf[8..12].copy_from_slice(&60_000i32.to_le_bytes());
+    let config = StreamConfig::parse_bitmapinfoheader(&strf).unwrap();
+    assert!(matches!(
+        decode_frame(&config, YUY2_MEDIAN_8X4_FRAME),
+        Err(Error::InvalidData(_))
+    ));
+}
+
 /// Extradata prefixes observed on `FFVH` streams the reference
 /// workspace does not specify (per-frame tables, planar 4:4:4, 10-bit
 /// with alpha). Each must be refused as unsupported, and the same

@@ -37,6 +37,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decoding.
 - The encoder no longer underflows on an RGB raster with zero pixels
   (returns an error).
+- **Truncated frames decoded silently.** A chunk that ends before the
+  last pixel's codeword used to decode with zero bits standing in for
+  the missing data and return `Ok`. The decoder now reports
+  `InvalidData` when it had to read past the end of the chunk, and
+  rejects — before allocating the raster — a chunk too small to hold
+  one bit per residual of the declared picture.
 - **Registry frames for the RGB families were upside down.** The wire
   stores RGB24 / RGB32 bottom row first (spec/02 §2); the registry
   decoder handed that raster out unchanged and the registry encoder

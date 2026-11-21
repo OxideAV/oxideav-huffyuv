@@ -331,6 +331,36 @@ fn build_three_tables(config: &StreamConfig) -> Result<std::sync::Arc<ThreeTable
     }
 }
 
+/// A frame codes `codewords` residuals after its 4-byte first pixel,
+/// each with a codeword of at least one bit (spec/03 §3.1), so a
+/// frame shorter than that cannot be complete. Checked before the
+/// output raster is allocated: a header declaring a huge picture in
+/// front of a tiny chunk is rejected without the allocation.
+fn ensure_body_can_hold(frame_bytes: &[u8], codewords: usize) -> Result<()> {
+    let body_bits = (frame_bytes.len().saturating_sub(4) as u64) * 8;
+    if body_bits < codewords as u64 {
+        return Err(Error::invalid(format!(
+            "frame truncated: {} bytes cannot hold {codewords} codewords",
+            frame_bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The decoder stops by pixel count (spec/02 §1); every codeword it
+/// read must lie inside the chunk. Reading past the end means the
+/// chunk was cut short (or does not match the stream header).
+fn ensure_fully_read(reader: &BitReader<'_>, bit_data: &[u8]) -> Result<()> {
+    let have = (bit_data.len() as u64) * 8;
+    if reader.cursor_bits() > have {
+        return Err(Error::invalid(format!(
+            "frame truncated: the picture needs {} codeword bits, the chunk holds {have}",
+            reader.cursor_bits()
+        )));
+    }
+    Ok(())
+}
+
 fn decode_yuy2_raster(
     predictor: Predictor,
     width: u32,
@@ -362,6 +392,7 @@ fn decode_yuy2_raster(
             "YUY2 frame: missing 4-byte uncompressed pixel",
         ));
     }
+    ensure_body_can_hold(frame_bytes, total_bytes - 4)?;
     let mut pixels = vec![0u8; total_bytes];
     pixels[..4].copy_from_slice(&frame_bytes[..4]);
 
@@ -477,6 +508,8 @@ fn decode_yuy2_raster(
         byte_idx += 1;
     }
 
+    ensure_fully_read(&reader, bit_data)?;
+
     // Apply the YUY2 predictor inverse. spec/03 §2.1.1 / §2.2.2 /
     // §2.3.2.
     //
@@ -535,6 +568,7 @@ fn decode_rgb24_raster(
             "RGB24 frame: missing 4-byte uncompressed pixel",
         ));
     }
+    ensure_body_can_hold(frame_bytes, total_bytes - 3)?;
     let mut pixels = vec![0u8; total_bytes];
     // First uncompressed pixel: stored as `00 B G R` (4 wire bytes,
     // X = 0). The reconstructed buffer holds 3-byte BGR, so write
@@ -697,6 +731,7 @@ fn decode_rgb24_raster(
         pixels[bgr_off + 2] = v2;
     }
 
+    ensure_fully_read(&reader, bit_data)?;
     if predictor == Predictor::Median {
         return Err(Error::invalid("median predictor not legal for RGB"));
     }
@@ -758,6 +793,7 @@ fn decode_rgb32_raster(
             "RGB32 frame: missing 4-byte uncompressed pixel",
         ));
     }
+    ensure_body_can_hold(frame_bytes, total_bytes - 4)?;
     let mut pixels = vec![0u8; total_bytes];
     // First pixel verbatim (B G R A). spec/03 §1.3: alpha is real
     // data, no pad-byte zeroing.
@@ -841,6 +877,7 @@ fn decode_rgb32_raster(
         }
     }
 
+    ensure_fully_read(&reader, bit_data)?;
     if predictor == Predictor::Median {
         return Err(Error::invalid("median predictor not legal for RGB"));
     }
