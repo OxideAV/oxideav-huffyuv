@@ -24,7 +24,7 @@ use crate::header::{FOURCC_HFYU, Method, PixelFamily, Predictor, StreamConfig};
 use crate::predict::{
     forward_decorr_gradient_stride, forward_gradient_stride, forward_left_decorr_residuals,
     forward_median_yuy2, forward_rgb_left_subtract_linear, forward_yuy2_left_subtract,
-    interlace_flag_for_height, is_interlaced_height,
+    is_interlaced_height,
 };
 #[cfg(test)]
 use crate::tables::HuffTable;
@@ -60,6 +60,143 @@ pub enum ExtradataMode {
     /// length tables MUST NOT assign length-0 to any symbol the
     /// residual stream emits.
     V1xCompat,
+}
+
+/// How the encoder decides whether a frame is field-coded (spec/06).
+///
+/// A field-coded frame is predicted with "above" two frame rows back
+/// (spec/06 §2.1) and announced by the extradata interlace byte
+/// `0x10`; a plain frame carries `0x20` (spec/06 §1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum FieldCoding {
+    /// The original codec's rule: field-code exactly when the height
+    /// exceeds 288 lines (spec/06 §1.1). Every decoder agrees on such
+    /// a stream, whether it follows the interlace byte or the height.
+    #[default]
+    Auto,
+    /// Field-code whatever the height (interlaced material of 288
+    /// lines or fewer). Decoders that go by the height alone — the
+    /// x86-64 build of the original codec, spec/06 §1.3 — mis-read
+    /// such a stream at 288 lines or fewer.
+    Fields,
+    /// Plain raster whatever the height (progressive material taller
+    /// than 288 lines). Decoders that go by the height alone mis-read
+    /// such a stream above 288 lines.
+    Plain,
+}
+
+impl FieldCoding {
+    /// Resolve the choice for a frame of `height` lines written with
+    /// `mode`. A `biSize == 0x28` header has no interlace byte, so a
+    /// decoder can only apply the height rule to it: a choice that
+    /// disagrees with that rule is rejected for
+    /// [`ExtradataMode::V1xCompat`].
+    pub fn resolve(self, height: u32, mode: ExtradataMode) -> Result<bool> {
+        let by_height = is_interlaced_height(height);
+        let wanted = match self {
+            FieldCoding::Auto => by_height,
+            FieldCoding::Fields => true,
+            FieldCoding::Plain => false,
+        };
+        if wanted != by_height && mode == ExtradataMode::V1xCompat {
+            return Err(Error::unsupported(
+                "field coding against the 288-line rule needs the extradata interlace \
+                 byte, which a v1.x header does not carry",
+            ));
+        }
+        Ok(wanted)
+    }
+}
+
+/// Options for [`encode_frame_with_options`].
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct EncodeOptions {
+    /// Predictor choice. Defaults to [`MethodSelection::Auto`].
+    pub method: MethodSelection,
+    /// Header / table layout. Defaults to [`ExtradataMode::ClassicV2`].
+    pub mode: ExtradataMode,
+    /// Field-coding decision. Defaults to [`FieldCoding::Auto`].
+    pub field_coding: FieldCoding,
+    /// Advisory thread budget; `0` and `1` both mean serial. Only the
+    /// auto-selector's candidate scoring fans out.
+    pub worker_budget: usize,
+}
+
+impl EncodeOptions {
+    /// Auto-selected predictor, classic tables, height-rule field
+    /// coding, serial.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `method`.
+    pub fn with_method(mut self, v: MethodSelection) -> Self {
+        self.method = v;
+        self
+    }
+
+    /// Set `mode`.
+    pub fn with_mode(mut self, v: ExtradataMode) -> Self {
+        self.mode = v;
+        self
+    }
+
+    /// Set `field_coding`.
+    pub fn with_field_coding(mut self, v: FieldCoding) -> Self {
+        self.field_coding = v;
+        self
+    }
+
+    /// Set `worker_budget`.
+    pub fn with_worker_budget(mut self, v: usize) -> Self {
+        self.worker_budget = v;
+        self
+    }
+}
+
+/// Result of [`encode_frame_with_options`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct EncodedFrame {
+    /// AVI `strf` payload (`BITMAPINFOHEADER` + extradata).
+    pub strf: Vec<u8>,
+    /// One `00dc` chunk body.
+    pub frame: Vec<u8>,
+    /// The method written into the header.
+    pub method: Method,
+}
+
+/// Encode one frame with every encoder choice in one options record.
+///
+/// With default options this is [`encode_frame_auto`] in
+/// [`ExtradataMode::ClassicV2`]; `options.field_coding` additionally
+/// lets a caller field-code material of 288 lines or fewer, or keep
+/// taller progressive material on the plain raster (spec/06 §1).
+pub fn encode_frame_with_options(
+    family: PixelFamily,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    options: &EncodeOptions,
+) -> Result<EncodedFrame> {
+    let field_coded = options.field_coding.resolve(height, options.mode)?;
+    let (strf, frame, method) = encode_auto_inner(
+        family,
+        options.method,
+        width,
+        height,
+        field_coded,
+        pixels,
+        options.mode,
+        options.worker_budget,
+    )?;
+    Ok(EncodedFrame {
+        strf,
+        frame,
+        method,
+    })
 }
 
 /// Synthesise a complete `BITMAPINFOHEADER` payload + per-frame
@@ -105,8 +242,9 @@ pub fn encode_frame_with_mode(
     // shared across the auto-selector's candidate scoring + the final
     // emit pass (one residual computation per candidate instead of
     // candidate + winner-restart = N+1).
-    let frame = compute_frame_residuals(family, method, width, height, pixels)?;
-    encode_with_precomputed(family, method, width, height, &frame, mode)
+    let field_coded = is_interlaced_height(height);
+    let frame = residuals_for(family, method, width, height, field_coded, pixels)?;
+    encode_with_precomputed(family, method, width, height, field_coded, &frame, mode)
 }
 
 /// Encode a frame under an explicit worker budget.
@@ -160,7 +298,7 @@ pub(crate) fn encode_body_with_pinned_tables(
     height: u32,
     pixels: &[u8],
     tabs: &crate::decoder::ThreeTables,
-    worker_budget: usize,
+    field_coded: bool,
 ) -> Result<Vec<u8>> {
     if family.is_rgb() && !method.is_rgb_legal() {
         return Err(Error::invalid("encoder: method not legal for RGB"));
@@ -168,8 +306,7 @@ pub(crate) fn encode_body_with_pinned_tables(
     if !family.is_rgb() && !method.is_yuv_legal() {
         return Err(Error::invalid("encoder: method not legal for YUV"));
     }
-    let _ = worker_budget;
-    let frame = compute_frame_residuals(family, method, width, height, pixels)?;
+    let frame = residuals_for(family, method, width, height, field_coded, pixels)?;
     verify_body_in_table(
         family,
         method,
@@ -207,6 +344,7 @@ fn encode_with_precomputed(
     method: Method,
     width: u32,
     height: u32,
+    field_coded: bool,
     frame: &Residuals,
     mode: ExtradataMode,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -276,13 +414,14 @@ fn encode_with_precomputed(
     };
     let (slot1, slot2, slot3) = tabs.slots();
 
-    let strf = build_bitmapinfoheader(
+    let strf = build_bitmapinfoheader_field_coded(
         family,
         method,
         width,
         height,
         &extradata_tables,
         has_extradata,
+        field_coded,
     );
 
     let frame_bytes = emit_frame_bytes(family, method, frame, slot1, slot2, slot3)?;
@@ -330,8 +469,28 @@ fn compute_frame_residuals(
     height: u32,
     pixels: &[u8],
 ) -> Result<Residuals> {
+    residuals_for(
+        family,
+        method,
+        width,
+        height,
+        is_interlaced_height(height),
+        pixels,
+    )
+}
+
+/// Residual stream for an explicit field-coding decision: field coding
+/// only doubles the prediction row length (spec/06 §2.1).
+fn residuals_for(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    field_coded: bool,
+    pixels: &[u8],
+) -> Result<Residuals> {
     let row_bytes = family.row_bytes(width);
-    let stride = if is_interlaced_height(height) {
+    let stride = if field_coded {
         row_bytes.saturating_mul(2)
     } else {
         row_bytes
@@ -359,6 +518,31 @@ pub fn build_bitmapinfoheader(
     height: u32,
     extradata_tables: &[u8],
     with_extradata: bool,
+) -> Vec<u8> {
+    build_bitmapinfoheader_field_coded(
+        family,
+        method,
+        width,
+        height,
+        extradata_tables,
+        with_extradata,
+        is_interlaced_height(height),
+    )
+}
+
+/// [`build_bitmapinfoheader`] with the field-coding decision stated
+/// by the caller instead of derived from the height: the interlace
+/// byte at BIH `+0x2A` is `0x10` when `field_coded`, `0x20` otherwise
+/// (spec/06 §1.2). A header without extradata has no such byte and
+/// ignores the argument.
+pub fn build_bitmapinfoheader_field_coded(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    extradata_tables: &[u8],
+    with_extradata: bool,
+    field_coded: bool,
 ) -> Vec<u8> {
     if !with_extradata {
         // v1.x layout (spec/01 §6): biSize = 0x28, no extradata.
@@ -411,12 +595,10 @@ pub fn build_bitmapinfoheader(
         PixelFamily::Rgb24 => 24,
         PixelFamily::Rgb32 => 32,
     };
-    // interlace_flag at +0x2A (spec/01 §3): mirror the i386 build's
-    // height-derived `0x10` (interlaced) / `0x20` (non-interlaced)
-    // encoding so our extradata round-trips bug-for-bug with the i386
-    // decoder's primary indicator. (The x86-64 build writes 0x00; both
-    // decode correctly via `interlaced_from_flag_and_height`.)
-    v[0x2A] = interlace_flag_for_height(height);
+    // Interlace byte at +0x2A (spec/01 §3, spec/06 §1.2): `0x10`
+    // field-coded, `0x20` plain raster. A decoder that reads the byte
+    // follows it; one that does not applies the height rule.
+    v[0x2A] = if field_coded { 0x10 } else { 0x20 };
     v[0x2B] = 0;
     v[0x2C..0x2C + extradata_tables.len()].copy_from_slice(extradata_tables);
     v
@@ -559,9 +741,10 @@ fn score_candidate(
     method: Method,
     width: u32,
     height: u32,
+    field_coded: bool,
     pixels: &[u8],
 ) -> Result<(u64, Residuals)> {
-    let frame = compute_frame_residuals(family, method, width, height, pixels)?;
+    let frame = residuals_for(family, method, width, height, field_coded, pixels)?;
     let (h1, h2, h3) = histogramise(family, method, &frame.body);
     Ok((bit_cost_from_histograms(&h1, &h2, &h3), frame))
 }
@@ -598,9 +781,50 @@ pub fn encode_frame_auto_workers(
     mode: ExtradataMode,
     worker_budget: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, Method)> {
+    encode_auto_inner(
+        family,
+        selection,
+        width,
+        height,
+        is_interlaced_height(height),
+        pixels,
+        mode,
+        worker_budget,
+    )
+}
+
+/// Auto-selector body shared by [`encode_frame_auto_workers`] (height
+/// rule) and [`encode_frame_with_options`] (caller's field-coding
+/// decision).
+#[allow(clippy::too_many_arguments)] // one frame description, passed flat like its public callers
+pub(crate) fn encode_auto_inner(
+    family: PixelFamily,
+    selection: MethodSelection,
+    width: u32,
+    height: u32,
+    field_coded: bool,
+    pixels: &[u8],
+    mode: ExtradataMode,
+    worker_budget: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Method)> {
     let candidates = selection.candidates(family);
+    for &m in &candidates {
+        if family.is_rgb() && !m.is_rgb_legal() {
+            return Err(Error::invalid("encoder: method not legal for RGB"));
+        }
+        if !family.is_rgb() && !m.is_yuv_legal() {
+            return Err(Error::invalid("encoder: method not legal for YUV"));
+        }
+    }
     if candidates.is_empty() {
         return Err(Error::invalid("encode_frame_auto: no legal methods"));
+    }
+    if let [only] = candidates[..] {
+        // A pinned method needs no scoring pass.
+        let frame = residuals_for(family, only, width, height, field_coded, pixels)?;
+        let (strf, bytes) =
+            encode_with_precomputed(family, only, width, height, field_coded, &frame, mode)?;
+        return Ok((strf, bytes, only));
     }
     // Inline scoring fan-out clamp per the ExecutionContext threading
     // contract — `threads.min(units).max(1)` with `units` = number of
@@ -638,12 +862,26 @@ pub fn encode_frame_auto_workers(
                 cands_rest = ctail;
                 s.spawn(move || {
                     for (slot, &m) in chunk_slots.iter_mut().zip(chunk_cands) {
-                        *slot = Some(score_candidate(family, m, width, height, pixels));
+                        *slot = Some(score_candidate(
+                            family,
+                            m,
+                            width,
+                            height,
+                            field_coded,
+                            pixels,
+                        ));
                     }
                 });
             }
             for (slot, &m) in own_slots.iter_mut().zip(own_cands) {
-                *slot = Some(score_candidate(family, m, width, height, pixels));
+                *slot = Some(score_candidate(
+                    family,
+                    m,
+                    width,
+                    height,
+                    field_coded,
+                    pixels,
+                ));
             }
         });
         for (&m, slot) in candidates.iter().zip(results) {
@@ -656,7 +894,7 @@ pub fn encode_frame_auto_workers(
         }
     } else {
         for &m in &candidates {
-            let (cost, frame) = score_candidate(family, m, width, height, pixels)?;
+            let (cost, frame) = score_candidate(family, m, width, height, field_coded, pixels)?;
             match best {
                 None => best = Some((m, cost, frame)),
                 Some((_, prev_cost, _)) if cost < prev_cost => best = Some((m, cost, frame)),
@@ -665,7 +903,8 @@ pub fn encode_frame_auto_workers(
         }
     }
     let (chosen, _, frame) = best.expect("non-empty candidates → some winner");
-    let (strf, bytes) = encode_with_precomputed(family, chosen, width, height, &frame, mode)?;
+    let (strf, bytes) =
+        encode_with_precomputed(family, chosen, width, height, field_coded, &frame, mode)?;
     Ok((strf, bytes, chosen))
 }
 

@@ -74,9 +74,14 @@ No external library source consulted.
 - Public **`build_bitmapinfoheader`** BIH writer for muxers
   synthesising an AVI `strf` payload; writes the interlace byte
   `0x10` / `0x20` at BIH `+0x2A` (spec/06 §1.2).
-- **Field coding** for `biHeight > 288` (spec/06 §1.1), with the
-  matching interlace byte, so the stream decodes the same way under
-  the height rule and under the byte rule.
+- **Field coding** for `biHeight > 288` by default (spec/06 §1.1),
+  with the matching interlace byte, so the stream decodes the same
+  way under the height rule and under the byte rule. `FieldCoding`
+  (`Auto` / `Fields` / `Plain`, via `EncodeOptions` +
+  `encode_frame_with_options`, or the registry option
+  `field-coding`) overrides it for interlaced material of 288 lines
+  or fewer and progressive material above; such streams rely on the
+  interlace byte (spec/06 §1.3) and need a v2.x header.
 
 ### Registry
 
@@ -91,7 +96,8 @@ No external library source consulted.
   `method` = `auto`|`predict-old`|`left`|`gradient`|`median`|
   `left-decorr`|`gradient-decorr` (`auto` bit-cost-selects on the
   first frame and pins the winner — the method byte is stream-level),
-  `mode` = `classic-v2`|`custom-v2`|`v1x`.
+  `mode` = `classic-v2`|`custom-v2`|`v1x`,
+  `field-coding` = `auto`|`fields`|`plain`.
 - `output_params()` carries the AVI `strf` as extradata (final at
   construction for a fixed method with `classic-v2`/`v1x`; finalized
   by the first `send_frame` otherwise). `custom-v2` streams pin the
@@ -129,10 +135,10 @@ skips when the tool is absent; nothing large is committed):
 |-------|------:|--------|
 | Foreign → ours: both black-box encoders × 3 packed formats × 3 predictors × field flag on/off × 13–18 rasters (2×1 … 720×576, odd widths and heights, both sides of 288 lines) × 1–3 frames | 380 writable `HFYU`-layout streams | **380 / 380 bit-exact** against the source raster (and against the black-box decoder wherever it accepts its own stream) |
 | Foreign → ours: `FFVH`-only variants (23 extra pixel formats × 3 predictors × per-frame tables on/off, plus per-frame tables on the packed formats) | 180 writable streams | **180 / 180 refused** cleanly (unspecified extensions) |
-| Ours → foreign: 3 families × 4 methods × 3 extradata modes × 12–13 rasters | 380 comparable streams | **380 / 380 accepted without a diagnostic and bit-exact** |
+| Ours → foreign: 3 families × 4 methods × 3 extradata modes × 12–13 rasters, each also with the field-coding choice forced against the height rule where the header can carry it | 536 comparable streams | **536 / 536 accepted without a diagnostic and bit-exact** |
 | Registry path both ways: 3 families, 36×290 field-coded, 3 frames; foreign file → registry frames, registry packets (padded rows, 3 extradata modes) → black-box decoder | 3 + 9 streams | **12 / 12 bit-exact, frames top row first** |
 
-Not comparable (76 further cells): method byte `-2` (`predict_old`)
+Not comparable (128 further cells): method byte `-2` (`predict_old`)
 next to extradata. spec/01 §3.1 makes it legal and equivalent to
 `left`; the black-box decoder reads that byte as predictor flags and
 rejects or mis-reads it. Use `left` when the stream must play in other
@@ -151,14 +157,19 @@ Encoded size against the black-box encoder on the same rasters is in
   — same output at every budget (a frame is one codeword stream, so
   decode has a single unit of work)
 - `encode_frame` / `encode_frame_with_mode` / `encode_frame_auto`
+- `encode_frame_with_options(family, width, height, pixels,
+  &EncodeOptions) -> Result<EncodedFrame>` — method selection,
+  extradata mode, field coding and thread budget in one record
 - `encode_frame_with_mode_workers(..., worker_budget)` — same wire
   bytes at every budget
 - `encode_frame_auto_workers(..., worker_budget)` — budgeted
   candidate scoring, identical output across budgets
   (`encode_frame_auto` ≡ budget 1)
-- `build_bitmapinfoheader`, `bit_cost_for_method`
+- `build_bitmapinfoheader`, `build_bitmapinfoheader_field_coded`,
+  `bit_cost_for_method`
 - `Method`, `PixelFamily`, `Predictor`, `StreamConfig`,
-  `ExtradataMode`, `MethodSelection`
+  `ExtradataMode`, `MethodSelection`, `FieldCoding`, `EncodeOptions`,
+  `EncodedFrame`
 - `register` / `register_codecs` / `make_decoder` / `make_encoder` /
   `HuffYuvEncoderOptions` / `CODEC_ID_STR`
 

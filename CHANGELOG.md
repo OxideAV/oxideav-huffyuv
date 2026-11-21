@@ -69,6 +69,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Bgra`) from the stream header at construction.
 - Registry encoder: input planes whose stride exceeds the packed row
   (row padding) are accepted.
+- **Field-coding choice on the encode side**: `FieldCoding`
+  (`Auto` = above 288 lines, `Fields`, `Plain`), carried by the new
+  `EncodeOptions` record into `encode_frame_with_options` (returns an
+  `EncodedFrame { strf, frame, method }`), by
+  `build_bitmapinfoheader_field_coded` for muxers, and by the registry
+  option `field-coding` = `auto`|`fields`|`plain`. The decoder already
+  honoured the interlace byte over the height; the encoder can now
+  write those streams (interlaced material of 288 lines or fewer,
+  progressive material above). A v1.x header has no interlace byte, so
+  a choice against the height rule is rejected there.
 - `predict::{inverse_gradient_stride, forward_gradient_stride,
   forward_decorr_gradient_stride, forward_median_yuy2,
   inverse_median_yuy2}` — byte-position predictor passes taking the

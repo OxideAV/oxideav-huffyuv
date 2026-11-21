@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxideav_huffyuv::decoder::decode_frame;
-use oxideav_huffyuv::encoder::{ExtradataMode, encode_frame_with_mode};
+use oxideav_huffyuv::encoder::{
+    EncodeOptions, ExtradataMode, FieldCoding, MethodSelection, encode_frame_with_mode,
+    encode_frame_with_options,
+};
 use oxideav_huffyuv::header::{Method, PixelFamily, StreamConfig};
 
 fn ffmpeg_available() -> bool {
@@ -558,9 +561,23 @@ fn our_streams_decode_bit_exact_in_black_box() {
                 ExtradataMode::CustomV2,
                 ExtradataMode::V1xCompat,
             ] {
-                for &(width, height) in shapes {
+                // Each raster once under the height rule, plus — where
+                // the header can say so — once with the opposite
+                // field-coding choice (spec/06 §1.2 interlace byte).
+                let runs = shapes.iter().flat_map(|&(w, h)| {
+                    let against = if h > 288 {
+                        FieldCoding::Plain
+                    } else {
+                        FieldCoding::Fields
+                    };
+                    let forced = (mode != ExtradataMode::V1xCompat && w <= 64 && h >= 3)
+                        .then_some((w, h, against));
+                    std::iter::once((w, h, FieldCoding::Auto)).chain(forced)
+                });
+                for (width, height, field_coding) in runs {
                     cells += 1;
-                    let name = format!("{family:?}-{method:?}-{mode:?}-{width}x{height}");
+                    let name =
+                        format!("{family:?}-{method:?}-{mode:?}-{width}x{height}-{field_coding:?}");
                     let row_bytes = family.row_bytes(width);
                     let pixels = synth_raster(
                         row_bytes * height as usize,
@@ -568,15 +585,26 @@ fn our_streams_decode_bit_exact_in_black_box() {
                         row_bytes,
                         0x9E37_79B9 ^ (width << 12) ^ height,
                     );
-                    let (strf, frame) = match encode_frame_with_mode(
-                        family, method, width, height, &pixels, mode,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            failures.push(format!("{name}: encode failed: {e}"));
-                            continue;
-                        }
-                    };
+                    let options = EncodeOptions::new()
+                        .with_method(MethodSelection::Fixed(method))
+                        .with_mode(mode)
+                        .with_field_coding(field_coding);
+                    let (strf, frame) =
+                        match encode_frame_with_options(family, width, height, &pixels, &options) {
+                            Ok(v) => (v.strf, v.frame),
+                            Err(e) => {
+                                failures.push(format!("{name}: encode failed: {e}"));
+                                continue;
+                            }
+                        };
+                    if field_coding == FieldCoding::Auto {
+                        // The options entry point and the classic one
+                        // are the same encoder.
+                        let classic =
+                            encode_frame_with_mode(family, method, width, height, &pixels, mode)
+                                .unwrap();
+                        assert_eq!((&strf, &frame), (&classic.0, &classic.1), "{name}");
+                    }
                     // Own decoder first: the two decoders are compared
                     // against the same source raster.
                     let config = StreamConfig::parse_bitmapinfoheader(&strf).unwrap();

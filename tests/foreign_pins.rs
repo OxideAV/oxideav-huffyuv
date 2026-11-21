@@ -21,7 +21,10 @@
 //!   specified `HFYU` layout.
 
 use oxideav_huffyuv::decoder::decode_frame;
-use oxideav_huffyuv::encoder::{ExtradataMode, encode_frame_with_mode};
+use oxideav_huffyuv::encoder::{
+    EncodeOptions, ExtradataMode, FieldCoding, MethodSelection, encode_frame_with_mode,
+    encode_frame_with_options,
+};
 use oxideav_huffyuv::error::Error;
 use oxideav_huffyuv::header::{Method, PixelFamily, StreamConfig};
 
@@ -143,6 +146,121 @@ fn ffvh_inside_the_hfyu_layout_decodes() {
     assert_eq!(&FFVH_YUY2_LEFT_4X2_STRF[16..20], b"FFVH");
     let (_, pixels) = decode_top_down(FFVH_YUY2_LEFT_4X2_STRF, FFVH_YUY2_LEFT_4X2_FRAME);
     assert_eq!(pixels, FFVH_YUY2_LEFT_4X2_PIXELS);
+}
+
+/// spec/06 §2.1: the payload of a field-coded `W × H` frame is
+/// byte-identical to the payload of the same bytes coded as a plain
+/// `2W × H/2` frame; only the interlace byte differs (`0x10` against
+/// `0x20`). Checked for every legal method of every family, on both
+/// sides of the 288-line rule, through the explicit field-coding
+/// option.
+#[test]
+fn field_coded_payload_equals_plain_double_width_payload() {
+    for (family, bpp) in [
+        (PixelFamily::Yuy2, 2usize),
+        (PixelFamily::Rgb24, 3),
+        (PixelFamily::Rgb32, 4),
+    ] {
+        let methods: &[Method] = if family.is_rgb() {
+            &[Method::Left, Method::LeftDecorr, Method::GradientDecorr]
+        } else {
+            &[Method::Left, Method::Gradient, Method::Median]
+        };
+        for (width, height) in [(12u32, 10u32), (8, 300)] {
+            let len = width as usize * bpp * height as usize;
+            let mut state = 0x1234_5678u32 ^ len as u32;
+            let pixels: Vec<u8> = (0..len)
+                .map(|i| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    ((i / 7) as u32).wrapping_add(state & 0x1F) as u8
+                })
+                .collect();
+            for &method in methods {
+                for mode in [ExtradataMode::ClassicV2, ExtradataMode::CustomV2] {
+                    let base = EncodeOptions::new()
+                        .with_method(MethodSelection::Fixed(method))
+                        .with_mode(mode);
+                    let fields = encode_frame_with_options(
+                        family,
+                        width,
+                        height,
+                        &pixels,
+                        &base.with_field_coding(FieldCoding::Fields),
+                    )
+                    .unwrap();
+                    let plain_wide = encode_frame_with_options(
+                        family,
+                        width * 2,
+                        height / 2,
+                        &pixels,
+                        &base.with_field_coding(FieldCoding::Plain),
+                    )
+                    .unwrap();
+                    let what = format!("{family:?}/{method:?}/{mode:?}/{width}x{height}");
+                    assert_eq!(fields.frame, plain_wide.frame, "{what}: payload twins");
+                    assert_eq!(fields.strf[0x2A], 0x10, "{what}");
+                    assert_eq!(plain_wide.strf[0x2A], 0x20, "{what}");
+                    assert_eq!(
+                        fields.strf[0x2C..],
+                        plain_wide.strf[0x2C..],
+                        "{what}: tables"
+                    );
+                    let (config, _) = decode_top_down(&fields.strf, &fields.frame);
+                    assert!(config.is_interlaced(), "{what}");
+                    let decoded = decode_frame(&config, &fields.frame).unwrap();
+                    assert_eq!(decoded.pixels, pixels, "{what}: lossless");
+                    // The opposite choice on the same raster decodes too.
+                    let plain = encode_frame_with_options(
+                        family,
+                        width,
+                        height,
+                        &pixels,
+                        &base.with_field_coding(FieldCoding::Plain),
+                    )
+                    .unwrap();
+                    let config = StreamConfig::parse_bitmapinfoheader(&plain.strf).unwrap();
+                    assert!(!config.is_interlaced(), "{what}");
+                    assert_eq!(decode_frame(&config, &plain.frame).unwrap().pixels, pixels);
+                }
+            }
+        }
+    }
+}
+
+/// A `biSize == 0x28` header has no interlace byte: a field-coding
+/// choice the 288-line rule would not reproduce cannot be written.
+#[test]
+fn v1x_header_cannot_carry_a_field_coding_override() {
+    let pixels = vec![0x40u8; 8 * 2 * 10];
+    let v1x = EncodeOptions::new().with_mode(ExtradataMode::V1xCompat);
+    for (height, choice, ok) in [
+        (10u32, FieldCoding::Fields, false),
+        (10, FieldCoding::Plain, true),
+        (10, FieldCoding::Auto, true),
+    ] {
+        let got = encode_frame_with_options(
+            PixelFamily::Yuy2,
+            8,
+            height,
+            &pixels,
+            &v1x.with_field_coding(choice),
+        );
+        assert_eq!(got.is_ok(), ok, "{choice:?} at {height} lines");
+        if !ok {
+            assert!(matches!(got, Err(Error::Unsupported(_))));
+        }
+    }
+    assert!(
+        FieldCoding::Plain
+            .resolve(300, ExtradataMode::V1xCompat)
+            .is_err()
+    );
+    assert_eq!(
+        FieldCoding::Auto.resolve(300, ExtradataMode::V1xCompat),
+        Ok(true)
+    );
 }
 
 /// Through the framework the same stream comes out top row first —

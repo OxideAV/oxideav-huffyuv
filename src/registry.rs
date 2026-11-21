@@ -17,8 +17,8 @@ use oxideav_core::{
 
 use crate::decoder::{DecodedFrame, ThreeTables, decode_frame_with_workers, table_cache};
 use crate::encoder::{
-    ExtradataMode, MethodSelection, build_bitmapinfoheader, encode_body_with_pinned_tables,
-    encode_frame_auto_workers, encode_frame_with_mode_workers,
+    EncodeOptions, ExtradataMode, FieldCoding, MethodSelection, build_bitmapinfoheader_field_coded,
+    encode_body_with_pinned_tables, encode_frame_with_options,
 };
 use crate::header::{Method, PixelFamily, StreamConfig};
 use crate::tables::classic_blob_bytes;
@@ -226,10 +226,9 @@ fn packet_time_base(frame_rate: Option<Rational>) -> TimeBase {
     }
 }
 
-/// Typed options for the registry encoder — the same three axes the
-/// direct API exposes as function parameters
-/// (`encode_frame_with_mode_workers` / `encode_frame_auto_workers`):
-/// input pixel family, predictor method, extradata mode.
+/// Typed options for the registry encoder — the axes the direct API
+/// exposes through [`EncodeOptions`]: input pixel family, predictor
+/// method, extradata mode, field coding.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct HuffYuvEncoderOptions {
@@ -245,6 +244,10 @@ pub struct HuffYuvEncoderOptions {
     /// Extradata mode: `"classic-v2"` (default), `"custom-v2"`, or
     /// `"v1x"`. Mirrors [`ExtradataMode`].
     pub mode: ExtradataMode,
+    /// Field coding: `"auto"` (default — field-code above 288 lines,
+    /// spec/06 §1.1), `"fields"`, or `"plain"`. Mirrors
+    /// [`FieldCoding`].
+    pub field_coding: FieldCoding,
 }
 
 impl HuffYuvEncoderOptions {
@@ -263,6 +266,12 @@ impl HuffYuvEncoderOptions {
     /// Set `mode`.
     pub fn with_mode(mut self, v: ExtradataMode) -> Self {
         self.mode = v;
+        self
+    }
+
+    /// Set `field_coding`.
+    pub fn with_field_coding(mut self, v: FieldCoding) -> Self {
+        self.field_coding = v;
         self
     }
 }
@@ -298,6 +307,13 @@ impl CodecOptionsStruct for HuffYuvEncoderOptions {
                    optimal tables from the first frame; v1x emits a biSize=0x28 \
                    header with no extradata)",
         },
+        OptionField {
+            name: "field-coding",
+            kind: OptionKind::Enum(&["auto", "fields", "plain"]),
+            default: OptionValue::String(String::new()),
+            help: "field (interlaced) coding: auto = above 288 lines, fields = always, \
+                   plain = never; fields/plain against the 288-line rule need extradata",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
@@ -328,6 +344,14 @@ impl CodecOptionsStruct for HuffYuvEncoderOptions {
                     "classic-v2" => ExtradataMode::ClassicV2,
                     "custom-v2" => ExtradataMode::CustomV2,
                     "v1x" => ExtradataMode::V1xCompat,
+                    _ => unreachable!("guarded by SCHEMA"),
+                }
+            }
+            "field-coding" => {
+                self.field_coding = match value.as_str()? {
+                    "auto" => FieldCoding::Auto,
+                    "fields" => FieldCoding::Fields,
+                    "plain" => FieldCoding::Plain,
                     _ => unreachable!("guarded by SCHEMA"),
                 }
             }
@@ -398,6 +422,11 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         }
     }
 
+    let field_coded = opts
+        .field_coding
+        .resolve(height, opts.mode)
+        .map_err(|e| CoreError::invalid(format!("oxideav-huffyuv: {e}")))?;
+
     let mut output = CodecParameters::video(params.codec_id.clone());
     output.width = Some(width);
     output.height = Some(height);
@@ -412,17 +441,26 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     if let Some(m) = opts.method {
         match opts.mode {
             ExtradataMode::ClassicV2 => {
-                output.extradata = build_bitmapinfoheader(
+                output.extradata = build_bitmapinfoheader_field_coded(
                     family,
                     m,
                     width,
                     height,
                     classic_blob_bytes(family, m),
                     true,
+                    field_coded,
                 );
             }
             ExtradataMode::V1xCompat => {
-                output.extradata = build_bitmapinfoheader(family, m, width, height, &[], false);
+                output.extradata = build_bitmapinfoheader_field_coded(
+                    family,
+                    m,
+                    width,
+                    height,
+                    &[],
+                    false,
+                    field_coded,
+                );
             }
             // Finalized by the first send_frame.
             ExtradataMode::CustomV2 => {}
@@ -434,6 +472,8 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         width,
         height,
         mode: opts.mode,
+        field_coding: opts.field_coding,
+        field_coded,
         chosen_method: opts.method,
         pinned_custom: None,
         time_base: packet_time_base(params.frame_rate),
@@ -449,6 +489,10 @@ struct HuffYuvEncoder {
     width: u32,
     height: u32,
     mode: ExtradataMode,
+    /// The caller's field-coding choice and its resolution for this
+    /// stream's height and mode (spec/06 §1).
+    field_coding: FieldCoding,
+    field_coded: bool,
     /// The stream's method. `Some` from construction for a fixed
     /// `method` option; pinned by the first frame's auto-selection
     /// otherwise (the method byte is stream-level, spec/01 §3).
@@ -480,64 +524,42 @@ impl HuffYuvEncoder {
     /// for every frame of the stream.
     fn encode_pixels(&mut self, pixels: &[u8]) -> CoreResult<(Vec<u8>, Vec<u8>)> {
         let map = |e: crate::error::Error| CoreError::invalid(format!("oxideav-huffyuv: {e}"));
-        let budget = self.worker_budget;
-        match self.chosen_method {
-            None => {
-                let (strf, bytes, chosen) = encode_frame_auto_workers(
-                    self.family,
-                    MethodSelection::Auto,
-                    self.width,
-                    self.height,
-                    pixels,
-                    self.mode,
-                    budget,
-                )
-                .map_err(map)?;
-                self.chosen_method = Some(chosen);
-                if self.mode == ExtradataMode::CustomV2 {
-                    self.pin_custom_tables(&strf)?;
-                }
-                Ok((strf, bytes))
-            }
-            Some(m) if self.mode == ExtradataMode::CustomV2 => {
-                if let Some((strf, tabs)) = &self.pinned_custom {
-                    let bytes = encode_body_with_pinned_tables(
-                        self.family,
-                        m,
-                        self.width,
-                        self.height,
-                        pixels,
-                        tabs,
-                        budget,
-                    )
-                    .map_err(map)?;
-                    Ok((strf.clone(), bytes))
-                } else {
-                    let (strf, bytes) = encode_frame_with_mode_workers(
-                        self.family,
-                        m,
-                        self.width,
-                        self.height,
-                        pixels,
-                        ExtradataMode::CustomV2,
-                        budget,
-                    )
-                    .map_err(map)?;
-                    self.pin_custom_tables(&strf)?;
-                    Ok((strf, bytes))
-                }
-            }
-            Some(m) => encode_frame_with_mode_workers(
+        let options = EncodeOptions::new()
+            .with_mode(self.mode)
+            .with_field_coding(self.field_coding)
+            .with_worker_budget(self.worker_budget);
+        // CustomV2 after the first frame: emit against the pinned
+        // stream tables.
+        if let (Some(m), Some((strf, tabs))) = (self.chosen_method, &self.pinned_custom) {
+            let bytes = encode_body_with_pinned_tables(
                 self.family,
                 m,
                 self.width,
                 self.height,
                 pixels,
-                self.mode,
-                budget,
+                tabs,
+                self.field_coded,
             )
-            .map_err(map),
+            .map_err(map)?;
+            return Ok((strf.clone(), bytes));
         }
+        let selection = match self.chosen_method {
+            Some(m) => MethodSelection::Fixed(m),
+            None => MethodSelection::Auto,
+        };
+        let encoded = encode_frame_with_options(
+            self.family,
+            self.width,
+            self.height,
+            pixels,
+            &options.with_method(selection),
+        )
+        .map_err(map)?;
+        self.chosen_method = Some(encoded.method);
+        if self.mode == ExtradataMode::CustomV2 {
+            self.pin_custom_tables(&encoded.strf)?;
+        }
+        Ok((encoded.strf, encoded.frame))
     }
 
     /// Pin the `CustomV2` stream tables from the first frame's strf.
@@ -932,6 +954,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The `field-coding` option reaches the wire: the interlace byte
+    /// follows the choice (spec/06 §1.2), every frame of the stream
+    /// decodes through the registry decoder, and a choice a v1.x
+    /// header cannot express is rejected at construction.
+    #[test]
+    fn field_coding_option_sets_the_interlace_byte() {
+        for (choice, byte) in [("fields", 0x10u8), ("plain", 0x20), ("auto", 0x20)] {
+            for mode in [ExtradataMode::ClassicV2, ExtradataMode::CustomV2] {
+                for family in [PixelFamily::Yuy2, PixelFamily::Rgb24] {
+                    let (w, h) = (16u32, 12u32);
+                    let mut params = encoder_params(family, w, h, None, mode);
+                    params.options.insert("field-coding", choice);
+                    let mut enc = make_encoder(&params).expect("make_encoder");
+                    let picture = synth_pixels(w, h, family, 7);
+                    let mut packets = Vec::new();
+                    for pts in 0..2 {
+                        packets.push(encode_one(
+                            &mut enc,
+                            &video_frame(family, w, picture.clone(), pts),
+                        ));
+                    }
+                    let strf = enc.output_params().extradata.clone();
+                    assert_eq!(strf[0x2A], byte, "{choice}/{mode:?}/{family:?}");
+                    let mut dec = make_decoder(enc.output_params()).expect("make_decoder");
+                    for pkt in &packets {
+                        dec.send_packet(pkt).expect("send_packet");
+                        let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+                            panic!("expected a video frame");
+                        };
+                        assert_eq!(vf.planes[0].data, picture, "{choice}/{mode:?}/{family:?}");
+                    }
+                }
+            }
+        }
+        let mut params = encoder_params(PixelFamily::Yuy2, 16, 12, None, ExtradataMode::V1xCompat);
+        params.options.insert("field-coding", "fields");
+        assert!(make_encoder(&params).is_err());
     }
 
     /// Round-429: `method=auto` (the default) picks the bit-cost

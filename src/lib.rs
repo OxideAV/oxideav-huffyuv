@@ -77,9 +77,10 @@ mod roundtrip_tests;
 
 pub use crate::decoder::{DecodedFrame, decode_frame, decode_frame_with_workers};
 pub use crate::encoder::{
-    ExtradataMode, MethodSelection, bit_cost_for_method, build_bitmapinfoheader, encode_frame,
-    encode_frame_auto, encode_frame_auto_workers, encode_frame_with_mode,
-    encode_frame_with_mode_workers,
+    EncodeOptions, EncodedFrame, ExtradataMode, FieldCoding, MethodSelection, bit_cost_for_method,
+    build_bitmapinfoheader, build_bitmapinfoheader_field_coded, encode_frame, encode_frame_auto,
+    encode_frame_auto_workers, encode_frame_with_mode, encode_frame_with_mode_workers,
+    encode_frame_with_options,
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{Method, PixelFamily, Predictor, StreamConfig};
