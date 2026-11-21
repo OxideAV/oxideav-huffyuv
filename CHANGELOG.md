@@ -6,7 +6,62 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Field-coded ("interlaced") frames were a private dialect.** The
+  crate coded a frame taller than 288 lines as two independently
+  predicted fields, each with its own uncompressed first pixel and its
+  own codeword stream, concatenated. No other decoder reads that and
+  this decoder read nobody else's field-coded frames. Field coding is
+  now what spec/06 defines: one first pixel, one codeword stream, rows
+  in memory order, and only the predictors' "above" reference moved
+  two frame rows back (prediction row length doubled), including odd
+  heights. **Streams this crate's earlier versions wrote at heights
+  above 288 do not decode with this version** (and never decoded
+  anywhere else).
+- **YUY2 median predicted chroma from the wrong neighbours.** The left
+  and above-left neighbours of a U / V sample are the previous U / V
+  sample (4 wire bytes back, spec/06 §3), not the byte 2 back. Every
+  third-party median stream decoded with about half its bytes wrong,
+  and the encoder wrote median streams only this crate could read.
+- **First pixel of a decorrelated RGB frame.** With `LeftDecorr` /
+  `GradientDecorr` the uncompressed first pixel is the plain `B G R`
+  (spec/03 §1.1, §1.3); the crate stored and expected `B−G, G, R−G`.
+  Third-party streams decoded with B and R offset by the first
+  pixel's G unless that G happened to be 0; streams this crate wrote
+  had the mirror-image offset elsewhere.
+- **`FFVH` extensions were silently mis-decoded.** An `FFVH` stream
+  whose extradata prefix leaves the specified `HFYU` layout (planar
+  or >8-bit formats, alpha planes, per-frame tables) is now refused
+  with `Error::Unsupported`; `FFVH` streams inside the layout keep
+  decoding.
+- The encoder no longer underflows on an RGB raster with zero pixels
+  (returns an error).
+
+### Changed
+
+- `decode_frame_with_workers` and `encode_frame_with_mode_workers`
+  keep their signatures but run serially at every budget: a frame is
+  a single codeword stream with no resynchronisation point, so the
+  two-worker field-parallel paths (which only existed for the retired
+  layout) are gone. `encode_frame_auto_workers` still fans out its
+  candidate scoring.
+- Golden wire pins regenerated for the corrected format (median, all
+  decorrelated RGB cells, all cells above 288 lines).
+
 ### Added
+
+- `tests/blackbox_matrix.rs` — live interoperability matrix against a
+  black-box encoder / decoder (skips when the tool is absent):
+  380 / 380 third-party `HFYU`-layout streams bit-exact, 180 / 180
+  unspecified `FFVH` streams refused, 380 / 380 of this encoder's
+  streams accepted without a diagnostic and bit-exact.
+- `tests/foreign_pins.rs` — six tiny third-party streams pinned as
+  bytes, one per bug above.
+- `predict::{inverse_gradient_stride, forward_gradient_stride,
+  forward_decorr_gradient_stride, forward_median_yuy2,
+  inverse_median_yuy2}` — byte-position predictor passes taking the
+  prediction row length.
 
 - `StreamConfig::new(family, method, width, height)` plus
   `with_has_extradata` / `with_extradata_tables` / `with_interlace_flag`,

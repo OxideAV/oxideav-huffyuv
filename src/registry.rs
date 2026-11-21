@@ -95,11 +95,10 @@ struct HuffYuvDecoder {
     eof: bool,
     /// Advisory worker budget from [`Decoder::set_execution_context`].
     /// Defaults to 1 — per the `ExecutionContext` threading contract
-    /// the codec runs serial until told otherwise. Budgets ≥ 2 let
-    /// interlaced streams decode their two independently-coded fields
-    /// on parallel workers (round 420); the fan-out clamp
-    /// (`threads.min(units).max(1)`, `units = 2` fields) lives at the
-    /// decode site in [`decode_frame_with_workers`].
+    /// the codec runs serial until told otherwise. A frame is a single
+    /// codeword stream with no resynchronisation point (spec/02 §2,
+    /// spec/06 §3.4), so decode has one unit of work and the budget is
+    /// recorded but changes nothing; see [`decode_frame_with_workers`].
     worker_budget: usize,
 }
 
@@ -437,9 +436,9 @@ struct HuffYuvEncoder {
     /// Advisory worker budget from [`Encoder::set_execution_context`].
     /// Defaults to 1 — per the `ExecutionContext` threading contract
     /// the codec runs serial until told otherwise. Budgets ≥ 2 engage
-    /// the r420 field-parallel interlaced encode and the r429
-    /// parallel auto-selector scoring; every fan-out site clamps
-    /// inline (`threads.min(units).max(1)`).
+    /// the parallel auto-selector scoring (one candidate predictor per
+    /// worker, clamped inline to `threads.min(units).max(1)`); a
+    /// fixed-method frame has a single unit of work.
     worker_budget: usize,
 }
 
@@ -628,11 +627,10 @@ mod tests {
         assert!(ctx.codecs.encoder_options_schema(&codec_id).is_some());
     }
 
-    /// Round-420: `set_execution_context` end-to-end through the
-    /// `Decoder` trait object. A budget-2 registry decoder must emit
-    /// byte-identical frames to a default (serial) one on an
-    /// interlaced stream, and the budget must be a no-op on a
-    /// progressive stream.
+    /// `set_execution_context` end-to-end through the `Decoder` trait
+    /// object: a budget-2 registry decoder must emit byte-identical
+    /// frames to a default (serial) one on field-coded and plain
+    /// streams alike.
     #[test]
     fn round420_execution_context_budget_output_invariant() {
         use crate::encoder::{ExtradataMode, encode_frame_with_mode};
@@ -836,9 +834,8 @@ mod tests {
     }
 
     /// Round-429: the trait encoder honours `set_execution_context`
-    /// with byte-identical output across budgets — interlaced streams
-    /// engage the r420 field-parallel encode, progressive streams
-    /// treat the budget as a no-op, and the auto-selector's r429
+    /// with byte-identical output across budgets — fixed-method
+    /// frames treat the budget as a no-op, and the auto-selector's
     /// parallel candidate scoring changes nothing on the wire.
     #[test]
     fn round429_trait_budget_output_invariant() {

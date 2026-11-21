@@ -9,7 +9,7 @@ use crate::bitio::BitReader;
 use crate::error::{Error, Result};
 use crate::header::{PixelFamily, Predictor, StreamConfig};
 use crate::predict::{
-    interleave_fields, inverse_gradient_post, inverse_left_row, inverse_rgb_decorr_bgr,
+    inverse_gradient_stride, inverse_left_row, inverse_median_yuy2, inverse_rgb_decorr_bgr,
     inverse_rgb_decorr_bgra, inverse_yuy2_left_macropixel,
 };
 use crate::tables::{
@@ -37,527 +37,68 @@ pub struct DecodedFrame {
 /// `ICDecompressBegin` time; `frame_bytes` is the raw payload of one
 /// AVI `00dc` chunk.
 ///
-/// When `config.height > 288` the spec engages the field-stride=2
-/// interlaced path (spec/02 §2): the chunk holds two concatenated
-/// sub-frames (top field then bottom field), each with its own
-/// uncompressed seed + bit-packed body. We decode each field as if
-/// its own H/2-tall frame, then interleave rows back into a single
-/// `height`-row raster.
+/// A field-coded stream ([`StreamConfig::is_interlaced`], spec/06 §1)
+/// carries the same single first pixel and the same single codeword
+/// stream as a plain one; the only difference is that the predictors'
+/// "above" reference is two frame rows back (spec/06 §2.1).
 pub fn decode_frame(config: &StreamConfig, frame_bytes: &[u8]) -> Result<DecodedFrame> {
-    decode_frame_with_workers(config, frame_bytes, 1)
+    let tables = build_three_tables(config)?;
+    let predictor = config.method.predictor();
+    let decorrelate = config.method.decorrelate();
+    // Prediction row length in bytes (spec/06 §2.1): doubled when the
+    // stream is field-coded, the plain wire row otherwise.
+    let stride = if config.is_interlaced() {
+        config.row_bytes().saturating_mul(2)
+    } else {
+        config.row_bytes()
+    };
+    match config.family {
+        PixelFamily::Yuy2 => decode_yuy2_raster(
+            predictor,
+            config.width,
+            config.height,
+            stride,
+            frame_bytes,
+            &tables,
+        ),
+        PixelFamily::Rgb24 => decode_rgb24_raster(
+            predictor,
+            decorrelate,
+            config.width,
+            config.height,
+            stride,
+            frame_bytes,
+            &tables,
+        ),
+        PixelFamily::Rgb32 => decode_rgb32_raster(
+            predictor,
+            decorrelate,
+            config.width,
+            config.height,
+            stride,
+            frame_bytes,
+            &tables,
+        ),
+    }
 }
 
 /// Decode one HuffYUV frame under an explicit worker budget.
 ///
 /// `worker_budget` is the caller's advisory thread cap, in the sense of
-/// the `oxideav-core` `ExecutionContext` threading contract: the codec
-/// runs serial until told otherwise, and every internal fan-out is
-/// bounded by `budget.min(work_units).max(1)`. This crate's only
-/// independent work units are the two fields of an interlaced stream
-/// (spec/02 §2: each field is coded independently — own uncompressed
-/// seed, own bit-packed body — with the two per-field streams
-/// concatenated on the wire), so:
-///
-/// - `worker_budget <= 1`, or a progressive stream: exactly the
-///   [`decode_frame`] serial code path. Byte-identical output.
-/// - `worker_budget >= 2` AND the stream is interlaced (with a
-///   non-empty bottom field): the two fields are decoded on two
-///   parallel workers via [`decode_frame_interlaced_parallel`]. The
-///   output is byte-identical to the serial path (regression-guarded
-///   by the round-420 invariance tests + the r419 golden pins).
-///
-/// The registry `Decoder` routes its stored `ExecutionContext` budget
-/// here; direct-API callers can pass a budget explicitly. Budgets
-/// above 2 are clamped — there is no third independent unit to feed.
+/// the `oxideav-core` `ExecutionContext` threading contract. A HuffYUV
+/// frame is one first pixel followed by one variable-length codeword
+/// stream with no resynchronisation point and no per-field offset
+/// (spec/02 §2, spec/06 §3.4), so the frame has a single unit of work:
+/// every budget takes the serial path and the output is identical to
+/// [`decode_frame`]. The parameter is kept so callers holding a budget
+/// do not need a separate code path.
 pub fn decode_frame_with_workers(
     config: &StreamConfig,
     frame_bytes: &[u8],
     worker_budget: usize,
 ) -> Result<DecodedFrame> {
-    let three_tables = build_three_tables(config)?;
-    // Honour the extradata interlace_flag (BIH +0x2A) when set, falling
-    // back to the biHeight > 288 heuristic otherwise — see
-    // `StreamConfig::is_interlaced`.
-    if config.is_interlaced() {
-        // Two independently-coded fields = two parallelisable work
-        // units. Inline worker clamp per the ExecutionContext
-        // threading contract — `threads.min(units).max(1)`, written
-        // as `clamp(1, units)` with `units = 2`.
-        let workers = worker_budget.clamp(1, 2);
-        if workers >= 2 {
-            return decode_frame_interlaced_parallel(config, frame_bytes, &three_tables);
-        }
-        return decode_frame_interlaced(config, frame_bytes, &three_tables);
-    }
-    decode_field(
-        config.family,
-        config.method.predictor(),
-        config.method.decorrelate(),
-        config.width,
-        config.height,
-        frame_bytes,
-        &three_tables,
-    )
-    .map(|(frame, _consumed)| frame)
-}
-
-fn decode_frame_interlaced(
-    config: &StreamConfig,
-    frame_bytes: &[u8],
-    tables: &ThreeTables,
-) -> Result<DecodedFrame> {
-    let h = config.height as usize;
-    let top_h = h.div_ceil(2) as u32;
-    let bot_h = (h / 2) as u32;
-    let (top_frame, top_consumed) = decode_field(
-        config.family,
-        config.method.predictor(),
-        config.method.decorrelate(),
-        config.width,
-        top_h,
-        frame_bytes,
-        tables,
-    )?;
-    let bot_frame = if bot_h > 0 {
-        // A malformed/truncated top field can leave the bit cursor past
-        // the end of the chunk, so `top_consumed` may exceed the buffer
-        // length; clamp the split point to avoid a slice-bounds panic.
-        // The bottom field then sees the (possibly empty) remainder and
-        // its own length guard rejects it cleanly.
-        let split = top_consumed.min(frame_bytes.len());
-        let rest = &frame_bytes[split..];
-        let (bf, _) = decode_field(
-            config.family,
-            config.method.predictor(),
-            config.method.decorrelate(),
-            config.width,
-            bot_h,
-            rest,
-            tables,
-        )?;
-        Some(bf)
-    } else {
-        None
-    };
-    // Round-261: single source of truth (`StreamConfig::row_bytes`)
-    // for the family → wire-stride dispatch; spec/02 §3 wire-byte
-    // layout table.
-    let row_bytes = config.row_bytes();
-    let merged = if let Some(bot) = bot_frame {
-        interleave_fields(&top_frame.pixels, &bot.pixels, row_bytes, h)
-    } else {
-        top_frame.pixels
-    };
-    Ok(DecodedFrame {
-        family: config.family,
-        width: config.width,
-        height: config.height,
-        pixels: merged,
-    })
-}
-
-/// Round-420 two-worker interlaced decode.
-///
-/// The two fields of an interlaced stream are coded independently
-/// (own seed, own bit stream), but the wire carries **no bottom-field
-/// offset**: the bottom field starts at the top field's word-rounded
-/// consumed-byte count, which is only known after walking the top
-/// field's variable-length codeword stream. Field-parallel decode
-/// therefore needs a split-finding prefix:
-///
-/// - **Worker (spawned):** full top-field decode, started immediately
-///   at t=0 — it never waits on the split.
-/// - **Caller thread:** runs [`scan_field`] over the top field — a
-///   bit-exact *length-only* walk of the same codeword stream (same
-///   tables, same slot order, same `BitReader`, no pixel stores, no
-///   predictor passes, no output allocation) — to recover the split
-///   point, then decodes the bottom field from there.
-///
-/// Wall clock goes from `top + bottom` to `max(top, scan + bottom)`;
-/// the scan is cheaper than a full field decode (no raster writes, no
-/// predictor inverse), so the parallel path wins whenever the fields
-/// carry real work. Output and error behaviour are identical to the
-/// serial path: the scan consumes bit-for-bit what the top-field
-/// decode consumes (including `decode_one` failures on invalid
-/// windows, which surface identically), the split is clamped to the
-/// chunk length exactly like the serial path, and the top field's
-/// result is inspected first so a malformed top field reports the
-/// same error the serial path reports.
-fn decode_frame_interlaced_parallel(
-    config: &StreamConfig,
-    frame_bytes: &[u8],
-    tables: &ThreeTables,
-) -> Result<DecodedFrame> {
-    let h = config.height as usize;
-    let top_h = h.div_ceil(2) as u32;
-    let bot_h = (h / 2) as u32;
-    if bot_h == 0 {
-        // Single-field degenerate (forced-interlaced height 1): no
-        // second unit to parallelise; keep the serial path.
-        return decode_frame_interlaced(config, frame_bytes, tables);
-    }
-    let family = config.family;
-    let predictor = config.method.predictor();
-    let decorrelate = config.method.decorrelate();
-    let width = config.width;
-    let (top_joined, bot_result) = std::thread::scope(|s| {
-        let top_handle = s.spawn(|| {
-            decode_field(
-                family,
-                predictor,
-                decorrelate,
-                width,
-                top_h,
-                frame_bytes,
-                tables,
-            )
-        });
-        // Same clamp as the serial path: a malformed/truncated top
-        // field can push the scan cursor past the end of the chunk;
-        // the bottom field then sees the (possibly empty) remainder
-        // and its own length guard rejects it cleanly.
-        let bot_result = scan_field(family, decorrelate, width, top_h, frame_bytes, tables)
-            .and_then(|top_consumed| {
-                let split = top_consumed.min(frame_bytes.len());
-                decode_field(
-                    family,
-                    predictor,
-                    decorrelate,
-                    width,
-                    bot_h,
-                    &frame_bytes[split..],
-                    tables,
-                )
-            });
-        (top_handle.join(), bot_result)
-    });
-    let (top_frame, _top_consumed) = match top_joined {
-        Ok(res) => res?,
-        Err(panic) => std::panic::resume_unwind(panic),
-    };
-    let (bot_frame, _bot_consumed) = bot_result?;
-    // Round-261: single source of truth (`StreamConfig::row_bytes`)
-    // for the family → wire-stride dispatch; spec/02 §3 wire-byte
-    // layout table.
-    let row_bytes = config.row_bytes();
-    let merged = interleave_fields(&top_frame.pixels, &bot_frame.pixels, row_bytes, h);
-    Ok(DecodedFrame {
-        family: config.family,
-        width: config.width,
-        height: config.height,
-        pixels: merged,
-    })
-}
-
-/// Decode one field (or one full progressive frame).  Returns the
-/// reconstructed pixels plus the byte count consumed from
-/// `frame_bytes` (used by the interlaced path to find the start of
-/// the bottom field).
-fn decode_field(
-    family: PixelFamily,
-    predictor: Predictor,
-    decorrelate: bool,
-    width: u32,
-    height: u32,
-    frame_bytes: &[u8],
-    tables: &ThreeTables,
-) -> Result<(DecodedFrame, usize)> {
-    match family {
-        PixelFamily::Yuy2 => decode_yuy2_field(predictor, width, height, frame_bytes, tables),
-        PixelFamily::Rgb24 => {
-            decode_rgb24_field(predictor, decorrelate, width, height, frame_bytes, tables)
-        }
-        PixelFamily::Rgb32 => {
-            decode_rgb32_field(predictor, decorrelate, width, height, frame_bytes, tables)
-        }
-    }
-}
-
-/// Round-420 split scanner: walk one field's entropy stream and
-/// return the byte count `decode_field` would report as consumed —
-/// WITHOUT reconstructing pixels, running predictor inverses, or
-/// allocating an output raster.
-///
-/// This is the split-finding prefix of the two-worker interlaced
-/// path: the wire carries no bottom-field offset, so the caller
-/// thread scans the top field's codeword stream to learn where the
-/// bottom field's seed starts while a second worker performs the full
-/// top-field decode in parallel.
-///
-/// Bit-exactness contract (guarded by the round-420 scan-equivalence
-/// tests): for every input on which `decode_field` succeeds, the scan
-/// consumes the identical bit count — it replicates the per-family
-/// dimension guards, the slot order of every codeword (spec/02 §3 /
-/// spec/03 §1.4 wire cycles), and the shared `BitReader` word-rounded
-/// [`BitReader::bytes_consumed`] tail — and for every input on which
-/// `decode_field` fails inside the entropy loop, the scan fails with
-/// the same error. (`decode_field` errors that fire *after* the
-/// entropy loop — the RGB median-illegal check — are not replicated
-/// here; the parallel caller surfaces them from the top-field decode
-/// result, which it inspects first.)
-///
-/// The predictor never affects the bit stream (spec/02 §5: byte
-/// ordering, channel-table assignment and bit packing are
-/// predictor-independent), so the scanner takes no `Predictor`.
-fn scan_field(
-    family: PixelFamily,
-    decorrelate: bool,
-    width: u32,
-    height: u32,
-    frame_bytes: &[u8],
-    tables: &ThreeTables,
-) -> Result<usize> {
-    match family {
-        PixelFamily::Yuy2 => scan_yuy2_field(width, height, frame_bytes, tables),
-        PixelFamily::Rgb24 | PixelFamily::Rgb32 => {
-            scan_rgb_field(family, decorrelate, width, height, frame_bytes, tables)
-        }
-    }
-}
-
-/// YUY2 arm of [`scan_field`]. Mirrors `decode_yuy2_field`'s guards
-/// and its macropixel-step entropy loop (slot cycle `+0 → slot1,
-/// +1 → slot2, +2 → slot1, +3 → slot3`; paired window reads with the
-/// sequential long-code fallback) with the stores elided.
-fn scan_yuy2_field(
-    width: u32,
-    height: u32,
-    frame_bytes: &[u8],
-    tables: &ThreeTables,
-) -> Result<usize> {
-    let width_us = width as usize;
-    let height_us = height as usize;
-    if !width_us.is_multiple_of(2) {
-        return Err(Error::invalid("YUY2 width must be even"));
-    }
-    let row_bytes = PixelFamily::Yuy2.row_bytes(width);
-    let total_bytes = row_bytes * height_us;
-    if total_bytes < 4 {
-        return Err(Error::invalid(
-            "YUY2 frame: degenerate dimensions (need ≥ 1 macropixel)",
-        ));
-    }
-    if frame_bytes.len() < 4 {
-        return Err(Error::invalid(
-            "YUY2 frame: missing 4-byte uncompressed pixel",
-        ));
-    }
-    let mut reader = BitReader::new(&frame_bytes[4..]);
-    let body_end = total_bytes - ((total_bytes - 4) & 3);
-    let mut byte_idx = 4usize;
-    // Round-420 pair-length LUTs: one 8-bit load resolves the summed
-    // bit length of two codewords when the pair fits inside the 16
-    // known window bits (`tables::build_pair_len_lut` soundness note);
-    // `0` falls back to the exact decode_pair / decode_one walk the
-    // decoder itself uses, so the consumed bit count stays identical.
-    let lut12 = tables.scan_lut_s1s2();
-    let lut13 = tables.scan_lut_s1s3();
-    while byte_idx < body_end {
-        // (Y₁ → slot1, U → slot2)
-        let w = reader.peek_window();
-        let s = lut12[(w >> 16) as usize];
-        if s != 0 {
-            reader.consume_bits_trusted(s as u32);
-        } else if let Some((_, _, n)) = decode_pair(&tables.slot1, &tables.slot2, w) {
-            reader.consume_bits_trusted(n);
-        } else {
-            let (_, len_y1) = decode_one(&tables.slot1, w)?;
-            reader.consume_bits_trusted(len_y1 as u32);
-            let (_, len_u) = decode_one(&tables.slot2, reader.peek_window())?;
-            reader.consume_bits_trusted(len_u as u32);
-        }
-        // (Y₂ → slot1, V → slot3)
-        let w = reader.peek_window();
-        let s = lut13[(w >> 16) as usize];
-        if s != 0 {
-            reader.consume_bits_trusted(s as u32);
-        } else if let Some((_, _, n)) = decode_pair(&tables.slot1, &tables.slot3, w) {
-            reader.consume_bits_trusted(n);
-        } else {
-            let (_, len_y2) = decode_one(&tables.slot1, w)?;
-            reader.consume_bits_trusted(len_y2 as u32);
-            let (_, len_v) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits_trusted(len_v as u32);
-        }
-        byte_idx += 4;
-    }
-    // Scalar fall-through mirror of the decode loop's 1..=3-byte tail
-    // (unreachable for in-spec YUY2 input; kept so the scan stays
-    // bit-exact even on unforeseen future layouts).
-    while byte_idx < total_bytes {
-        let slot = match byte_idx % 4 {
-            0 | 2 => &tables.slot1,
-            1 => &tables.slot2,
-            _ => &tables.slot3,
-        };
-        let (_, len) = decode_one(slot, reader.peek_window())?;
-        reader.consume_bits_trusted(len as u32);
-        byte_idx += 1;
-    }
-    Ok(4 + reader.bytes_consumed())
-}
-
-/// RGB arm of [`scan_field`], shared between RGB24 and RGB32.
-/// Mirrors `decode_rgb24_field` / `decode_rgb32_field`: the same
-/// dimension guards (via the same saturating
-/// [`PixelFamily::row_bytes`] accessor), the same mode-resolved
-/// first-two-position slot binding (spec/03 §1.4: `B, G` no-decorr /
-/// `G, B−G` decorr), position +2 (R / R−G) via slot3, and — RGB32
-/// only — position +3 (A) via slot3.
-fn scan_rgb_field(
-    family: PixelFamily,
-    decorrelate: bool,
-    width: u32,
-    height: u32,
-    frame_bytes: &[u8],
-    tables: &ThreeTables,
-) -> Result<usize> {
-    debug_assert!(matches!(family, PixelFamily::Rgb24 | PixelFamily::Rgb32));
-    let is_rgb32 = matches!(family, PixelFamily::Rgb32);
-    let width_us = width as usize;
-    let height_us = height as usize;
-    let row_bytes = family.row_bytes(width);
-    let total_bytes = row_bytes * height_us;
-    if is_rgb32 {
-        if total_bytes < 4 {
-            return Err(Error::invalid(
-                "RGB32 frame: degenerate dimensions (need ≥ 1 pixel)",
-            ));
-        }
-    } else if total_bytes < 3 {
-        return Err(Error::invalid(
-            "RGB24 frame: degenerate dimensions (need ≥ 1 pixel)",
-        ));
-    }
-    if frame_bytes.len() < 4 {
-        return Err(Error::invalid(if is_rgb32 {
-            "RGB32 frame: missing 4-byte uncompressed pixel"
-        } else {
-            "RGB24 frame: missing 4-byte uncompressed pixel"
-        }));
-    }
-    let mut reader = BitReader::new(&frame_bytes[4..]);
-    let (s_w0, s_w1) = if decorrelate {
-        (&tables.slot2, &tables.slot1)
-    } else {
-        (&tables.slot1, &tables.slot2)
-    };
-    // Round-420 pair-length LUTs (see the YUY2 scanner note): the
-    // first two wire positions resolve through the mode-matched pair
-    // LUT, RGB32's (+2, +3) pair through the slot3/slot3 LUT.
-    let lut01 = if decorrelate {
-        tables.scan_lut_s2s1()
-    } else {
-        tables.scan_lut_s1s2()
-    };
-    let n_pixels = width_us * height_us;
-    if is_rgb32 {
-        let lut33 = tables.scan_lut_s3s3();
-        for _px in 1..n_pixels {
-            let w = reader.peek_window();
-            let s = lut01[(w >> 16) as usize];
-            if s != 0 {
-                reader.consume_bits_trusted(s as u32);
-            } else if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
-                reader.consume_bits_trusted(n);
-            } else {
-                let (_, l0) = decode_one(s_w0, w)?;
-                reader.consume_bits_trusted(l0 as u32);
-                let (_, l1) = decode_one(s_w1, reader.peek_window())?;
-                reader.consume_bits_trusted(l1 as u32);
-            }
-            // Wire positions +2 (R or R−G) and +3 (A) both use the
-            // slot-3 codebook (spec/03 §1.2; alpha shares slot 3).
-            let w = reader.peek_window();
-            let s = lut33[(w >> 16) as usize];
-            if s != 0 {
-                reader.consume_bits_trusted(s as u32);
-            } else if let Some((_, _, n)) = decode_pair(&tables.slot3, &tables.slot3, w) {
-                reader.consume_bits_trusted(n);
-            } else {
-                let (_, l2) = decode_one(&tables.slot3, w)?;
-                reader.consume_bits_trusted(l2 as u32);
-                let (_, l3) = decode_one(&tables.slot3, reader.peek_window())?;
-                reader.consume_bits_trusted(l3 as u32);
-            }
-        }
-        return Ok(4 + reader.bytes_consumed());
-    }
-    // RGB24: round-440 phase-flip pairing, mirroring the decode
-    // body's two-pixel step — the six codewords of a pixel pair group
-    // as (w0, w1), (w2, w0′), (w1′, w2′) with the middle pair
-    // crossing the pixel boundary, so the scan's critical path rides
-    // one pair-length LUT load per two codewords instead of leaving
-    // every +2 → slot3 position on a lone `decode_one`. Fallbacks are
-    // the exact decode_pair / decode_one walk, so the consumed bit
-    // count stays identical (round420 scan/decode equivalence
-    // suites); an odd body-pixel count finishes on the single-pixel
-    // arm.
-    let (lut_2w0, lut_w12) = if decorrelate {
-        (tables.scan_lut_s3s2(), tables.scan_lut_s1s3())
-    } else {
-        (tables.scan_lut_s3s1(), tables.scan_lut_s2s3())
-    };
-    let mut px = 1usize;
-    while px + 1 < n_pixels {
-        // Pair 1: (w0, w1) of pixel A.
-        let w = reader.peek_window();
-        let s = lut01[(w >> 16) as usize];
-        if s != 0 {
-            reader.consume_bits_trusted(s as u32);
-        } else if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
-            reader.consume_bits_trusted(n);
-        } else {
-            let (_, l0) = decode_one(s_w0, w)?;
-            reader.consume_bits_trusted(l0 as u32);
-            let (_, l1) = decode_one(s_w1, reader.peek_window())?;
-            reader.consume_bits_trusted(l1 as u32);
-        }
-        // Pair 2 (phase flip): (w2 of A → slot3, w0 of B).
-        let w = reader.peek_window();
-        let s = lut_2w0[(w >> 16) as usize];
-        if s != 0 {
-            reader.consume_bits_trusted(s as u32);
-        } else if let Some((_, _, n)) = decode_pair(&tables.slot3, s_w0, w) {
-            reader.consume_bits_trusted(n);
-        } else {
-            let (_, l2) = decode_one(&tables.slot3, w)?;
-            reader.consume_bits_trusted(l2 as u32);
-            let (_, l0b) = decode_one(s_w0, reader.peek_window())?;
-            reader.consume_bits_trusted(l0b as u32);
-        }
-        // Pair 3: (w1 of B, w2 of B → slot3).
-        let w = reader.peek_window();
-        let s = lut_w12[(w >> 16) as usize];
-        if s != 0 {
-            reader.consume_bits_trusted(s as u32);
-        } else if let Some((_, _, n)) = decode_pair(s_w1, &tables.slot3, w) {
-            reader.consume_bits_trusted(n);
-        } else {
-            let (_, l1b) = decode_one(s_w1, w)?;
-            reader.consume_bits_trusted(l1b as u32);
-            let (_, l2b) = decode_one(&tables.slot3, reader.peek_window())?;
-            reader.consume_bits_trusted(l2b as u32);
-        }
-        px += 2;
-    }
-    if px < n_pixels {
-        let w = reader.peek_window();
-        let s = lut01[(w >> 16) as usize];
-        if s != 0 {
-            reader.consume_bits_trusted(s as u32);
-        } else if let Some((_, _, n)) = decode_pair(s_w0, s_w1, w) {
-            reader.consume_bits_trusted(n);
-        } else {
-            let (_, l0) = decode_one(s_w0, w)?;
-            reader.consume_bits_trusted(l0 as u32);
-            let (_, l1) = decode_one(s_w1, reader.peek_window())?;
-            reader.consume_bits_trusted(l1 as u32);
-        }
-        let (_, l2) = decode_one(&tables.slot3, reader.peek_window())?;
-        reader.consume_bits_trusted(l2 as u32);
-    }
-    Ok(4 + reader.bytes_consumed())
+    let _ = worker_budget;
+    decode_frame(config, frame_bytes)
 }
 
 /// The three per-channel-slot Huffman tables (spec/03 §1.2 slot
@@ -572,47 +113,12 @@ pub(crate) struct ThreeTables {
     pub(crate) slot1: HuffTable,
     pub(crate) slot2: HuffTable,
     pub(crate) slot3: HuffTable,
-    /// Round-420: lazily-built pair-length LUTs for the interlaced
-    /// split scanner (see [`ScanLuts`]). `Default`-initialised empty;
-    /// built on first budget-≥ 2 interlaced decode of the stream and
-    /// reused for its lifetime via the round-419 table cache.
-    pub(crate) scan_luts: ScanLuts,
     /// Round-429: lazily-built full pair LUTs for the serial decode
     /// loops (see [`PairSymLuts`]) — both symbols + combined length in
     /// one 32-bit load. `Default`-initialised empty; built on the
     /// first decode of the stream that walks the pair and reused for
     /// its lifetime via the round-419 table cache.
     pub(crate) pair_sym_luts: PairSymLuts,
-}
-
-/// Lazily-built scan-side pair-length LUTs
-/// ([`crate::tables::build_pair_len_lut`]), one per (first-slot,
-/// second-slot) pair the field scanners consume:
-///
-/// - `s1s2` — YUY2 `(Y₁ → slot1, U → slot2)`; also RGB no-decorr
-///   `(B → slot1, G → slot2)`.
-/// - `s1s3` — YUY2 `(Y₂ → slot1, V → slot3)`; also RGB24 decorr
-///   phase-flip `(next B−G → slot1, next R−G → slot3)` (round 440).
-/// - `s2s1` — RGB decorr `(G → slot2, B−G → slot1)`.
-/// - `s3s3` — RGB32 `(R/R−G → slot3, A → slot3)`.
-/// - `s3s1` / `s2s3` / `s3s2` — round-440 RGB24 phase-flip combos
-///   (see [`PairSymLuts`]): `(R → slot3, next B → slot1)` +
-///   `(next G → slot2, next R → slot3)` no-decorr, and
-///   `(R−G → slot3, next G → slot2)` decorr.
-///
-/// Each is 64 KiB and built at most once per cached `ThreeTables`
-/// (`OnceLock`), only when the two-worker interlaced path actually
-/// scans with that pair — progressive and serial decodes never pay
-/// for them.
-#[derive(Debug, Default)]
-pub(crate) struct ScanLuts {
-    s1s2: std::sync::OnceLock<Box<[u8]>>,
-    s1s3: std::sync::OnceLock<Box<[u8]>>,
-    s2s1: std::sync::OnceLock<Box<[u8]>>,
-    s3s3: std::sync::OnceLock<Box<[u8]>>,
-    s3s1: std::sync::OnceLock<Box<[u8]>>,
-    s2s3: std::sync::OnceLock<Box<[u8]>>,
-    s3s2: std::sync::OnceLock<Box<[u8]>>,
 }
 
 /// Lazily-built decode-side full pair LUTs
@@ -685,42 +191,6 @@ impl ThreeTables {
             .s3s2
             .get_or_init(|| crate::tables::build_pair_sym_lut(&self.slot3, &self.slot2))
     }
-
-    fn scan_lut_s1s2(&self) -> &[u8] {
-        self.scan_luts
-            .s1s2
-            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot1, &self.slot2))
-    }
-    fn scan_lut_s1s3(&self) -> &[u8] {
-        self.scan_luts
-            .s1s3
-            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot1, &self.slot3))
-    }
-    fn scan_lut_s2s1(&self) -> &[u8] {
-        self.scan_luts
-            .s2s1
-            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot2, &self.slot1))
-    }
-    fn scan_lut_s3s3(&self) -> &[u8] {
-        self.scan_luts
-            .s3s3
-            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot3, &self.slot3))
-    }
-    fn scan_lut_s3s1(&self) -> &[u8] {
-        self.scan_luts
-            .s3s1
-            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot3, &self.slot1))
-    }
-    fn scan_lut_s2s3(&self) -> &[u8] {
-        self.scan_luts
-            .s2s3
-            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot2, &self.slot3))
-    }
-    fn scan_lut_s3s2(&self) -> &[u8] {
-        self.scan_luts
-            .s3s2
-            .get_or_init(|| crate::tables::build_pair_len_lut(&self.slot3, &self.slot2))
-    }
 }
 
 /// Round-419 decode-table cache.
@@ -782,7 +252,6 @@ pub(crate) mod table_cache {
             slot1: HuffTable::build_from_lengths(&lengths[0])?,
             slot2: HuffTable::build_from_lengths(&lengths[1])?,
             slot3: HuffTable::build_from_lengths(&lengths[2])?,
-            scan_luts: ScanLuts::default(),
             pair_sym_luts: PairSymLuts::default(),
         });
         if let Ok(mut map) = extradata_cache().lock() {
@@ -823,7 +292,6 @@ pub(crate) mod table_cache {
                 slot1: table_a.clone(),
                 slot2: table_a.clone(),
                 slot3: table_a,
-                scan_luts: ScanLuts::default(),
                 pair_sym_luts: PairSymLuts::default(),
             });
         }
@@ -837,7 +305,6 @@ pub(crate) mod table_cache {
             slot1: table_a,
             slot2: table_b.clone(),
             slot3: table_b,
-            scan_luts: ScanLuts::default(),
             pair_sym_luts: PairSymLuts::default(),
         })
     }
@@ -864,13 +331,14 @@ fn build_three_tables(config: &StreamConfig) -> Result<std::sync::Arc<ThreeTable
     }
 }
 
-fn decode_yuy2_field(
+fn decode_yuy2_raster(
     predictor: Predictor,
     width: u32,
     height: u32,
+    stride: usize,
     frame_bytes: &[u8],
     tables: &ThreeTables,
-) -> Result<(DecodedFrame, usize)> {
+) -> Result<DecodedFrame> {
     let width_us = width as usize;
     let height_us = height as usize;
     if !width_us.is_multiple_of(2) {
@@ -1023,33 +491,30 @@ fn decode_yuy2_field(
         }
         Predictor::Gradient => {
             inverse_yuy2_left_macropixel(&mut pixels, 4, total_bytes);
-            inverse_gradient_post(&mut pixels, row_bytes, height_us);
+            inverse_gradient_stride(&mut pixels, stride);
         }
         Predictor::Median => {
-            inverse_yuy2_median(&mut pixels, row_bytes);
+            inverse_median_yuy2(&mut pixels, stride);
         }
     }
 
-    let consumed = 4 + reader.bytes_consumed();
-    Ok((
-        DecodedFrame {
-            family: PixelFamily::Yuy2,
-            width,
-            height,
-            pixels,
-        },
-        consumed,
-    ))
+    Ok(DecodedFrame {
+        family: PixelFamily::Yuy2,
+        width,
+        height,
+        pixels,
+    })
 }
 
-fn decode_rgb24_field(
+fn decode_rgb24_raster(
     predictor: Predictor,
     decorrelate: bool,
     width: u32,
     height: u32,
+    stride: usize,
     frame_bytes: &[u8],
     tables: &ThreeTables,
-) -> Result<(DecodedFrame, usize)> {
+) -> Result<DecodedFrame> {
     let width_us = width as usize;
     let height_us = height as usize;
     // Round-262: family → wire-stride via the round-261 accessor
@@ -1232,43 +697,47 @@ fn decode_rgb24_field(
         pixels[bgr_off + 2] = v2;
     }
 
-    let consumed = 4 + reader.bytes_consumed();
-
-    // Predictor inverse on the per-channel residual stream. Channels
-    // are interleaved 3-byte BGR; LEFT walks each channel via stride
-    // 3.
-    inverse_left_row(&mut pixels, 3);
-    match predictor {
-        Predictor::Left => {}
-        Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height_us),
-        Predictor::Median => {
-            return Err(Error::invalid("median predictor not legal for RGB"));
-        }
+    if predictor == Predictor::Median {
+        return Err(Error::invalid("median predictor not legal for RGB"));
     }
     if decorrelate {
-        // Inverse decorrelation: B = (B-G) + G, R = (R-G) + G.
+        // The first pixel is stored as the plain input bytes (spec/03
+        // §1.1 / §1.3, spec/02 §8 #6) while every residual is taken on
+        // the decorrelated channels (spec/03 §2.4.1), so move the first
+        // pixel into the decorrelated domain before chaining from it.
+        let g0 = pixels[1];
+        pixels[0] = pixels[0].wrapping_sub(g0);
+        pixels[2] = pixels[2].wrapping_sub(g0);
+    }
+    // Per-channel LEFT inverse over the interleaved raster, then the
+    // gradient post-pass (spec/03 §2.2.2) with the prediction row
+    // length of spec/06 §2.1.
+    inverse_left_row(&mut pixels, 3);
+    if predictor == Predictor::Gradient {
+        inverse_gradient_stride(&mut pixels, stride);
+    }
+    if decorrelate {
+        // Inverse decorrelation: B = (B−G) + G, R = (R−G) + G.
         inverse_rgb_decorr_bgr(&mut pixels);
     }
 
-    Ok((
-        DecodedFrame {
-            family: PixelFamily::Rgb24,
-            width,
-            height,
-            pixels,
-        },
-        consumed,
-    ))
+    Ok(DecodedFrame {
+        family: PixelFamily::Rgb24,
+        width,
+        height,
+        pixels,
+    })
 }
 
-fn decode_rgb32_field(
+fn decode_rgb32_raster(
     predictor: Predictor,
     decorrelate: bool,
     width: u32,
     height: u32,
+    stride: usize,
     frame_bytes: &[u8],
     tables: &ThreeTables,
-) -> Result<(DecodedFrame, usize)> {
+) -> Result<DecodedFrame> {
     let width_us = width as usize;
     let height_us = height as usize;
     // Round-262: family → wire-stride via the round-261 accessor
@@ -1372,140 +841,36 @@ fn decode_rgb32_field(
         }
     }
 
-    let consumed = 4 + reader.bytes_consumed();
-
-    // Per-channel LEFT inverse, stride 4.
-    inverse_left_row(&mut pixels, 4);
-    match predictor {
-        Predictor::Left => {}
-        Predictor::Gradient => inverse_gradient_post(&mut pixels, row_bytes, height_us),
-        Predictor::Median => {
-            return Err(Error::invalid("median predictor not legal for RGB"));
-        }
+    if predictor == Predictor::Median {
+        return Err(Error::invalid("median predictor not legal for RGB"));
     }
     if decorrelate {
+        // The first pixel is stored as the plain input bytes (spec/03
+        // §1.1 / §1.3, spec/02 §8 #6) while every residual is taken on
+        // the decorrelated channels (spec/03 §2.4.1), so move the first
+        // pixel into the decorrelated domain before chaining from it.
+        let g0 = pixels[1];
+        pixels[0] = pixels[0].wrapping_sub(g0);
+        pixels[2] = pixels[2].wrapping_sub(g0);
+    }
+    // Per-channel LEFT inverse over the interleaved raster, then the
+    // gradient post-pass (spec/03 §2.2.2) with the prediction row
+    // length of spec/06 §2.1.
+    inverse_left_row(&mut pixels, 4);
+    if predictor == Predictor::Gradient {
+        inverse_gradient_stride(&mut pixels, stride);
+    }
+    if decorrelate {
+        // Inverse decorrelation: B = (B−G) + G, R = (R−G) + G.
         inverse_rgb_decorr_bgra(&mut pixels);
     }
 
-    Ok((
-        DecodedFrame {
-            family: PixelFamily::Rgb32,
-            width,
-            height,
-            pixels,
-        },
-        consumed,
-    ))
-}
-
-/// YUY2 MEDIAN inverse: spec/03 §2.3.2. LEFT-predicts row 0 + the
-/// first 8 wire bytes of row 1, then per-byte median add for rows 1
-/// pos ≥ 8 + every later row.
-///
-/// Round-202: strip the two dead branches the median tail-loop had
-/// been carrying since round 1. After the LEFT-exemption pass the
-/// loop start is at `row_bytes + 8` (capped at `len`), so for every
-/// iteration `pos >= row_bytes + 8 >= 8 >= 2` and `pos - row_bytes >=
-/// 8 >= 2` — i.e. neither `pos < 2 || pos < row_bytes` nor `pos <
-/// row_bytes + 2` is ever true here, so both `if`-arms were dead.
-/// The cleanup leaves a single straight-line per-byte median body
-/// whose three lookback indices (`pos - 2`, `pos - row_bytes`, `pos -
-/// row_bytes - 2`) are all provably in-bounds. Spec/03 §2.3.2 +
-/// audit/01 §7.2 anchor the wire-byte LEFT exemption that makes
-/// the AL-lookback safe without a per-iteration guard.
-///
-/// Round-208: drops three single-use decoder-local wrappers
-/// (`inverse_left_per_channel`, `inverse_yuy2_left`,
-/// `inverse_yuy2_left_range`) and consumes the public predict-side
-/// helpers directly. `inverse_left_per_channel` was a byte-for-byte
-/// duplicate of `predict::inverse_left_row`, and the two YUY2-LEFT
-/// shims were thin pass-throughs into
-/// `predict::inverse_yuy2_left_macropixel` already (left over from
-/// the round-181 macropixel-step rewrite). Single source of truth
-/// for both predictors now lives in `predict.rs`.
-fn inverse_yuy2_median(out: &mut [u8], row_bytes: usize) {
-    let len = out.len();
-    if len <= 4 {
-        return;
-    }
-    // Row 0 LEFT pass.
-    let row0_end = row_bytes.min(len);
-    inverse_yuy2_left_macropixel(out, 4, row0_end);
-    // First 8 bytes of row 1 (LEFT exemption).
-    if len <= row_bytes {
-        return;
-    }
-    let row1_left_end = (row_bytes + 8).min(len);
-    inverse_yuy2_left_macropixel(out, row_bytes, row1_left_end);
-    if row1_left_end >= len {
-        return;
-    }
-    // Median per-byte add for the remaining bytes of row 1 + all
-    // rows ≥ 2. spec/03 §2.3 trace: L at -2, A at -row_stride,
-    // AL at -row_stride - 2. With `row1_left_end >= row_bytes + 8`,
-    // every lookback below is in-bounds.
-    //
-    // Round-255: rewrite as a half-macropixel (2-byte) step body to
-    // expose instruction-level parallelism between the two independent
-    // median computations within each step, mirroring the predict-side
-    // r253 macropixel-step rewrite shape but at half the unroll factor
-    // (the inverse predictor reads L from the same `out` buffer it
-    // writes to, so the L source at intra-step offset +2 / +3 would
-    // alias the writes at intra-step offset +0 / +1 — a 4-byte unroll
-    // would introduce a read-after-write within the unrolled body).
-    //
-    // At a 2-byte step, both L sources within the step
-    // (`out[pos - 2]`, `out[pos - 1]`) are read from positions
-    // finalised before the step began — the previous step's writes
-    // (or the LEFT-region bytes, for the very first step at
-    // `pos = row_bytes + 8`). The two `gradient_predictor → median3
-    // → wrapping_add` chains for the step's two output bytes are
-    // therefore independent and the compiler is free to schedule
-    // them across functional units.
-    //
-    // `row1_left_end = (row_bytes + 8).min(len)` is always a multiple
-    // of 2 for in-spec YUY2 input (row_bytes = 2 × width ⇒ row_bytes
-    // ≡ 0 mod 2, plus the +8 keeps the alignment), so the 2-byte
-    // step body covers every wire byte in the median region. A 1-byte
-    // scalar fall-through is kept for defence-in-depth, mirroring the
-    // r221 / r227 / r239 / r242 / r245 / r250 / r253 fall-throughs.
-    //
-    // Bit-identical to the pre-r255 per-byte body — regression-guarded
-    // by `round255_inverse_yuy2_median_step_*` tests below.
-    debug_assert!(row1_left_end >= row_bytes + 2);
-    let body_end = len - ((len - row1_left_end) & 1);
-    let mut pos = row1_left_end;
-    while pos < body_end {
-        // Two independent per-byte median adds per outer step. Each
-        // pair reads from disjoint reference offsets and writes to
-        // disjoint output offsets; the writes do not feed back into
-        // the reads within the same step.
-        let l0 = out[pos - 2];
-        let a0 = out[pos - row_bytes];
-        let al0 = out[pos - row_bytes - 2];
-        let l1 = out[pos - 1];
-        let a1 = out[pos + 1 - row_bytes];
-        let al1 = out[pos - row_bytes - 1];
-        let g0 = l0.wrapping_add(a0).wrapping_sub(al0);
-        let g1 = l1.wrapping_add(a1).wrapping_sub(al1);
-        let p0 = crate::predict::median3(l0, a0, g0);
-        let p1 = crate::predict::median3(l1, a1, g1);
-        out[pos] = out[pos].wrapping_add(p0);
-        out[pos + 1] = out[pos + 1].wrapping_add(p1);
-        pos += 2;
-    }
-    // Tail (0..=1 bytes after the last whole 2-byte step). In practice
-    // in-spec YUY2 input keeps `len − row1_left_end` even, so this
-    // loop runs zero times; kept for robustness.
-    while pos < len {
-        let l = out[pos - 2];
-        let a = out[pos - row_bytes];
-        let al = out[pos - row_bytes - 2];
-        let g = l.wrapping_add(a).wrapping_sub(al);
-        let predictor = crate::predict::median3(l, a, g);
-        out[pos] = out[pos].wrapping_add(predictor);
-        pos += 1;
-    }
+    Ok(DecodedFrame {
+        family: PixelFamily::Rgb32,
+        width,
+        height,
+        pixels,
+    })
 }
 
 #[cfg(test)]
@@ -1564,10 +929,9 @@ mod degenerate_dims_tests {
     }
 
     #[test]
-    fn interlaced_truncated_top_field_no_panic() {
-        // height > 288 engages the interlaced path; a tiny frame body
-        // makes the top field over-consume so the bottom-field split
-        // point would exceed the buffer. Must not panic.
+    fn field_coded_truncated_frame_no_panic() {
+        // height > 288 engages field coding; a frame body far shorter
+        // than the raster needs must not panic.
         let c = cfg(PixelFamily::Yuy2, Method::Left, 2, 290);
         let frame = [0u8; 8];
         let _ = decode_frame(&c, &frame); // Ok or Err, never panic.
@@ -1830,10 +1194,10 @@ mod round214_yuy2_decode_macropixel_tests {
                 }
                 Method::Gradient => {
                     crate::predict::inverse_yuy2_left_macropixel(&mut ref_pixels, 4, len);
-                    crate::predict::inverse_gradient_post(&mut ref_pixels, row_bytes, h as usize);
+                    crate::predict::inverse_gradient_stride(&mut ref_pixels, row_bytes);
                 }
                 Method::Median => {
-                    super::inverse_yuy2_median(&mut ref_pixels, row_bytes);
+                    crate::predict::inverse_median_yuy2(&mut ref_pixels, row_bytes);
                 }
                 _ => unreachable!("YUY2 doesn't carry decorrelating methods"),
             }
@@ -1841,209 +1205,6 @@ mod round214_yuy2_decode_macropixel_tests {
             // And the production decoder must also round-trip.
             let prod = decode_frame(&cfg, &frame).expect("decode");
             assert_eq!(prod.pixels, pixels, "production decode must round-trip");
-        }
-    }
-}
-
-#[cfg(test)]
-mod round255_inverse_yuy2_median_step_tests {
-    //! Round-255 regression guard. The decoder's
-    //! [`super::inverse_yuy2_median`] median-region body was rewritten
-    //! from a per-byte add loop into a half-macropixel (2-byte) step
-    //! body, mirroring r253's predict-side macropixel-step rewrite shape
-    //! at half the unroll factor.
-    //!
-    //! The inverse predictor reads `L` from the same `out` buffer it
-    //! writes to. A 4-byte unroll like r253's predict-side body would
-    //! introduce read-after-write aliasing (intra-step offset +2 / +3
-    //! reads `out[pos] / out[pos + 1]`, which are the writes from
-    //! intra-step offset +0 / +1). The 2-byte step body avoids this:
-    //! both L sources within a step (`out[pos - 2]`, `out[pos - 1]`)
-    //! are finalised before the step begins, so the two median chains
-    //! within a step are independent and the compiler can schedule
-    //! them across functional units. Successive 2-byte steps still
-    //! carry the natural sequential L dependency the median predictor
-    //! requires per spec/03 §2.3.
-    //!
-    //! These tests pin the rewrite at byte-equality against an inlined
-    //! copy of the pre-r255 per-byte body, cover the modular-wrap edge,
-    //! pin the `(len − row1_left_end) % 2 == 0` alignment invariant the
-    //! step body relies on, exercise the 1-byte scalar tail
-    //! fall-through, and run the encoder→decoder roundtrip across the
-    //! same YUY2 widths the r253 forward tests cover (so any drift
-    //! between forward and inverse predictor would surface as a
-    //! roundtrip mismatch even before the per-byte witness fires).
-    use crate::encoder::{ExtradataMode, encode_frame_with_mode};
-    use crate::header::{Method, PixelFamily, StreamConfig};
-    use crate::predict::median3;
-
-    /// Inlined copy of the pre-r255 decoder median body, used as the
-    /// per-byte reference oracle. Identical semantics to the
-    /// production code path before the 2-byte step rewrite.
-    fn ref_inverse_yuy2_median_per_byte(out: &mut [u8], row_bytes: usize) {
-        let len = out.len();
-        if len <= 4 {
-            return;
-        }
-        let row0_end = row_bytes.min(len);
-        crate::predict::inverse_yuy2_left_macropixel(out, 4, row0_end);
-        if len <= row_bytes {
-            return;
-        }
-        let row1_left_end = (row_bytes + 8).min(len);
-        crate::predict::inverse_yuy2_left_macropixel(out, row_bytes, row1_left_end);
-        if row1_left_end >= len {
-            return;
-        }
-        for pos in row1_left_end..len {
-            let l = out[pos - 2];
-            let a = out[pos - row_bytes];
-            let al = out[pos - row_bytes - 2];
-            let g = l.wrapping_add(a).wrapping_sub(al);
-            let predictor = median3(l, a, g);
-            out[pos] = out[pos].wrapping_add(predictor);
-        }
-    }
-
-    /// Deterministic byte stream — the median-region body is exercised
-    /// regardless of input statistics because every input byte feeds
-    /// into the lookback chain on subsequent rows.
-    fn synth_residuals(n: usize, seed: u32) -> Vec<u8> {
-        let mut s = seed | 1;
-        let mut out = vec![0u8; n];
-        for slot in out.iter_mut() {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            *slot = s as u8;
-        }
-        out
-    }
-
-    #[test]
-    fn round255_inverse_yuy2_median_matches_per_byte_reference() {
-        // The 2-byte step body must produce byte-identical output to
-        // the pre-r255 per-byte loop across the YUY2 widths the r253
-        // forward body covers: narrow widths where row_bytes < 8 (the
-        // LEFT exemption extends past row 1 into row 2), the
-        // bench-reference 320×16 raster, and intermediate sizes.
-        for (w, h) in [
-            (2usize, 18usize),
-            (4, 4),
-            (8, 6),
-            (16, 3),
-            (160, 8),
-            (320, 16),
-        ] {
-            let row_bytes = w * 2;
-            let n = row_bytes * h;
-            let buf = synth_residuals(n, 0xCAFE_BABE);
-            let mut a = buf.clone();
-            let mut b = buf;
-            ref_inverse_yuy2_median_per_byte(&mut a, row_bytes);
-            super::inverse_yuy2_median(&mut b, row_bytes);
-            assert_eq!(
-                a, b,
-                "2-byte step body must match per-byte reference (w={w}, h={h})"
-            );
-        }
-    }
-
-    #[test]
-    fn round255_inverse_yuy2_median_modular_wrap() {
-        // Force mod-256 wraps inside the gradient and the final add by
-        // priming the entire buffer with 0xFE / 0xFF / 0x01 / 0x02
-        // values that overflow when added in the predictor chain.
-        let row_bytes = 16;
-        let h = 6;
-        let n = row_bytes * h;
-        let mut buf = Vec::with_capacity(n);
-        for i in 0..n {
-            buf.push(match i & 3 {
-                0 => 0xFEu8,
-                1 => 0xFFu8,
-                2 => 0x01u8,
-                _ => 0x02u8,
-            });
-        }
-        let mut a = buf.clone();
-        let mut b = buf;
-        ref_inverse_yuy2_median_per_byte(&mut a, row_bytes);
-        super::inverse_yuy2_median(&mut b, row_bytes);
-        assert_eq!(a, b, "modular wrap path must match per-byte reference");
-    }
-
-    #[test]
-    fn round255_inverse_yuy2_median_boundary_row1_step_alignment() {
-        // Pin the alignment invariants the 2-byte step body relies on:
-        // - `row1_left_end = (row_bytes + 8).min(len)` must be a
-        //   multiple of 2 for in-spec YUY2 input (row_bytes = 2 * width
-        //   with width even ⇒ row_bytes ≡ 0 mod 2; the +8 keeps the
-        //   alignment).
-        // - `(len - row1_left_end) % 2 == 0` ⇒ the scalar 1-byte tail
-        //   fall-through runs zero times for every in-spec width.
-        for w in [2usize, 4, 8, 16, 160, 320] {
-            let row_bytes = w * 2;
-            let h = 4;
-            let len = row_bytes * h;
-            let row1_left_end = (row_bytes + 8).min(len);
-            assert_eq!(
-                row1_left_end & 1,
-                0,
-                "row1_left_end must be even for in-spec YUY2 (w={w})"
-            );
-            assert_eq!(
-                (len - row1_left_end) & 1,
-                0,
-                "(len - row1_left_end) must be even for in-spec YUY2 (w={w})"
-            );
-        }
-    }
-
-    #[test]
-    fn round255_inverse_yuy2_median_scalar_tail_safety() {
-        // Force the 1-byte scalar fall-through by constructing an
-        // out-of-spec buffer where (len - row1_left_end) is odd. Even
-        // though in-spec YUY2 widths keep this region even, the tail
-        // loop must remain memory-safe and produce the same output as
-        // the per-byte reference body — this is the defence-in-depth
-        // claim the rewrite makes.
-        let row_bytes = 16;
-        let h = 5;
-        let len = row_bytes * h - 1; // one byte short of full row
-        let buf = synth_residuals(len, 0xDEAD_BEEF);
-        let mut a = buf.clone();
-        let mut b = buf;
-        ref_inverse_yuy2_median_per_byte(&mut a, row_bytes);
-        super::inverse_yuy2_median(&mut b, row_bytes);
-        assert_eq!(a, b, "scalar tail fall-through must match reference");
-    }
-
-    #[test]
-    fn round255_inverse_yuy2_median_encoder_roundtrip() {
-        // End-to-end witness: encode → decode must round-trip
-        // bit-exactly across the same widths the r253 forward tests
-        // cover. The production decoder now routes the median region
-        // through the 2-byte step body — any drift between the forward
-        // predict and the inverse would surface here.
-        for (w, h) in [(2u32, 18u32), (4, 6), (8, 5), (16, 3)] {
-            // Synthesise pixels and roundtrip through ClassicV2 Median.
-            let pixels = synth_residuals((w as usize) * (h as usize) * 2, 0x1234_5678);
-            let (bih, frame) = encode_frame_with_mode(
-                PixelFamily::Yuy2,
-                Method::Median,
-                w,
-                h,
-                &pixels,
-                ExtradataMode::ClassicV2,
-            )
-            .expect("encode");
-            let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
-            let decoded = super::decode_frame(&cfg, &frame).expect("decode");
-            assert_eq!(
-                decoded.pixels, pixels,
-                "round-trip must be bit-exact (w={w}, h={h})"
-            );
         }
     }
 }
@@ -2479,9 +1640,15 @@ mod round277_rgb_decode_binding_tests {
         row_bytes: usize,
         height: usize,
     ) {
+        if method.decorrelate() {
+            // The first pixel is stored plain (spec/03 §1.1 / §1.3).
+            let g0 = out[1];
+            out[0] = out[0].wrapping_sub(g0);
+            out[2] = out[2].wrapping_sub(g0);
+        }
         inverse_left_row(out, n_channels);
         if matches!(method.predictor(), Predictor::Gradient) {
-            inverse_gradient_post(out, row_bytes, height);
+            crate::predict::inverse_gradient_post(out, row_bytes, height);
         }
         if method.decorrelate() {
             if n_channels == 3 {
@@ -2549,432 +1716,6 @@ mod round277_rgb_decode_binding_tests {
             let prod = decode_frame(&cfg, &frame).expect("decode");
             assert_eq!(prod.pixels, pixels, "production decode must round-trip");
         }
-    }
-}
-
-#[cfg(test)]
-mod round420_field_parallel_tests {
-    //! Round-420 regression guard for the two-worker interlaced decode
-    //! path (`decode_frame_with_workers` / `scan_field`).
-    //!
-    //! Two invariants are pinned:
-    //!
-    //! 1. **Scan bit-exactness.** [`super::scan_field`] must report the
-    //!    identical consumed-byte count [`super::decode_field`] reports
-    //!    for the same field bytes — the split point the parallel path
-    //!    hands to the bottom-field worker IS this value, so any drift
-    //!    would decode the bottom field from a garbage offset. Covered
-    //!    across the full (family, method, extradata-mode) matrix on
-    //!    progressive frames (a progressive frame is one field), on
-    //!    both fields of interlaced frames, and on the v1.x table path.
-    //! 2. **Budget invariance.** `decode_frame_with_workers(cfg, f, 2)`
-    //!    must produce byte-identical pixels to the serial
-    //!    `decode_frame` on every interlaced stream, including odd
-    //!    heights (unequal field heights) and forced-interlace tiny
-    //!    heights, and must fail (not panic, not diverge) exactly when
-    //!    the serial path fails on malformed input.
-
-    use super::*;
-    use crate::encoder::{ExtradataMode, encode_frame_with_mode};
-    use crate::header::{Method, StreamConfig};
-
-    fn synth(n: usize, seed: u32) -> Vec<u8> {
-        let mut s = seed | 1;
-        let mut out = vec![0u8; n];
-        for slot in out.iter_mut() {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            *slot = s as u8;
-        }
-        out
-    }
-
-    fn bpp(family: PixelFamily) -> usize {
-        match family {
-            PixelFamily::Yuy2 => 2,
-            PixelFamily::Rgb24 => 3,
-            PixelFamily::Rgb32 => 4,
-        }
-    }
-
-    fn legal_methods(family: PixelFamily) -> &'static [Method] {
-        match family {
-            PixelFamily::Yuy2 => &[
-                Method::PredictOld,
-                Method::Left,
-                Method::Gradient,
-                Method::Median,
-            ],
-            PixelFamily::Rgb24 | PixelFamily::Rgb32 => &[
-                Method::PredictOld,
-                Method::Left,
-                Method::LeftDecorr,
-                Method::GradientDecorr,
-            ],
-        }
-    }
-
-    const FAMILIES: [PixelFamily; 3] = [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32];
-    const MODES: [ExtradataMode; 3] = [
-        ExtradataMode::ClassicV2,
-        ExtradataMode::CustomV2,
-        ExtradataMode::V1xCompat,
-    ];
-
-    /// Scan == decode consumed-bytes, progressive frames (one field),
-    /// full method/mode matrix.
-    #[test]
-    fn round420_scan_matches_decode_consumed_progressive_matrix() {
-        for family in FAMILIES {
-            for &method in legal_methods(family) {
-                for mode in MODES {
-                    // All widths even so the YUY2 macropixel guard is
-                    // satisfied for every family.
-                    for (w, h) in [(2u32, 2u32), (4, 4), (16, 3), (48, 32)] {
-                        let pixels = synth((w as usize) * (h as usize) * bpp(family), 0x0420_0001);
-                        let (bih, frame) =
-                            encode_frame_with_mode(family, method, w, h, &pixels, mode)
-                                .expect("encode");
-                        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
-                        let tables = build_three_tables(&cfg).expect("tables");
-                        let (_, consumed) = decode_field(
-                            family,
-                            method.predictor(),
-                            method.decorrelate(),
-                            w,
-                            h,
-                            &frame,
-                            &tables,
-                        )
-                        .expect("decode_field");
-                        let scanned =
-                            scan_field(family, method.decorrelate(), w, h, &frame, &tables)
-                                .expect("scan_field");
-                        assert_eq!(
-                            scanned, consumed,
-                            "scan/decode consumed drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Scan == decode consumed-bytes on BOTH fields of interlaced
-    /// frames (the split point itself, then the bottom field's tail).
-    #[test]
-    fn round420_scan_matches_decode_consumed_interlaced_fields() {
-        for family in FAMILIES {
-            for &method in legal_methods(family) {
-                // Odd height: top field is one row taller than bottom.
-                for (w, h) in [(32u32, 292u32), (16, 293)] {
-                    let pixels = synth((w as usize) * (h as usize) * bpp(family), 0x0420_0002);
-                    let (bih, frame) = encode_frame_with_mode(
-                        family,
-                        method,
-                        w,
-                        h,
-                        &pixels,
-                        ExtradataMode::ClassicV2,
-                    )
-                    .expect("encode");
-                    let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
-                    assert!(cfg.is_interlaced(), "test premise: h > 288 is interlaced");
-                    let tables = build_three_tables(&cfg).expect("tables");
-                    let top_h = (h as usize).div_ceil(2) as u32;
-                    let bot_h = h / 2;
-                    let (_, top_consumed) = decode_field(
-                        family,
-                        method.predictor(),
-                        method.decorrelate(),
-                        w,
-                        top_h,
-                        &frame,
-                        &tables,
-                    )
-                    .expect("decode top");
-                    let top_scanned =
-                        scan_field(family, method.decorrelate(), w, top_h, &frame, &tables)
-                            .expect("scan top");
-                    assert_eq!(
-                        top_scanned, top_consumed,
-                        "top-field split drift: {family:?}/{method:?}/{w}x{h}"
-                    );
-                    let rest = &frame[top_consumed.min(frame.len())..];
-                    let (_, bot_consumed) = decode_field(
-                        family,
-                        method.predictor(),
-                        method.decorrelate(),
-                        w,
-                        bot_h,
-                        rest,
-                        &tables,
-                    )
-                    .expect("decode bot");
-                    let bot_scanned =
-                        scan_field(family, method.decorrelate(), w, bot_h, rest, &tables)
-                            .expect("scan bot");
-                    assert_eq!(
-                        bot_scanned, bot_consumed,
-                        "bottom-field consumed drift: {family:?}/{method:?}/{w}x{h}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Scan replicates decode_field's guard errors on degenerate
-    /// dimensions and truncated input.
-    #[test]
-    fn round420_scan_replicates_guard_errors() {
-        let tables = table_cache::v1x_tables(PixelFamily::Yuy2).expect("tables");
-        // Odd YUY2 width.
-        assert!(scan_field(PixelFamily::Yuy2, false, 3, 4, &[0u8; 64], &tables).is_err());
-        // Zero-height rasters.
-        assert!(scan_field(PixelFamily::Yuy2, false, 4, 0, &[0u8; 64], &tables).is_err());
-        // Input shorter than the 4-byte seed.
-        assert!(scan_field(PixelFamily::Yuy2, false, 4, 4, &[0u8; 3], &tables).is_err());
-        let rgb_tables = table_cache::v1x_tables(PixelFamily::Rgb24).expect("tables");
-        assert!(scan_field(PixelFamily::Rgb24, false, 4, 0, &[0u8; 64], &rgb_tables).is_err());
-        assert!(scan_field(PixelFamily::Rgb32, true, 0, 4, &[0u8; 64], &rgb_tables).is_err());
-        assert!(scan_field(PixelFamily::Rgb32, false, 4, 4, &[0u8; 2], &rgb_tables).is_err());
-    }
-
-    /// Budget-2 decode must be byte-identical to serial decode on
-    /// interlaced streams across the method/mode matrix, including an
-    /// odd interlaced height (top field one row taller).
-    #[test]
-    fn round420_workers2_matches_serial_interlaced_matrix() {
-        for family in FAMILIES {
-            for &method in legal_methods(family) {
-                for mode in MODES {
-                    for (w, h) in [(32u32, 292u32), (16, 293), (48, 289)] {
-                        let pixels = synth((w as usize) * (h as usize) * bpp(family), 0x0420_0003);
-                        let (bih, frame) =
-                            encode_frame_with_mode(family, method, w, h, &pixels, mode)
-                                .expect("encode");
-                        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
-                        assert!(cfg.is_interlaced());
-                        let serial = decode_frame(&cfg, &frame).expect("serial decode");
-                        let parallel =
-                            decode_frame_with_workers(&cfg, &frame, 2).expect("parallel decode");
-                        assert_eq!(
-                            serial.pixels, parallel.pixels,
-                            "budget-2 divergence: {family:?}/{method:?}/{mode:?}/{w}x{h}"
-                        );
-                        assert_eq!(
-                            parallel.pixels, pixels,
-                            "budget-2 lossless drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Budgets 0 / 1 route through the serial path; budgets > 2 clamp
-    /// to the two field units. All must equal serial output.
-    #[test]
-    fn round420_budget_clamp_all_equal_serial() {
-        let (w, h) = (32u32, 292u32);
-        let pixels = synth((w as usize) * (h as usize) * 2, 0x0420_0004);
-        let (bih, frame) = encode_frame_with_mode(
-            PixelFamily::Yuy2,
-            Method::Median,
-            w,
-            h,
-            &pixels,
-            ExtradataMode::ClassicV2,
-        )
-        .expect("encode");
-        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
-        let serial = decode_frame(&cfg, &frame).expect("decode");
-        for budget in [0usize, 1, 2, 3, 8, 64] {
-            let out = decode_frame_with_workers(&cfg, &frame, budget).expect("decode");
-            assert_eq!(out.pixels, serial.pixels, "budget {budget} diverged");
-        }
-    }
-
-    /// Progressive streams ignore the budget entirely (single unit).
-    #[test]
-    fn round420_progressive_budget_is_noop() {
-        let (w, h) = (48u32, 32u32);
-        let pixels = synth((w as usize) * (h as usize) * 3, 0x0420_0005);
-        let (bih, frame) = encode_frame_with_mode(
-            PixelFamily::Rgb24,
-            Method::LeftDecorr,
-            w,
-            h,
-            &pixels,
-            ExtradataMode::CustomV2,
-        )
-        .expect("encode");
-        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
-        let serial = decode_frame(&cfg, &frame).expect("decode");
-        let budgeted = decode_frame_with_workers(&cfg, &frame, 8).expect("decode");
-        assert_eq!(serial.pixels, budgeted.pixels);
-    }
-
-    /// Malformed interlaced input: the parallel path must fail exactly
-    /// when the serial path fails (same Ok/Err disposition, no panic),
-    /// mirroring `degenerate_dims_tests::interlaced_truncated_top_field_no_panic`.
-    #[test]
-    fn round420_workers2_truncated_matches_serial_disposition() {
-        let cfg = StreamConfig {
-            family: PixelFamily::Yuy2,
-            method: Method::Left,
-            width: 2,
-            height: 290,
-            has_extradata: false,
-            extradata_tables: Vec::new(),
-            interlace_flag: 0,
-        };
-        for len in [0usize, 3, 4, 5, 8, 16, 64] {
-            let frame = vec![0u8; len];
-            let serial = decode_frame(&cfg, &frame);
-            let parallel = decode_frame_with_workers(&cfg, &frame, 2);
-            match (&serial, &parallel) {
-                (Ok(a), Ok(b)) => assert_eq!(a.pixels, b.pixels, "len {len}: Ok pixels diverged"),
-                (Err(_), Err(_)) => {}
-                _ => panic!(
-                    "len {len}: serial/parallel disposition diverged: serial {}, parallel {}",
-                    if serial.is_ok() { "Ok" } else { "Err" },
-                    if parallel.is_ok() { "Ok" } else { "Err" },
-                ),
-            }
-        }
-    }
-
-    /// Truncated-mid-stream interlaced frames (cut at every word
-    /// boundary of a real stream) keep serial/parallel dispositions in
-    /// lockstep, and Ok outputs byte-identical.
-    #[test]
-    fn round420_workers2_word_truncation_sweep() {
-        let (w, h) = (16u32, 292u32);
-        let pixels = synth((w as usize) * (h as usize) * 2, 0x0420_0006);
-        let (bih, frame) = encode_frame_with_mode(
-            PixelFamily::Yuy2,
-            Method::Left,
-            w,
-            h,
-            &pixels,
-            ExtradataMode::ClassicV2,
-        )
-        .expect("encode");
-        let cfg = StreamConfig::parse_bitmapinfoheader(&bih).expect("parse");
-        let mut cut = 0usize;
-        while cut < frame.len() {
-            let sub = &frame[..cut];
-            let serial = decode_frame(&cfg, sub);
-            let parallel = decode_frame_with_workers(&cfg, sub, 2);
-            match (&serial, &parallel) {
-                (Ok(a), Ok(b)) => assert_eq!(a.pixels, b.pixels, "cut {cut}: pixels diverged"),
-                (Err(_), Err(_)) => {}
-                _ => panic!("cut {cut}: serial/parallel disposition diverged"),
-            }
-            cut += 32; // word-multiple stride keeps the sweep bounded
-        }
-    }
-}
-
-#[cfg(test)]
-mod round420_pair_len_lut_tests {
-    //! Round-420 soundness guard for the scan-side pair-length LUTs
-    //! (`tables::build_pair_len_lut`): a non-zero entry claims that
-    //! EVERY 32-bit window sharing the entry's 16-bit prefix decodes
-    //! its next two codewords to that exact combined length. Verify
-    //! the claim against the production `decode_pair` /
-    //! `decode_one` walk across randomised low window bits, for all
-    //! four (first, second) slot pairs the scanners consume, on both
-    //! the v1.x compiled-in tables and a histogram-derived CustomV2
-    //! set (whose code lengths differ per slot).
-
-    use super::*;
-    use crate::tables::{build_pair_len_lut, decode_one, decode_pair};
-
-    fn check_pair(a: &HuffTable, b: &HuffTable, label: &str) {
-        let lut = build_pair_len_lut(a, b);
-        let mut s: u32 = 0x0420_5eed;
-        for (p, &sum) in lut.iter().enumerate() {
-            if sum == 0 {
-                continue;
-            }
-            for _ in 0..4 {
-                s ^= s << 13;
-                s ^= s >> 17;
-                s ^= s << 5;
-                let w = ((p as u32) << 16) | (s & 0xFFFF);
-                // Reference: the exact two-symbol walk the decoder
-                // (and the scanner's fallback) performs.
-                let n = if let Some((_, _, n)) = decode_pair(a, b, w) {
-                    n
-                } else {
-                    let (_, l0) = decode_one(a, w).expect("code A must decode");
-                    // Second window after consuming l0 bits: low bits
-                    // beyond the 32-bit window are unknown to this
-                    // test, but sum ≤ 16 guarantees code B lies inside
-                    // the first 16 bits, so shifting w suffices.
-                    let (_, l1) = decode_one(b, w << l0).expect("code B must decode within window");
-                    (l0 + l1) as u32
-                };
-                assert_eq!(
-                    n,
-                    sum as u32,
-                    "{label}: prefix 0x{p:04x} low 0x{:04x}: LUT sum {sum} vs walk {n}",
-                    w & 0xFFFF
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn round420_pair_len_lut_sound_v1x_tables() {
-        let yuv = table_cache::v1x_tables(PixelFamily::Yuy2).expect("tables");
-        check_pair(&yuv.slot1, &yuv.slot2, "v1x yuv s1s2");
-        check_pair(&yuv.slot1, &yuv.slot3, "v1x yuv s1s3");
-        let rgb = table_cache::v1x_tables(PixelFamily::Rgb24).expect("tables");
-        check_pair(&rgb.slot2, &rgb.slot1, "v1x rgb s2s1");
-        check_pair(&rgb.slot3, &rgb.slot3, "v1x rgb s3s3");
-        // Round-440 RGB24 phase-flip combos.
-        check_pair(&rgb.slot3, &rgb.slot1, "v1x rgb s3s1");
-        check_pair(&rgb.slot2, &rgb.slot3, "v1x rgb s2s3");
-        check_pair(&rgb.slot3, &rgb.slot2, "v1x rgb s3s2");
-    }
-
-    #[test]
-    fn round420_pair_len_lut_sound_custom_tables() {
-        use crate::encoder::{ExtradataMode, encode_frame_with_mode};
-        use crate::header::Method;
-        // A CustomV2 encode derives per-channel tables from the frame
-        // histograms — three genuinely distinct codebooks.
-        let mut s: u32 = 0xBEEF_0042;
-        let mut pixels = vec![0u8; 64 * 300 * 2];
-        for slot in pixels.iter_mut() {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            *slot = s as u8;
-        }
-        let (strf, _) = encode_frame_with_mode(
-            PixelFamily::Yuy2,
-            Method::Median,
-            64,
-            300,
-            &pixels,
-            ExtradataMode::CustomV2,
-        )
-        .expect("encode");
-        let cfg = StreamConfig::parse_bitmapinfoheader(&strf).expect("parse");
-        let tables = build_three_tables(&cfg).expect("tables");
-        check_pair(&tables.slot1, &tables.slot2, "custom s1s2");
-        check_pair(&tables.slot1, &tables.slot3, "custom s1s3");
-        check_pair(&tables.slot2, &tables.slot1, "custom s2s1");
-        check_pair(&tables.slot3, &tables.slot3, "custom s3s3");
-        // Round-440 RGB24 phase-flip combos.
-        check_pair(&tables.slot3, &tables.slot1, "custom s3s1");
-        check_pair(&tables.slot2, &tables.slot3, "custom s2s3");
-        check_pair(&tables.slot3, &tables.slot2, "custom s3s2");
     }
 }
 
@@ -3197,9 +1938,19 @@ mod round440_rgb24_phase_flip_tests {
                         ref_decode_rgb24_per_symbol(method.decorrelate(), w, h, &frame, &tables);
                     // Apply the same inverse chain the production path
                     // runs, then compare the whole frame.
+                    if method.decorrelate() {
+                        // The first pixel is stored plain (spec/03 §1.1).
+                        let g0 = ref_pixels[1];
+                        ref_pixels[0] = ref_pixels[0].wrapping_sub(g0);
+                        ref_pixels[2] = ref_pixels[2].wrapping_sub(g0);
+                    }
                     inverse_left_row(&mut ref_pixels, 3);
                     if matches!(method.predictor(), Predictor::Gradient) {
-                        inverse_gradient_post(&mut ref_pixels, (w as usize) * 3, h as usize);
+                        crate::predict::inverse_gradient_post(
+                            &mut ref_pixels,
+                            (w as usize) * 3,
+                            h as usize,
+                        );
                     }
                     if method.decorrelate() {
                         inverse_rgb_decorr_bgr(&mut ref_pixels);
@@ -3218,11 +1969,9 @@ mod round440_rgb24_phase_flip_tests {
         }
     }
 
-    /// Interlaced RGB24: the phase-flip body runs per field; both the
-    /// serial and the budget-2 field-parallel paths must stay
-    /// lossless and identical (the two-worker split scan feeds the
-    /// bottom field from the top field's consumed-byte count, which
-    /// the phase-flip loop must not perturb).
+    /// Field-coded RGB24 (even and odd heights above 288): the
+    /// phase-flip body walks the whole frame as one stream; decode
+    /// stays lossless at every worker budget.
     #[test]
     fn round440_phase_flip_interlaced_budget_invariance() {
         for &method in [Method::Left, Method::LeftDecorr, Method::GradientDecorr].iter() {

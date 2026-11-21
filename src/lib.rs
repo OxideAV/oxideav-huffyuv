@@ -17,13 +17,15 @@
 //! fallback (`biSize == 0x28`, length-table set A and code-template
 //! set A/B from the proprietary's `.rdata`) are supported.
 //!
-//! Interlaced streams (`biHeight > 288`, spec/02 §2) engage the
-//! field-stride=2 path: the frame is split into two fields (even
-//! rows = top; odd rows = bottom), each field is encoded
-//! independently with the shared Huffman tables, and the two
-//! per-field bitstreams are concatenated on the wire. The decoder
-//! detects the trigger from `cfg.height` and reverses the split
-//! transparently.
+//! Field-coded ("interlaced") streams follow spec/06: the decision
+//! comes from the extradata interlace byte when it carries one of its
+//! two defined values and from `biHeight > 288` otherwise (§1.3); a
+//! field-coded frame keeps its single first pixel and single codeword
+//! stream, and only the predictors' "above" reference moves two frame
+//! rows back (§2.1). `FFVH`-tagged streams are accepted when their
+//! header stays inside the specified `HFYU` layout and refused
+//! otherwise (planar / high-bit-depth / per-frame-table extensions
+//! have no specification in the reference workspace).
 //!
 //! # Pipeline
 //!

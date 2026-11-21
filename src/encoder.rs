@@ -22,8 +22,8 @@ use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
 use crate::header::{FOURCC_HFYU, Method, PixelFamily, Predictor, StreamConfig};
 use crate::predict::{
-    forward_decorr_gradient_subtract, forward_gradient_subtract, forward_left_decorr_residuals,
-    forward_median_subtract, forward_rgb_left_subtract_linear, forward_yuy2_left_subtract,
+    forward_decorr_gradient_stride, forward_gradient_stride, forward_left_decorr_residuals,
+    forward_median_yuy2, forward_rgb_left_subtract_linear, forward_yuy2_left_subtract,
     interlace_flag_for_height, is_interlaced_height,
 };
 #[cfg(test)]
@@ -106,27 +106,18 @@ pub fn encode_frame_with_mode(
     // emit pass (one residual computation per candidate instead of
     // candidate + winner-restart = N+1).
     let frame = compute_frame_residuals(family, method, width, height, pixels)?;
-    encode_with_precomputed(family, method, width, height, &frame, mode, 1)
+    encode_with_precomputed(family, method, width, height, &frame, mode)
 }
 
-/// Encode a frame under an explicit worker budget (round 420).
+/// Encode a frame under an explicit worker budget.
 ///
-/// Same wire output as [`encode_frame_with_mode`] for every input —
-/// the budget only changes how the work is scheduled. Interlaced
-/// frames (spec/02 §2, `biHeight > 288`) carry two independently
-/// coded fields whose residual computations and bit-stream emits
-/// don't depend on each other (the encode side has no split-finding
-/// problem: each field is packed into its own buffer and the buffers
-/// are concatenated afterwards), so with a budget ≥ 2 both phases run
-/// their two fields on two parallel workers. `worker_budget` follows
-/// the `oxideav-core` `ExecutionContext` threading contract: serial
-/// until told otherwise, fan-out bounded by
-/// `budget.min(units).max(1)` with `units = 2`. Budget ≤ 1 and
-/// progressive frames take exactly the [`encode_frame_with_mode`]
-/// serial code path.
-///
-/// Byte-identity across budgets is guarded by the round-420
-/// encode-invariance tests plus the r419 golden wire-hash pins.
+/// Same wire output as [`encode_frame_with_mode`] for every input and
+/// every budget. A fixed-method frame is one residual pass feeding one
+/// continuous codeword stream (spec/02 §2; a field-coded frame has no
+/// separately coded halves either, spec/06 §3.4), so there is a single
+/// unit of work and this currently runs serially whatever the budget;
+/// the budget matters for [`encode_frame_auto_workers`], whose
+/// candidate scoring does fan out.
 pub fn encode_frame_with_mode_workers(
     family: PixelFamily,
     method: Method,
@@ -136,22 +127,8 @@ pub fn encode_frame_with_mode_workers(
     mode: ExtradataMode,
     worker_budget: usize,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    if family.is_rgb() && !method.is_rgb_legal() {
-        return Err(Error::invalid("encoder: method not legal for RGB"));
-    }
-    if !family.is_rgb() && !method.is_yuv_legal() {
-        return Err(Error::invalid("encoder: method not legal for YUV"));
-    }
-    // Inline worker clamp per the ExecutionContext threading contract
-    // — `threads.min(units).max(1)`, written as `clamp(1, units)`
-    // with `units = 2` interlaced fields.
-    let workers = worker_budget.clamp(1, 2);
-    let frame = if workers >= 2 {
-        compute_frame_residuals_parallel(family, method, width, height, pixels)?
-    } else {
-        compute_frame_residuals(family, method, width, height, pixels)?
-    };
-    encode_with_precomputed(family, method, width, height, &frame, mode, workers)
+    let _ = worker_budget;
+    encode_frame_with_mode(family, method, width, height, pixels, mode)
 }
 
 /// Encode one frame's wire bytes against caller-pinned per-slot
@@ -165,8 +142,7 @@ pub fn encode_frame_with_mode_workers(
 /// [`encode_frame_with_mode`] does with [`ExtradataMode::CustomV2`])
 /// would change the extradata mid-stream and make frames 2..N
 /// undecodable. The residual + emit pipeline is exactly the
-/// [`encode_frame_with_mode_workers`] one (same clamp, same r420
-/// two-worker interlaced arms); only the table sourcing differs.
+/// [`encode_frame_with_mode`] one; only the table sourcing differs.
 ///
 /// Because pinned first-frame tables assign length 0 to symbols the
 /// first frame never emitted, the body is verified against the tables
@@ -192,18 +168,12 @@ pub(crate) fn encode_body_with_pinned_tables(
     if !family.is_rgb() && !method.is_yuv_legal() {
         return Err(Error::invalid("encoder: method not legal for YUV"));
     }
-    // Inline worker clamp per the ExecutionContext threading contract
-    // (`threads.min(units).max(1)`, `units = 2` interlaced fields).
-    let workers = worker_budget.clamp(1, 2);
-    let frame = if workers >= 2 {
-        compute_frame_residuals_parallel(family, method, width, height, pixels)?
-    } else {
-        compute_frame_residuals(family, method, width, height, pixels)?
-    };
+    let _ = worker_budget;
+    let frame = compute_frame_residuals(family, method, width, height, pixels)?;
     verify_body_in_table(
         family,
         method,
-        &frame.combined_body,
+        &frame.body,
         &tabs.slot1.entries,
         &tabs.slot2.entries,
         &tabs.slot3.entries,
@@ -222,7 +192,6 @@ pub(crate) fn encode_body_with_pinned_tables(
         &tabs.slot1.entries,
         &tabs.slot2.entries,
         &tabs.slot3.entries,
-        workers,
     )
 }
 
@@ -238,11 +207,10 @@ fn encode_with_precomputed(
     method: Method,
     width: u32,
     height: u32,
-    frame: &PrecomputedFrame,
+    frame: &Residuals,
     mode: ExtradataMode,
-    workers: usize,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let stats_body: &[u8] = &frame.combined_body;
+    let stats_body: &[u8] = &frame.body;
 
     // Round-419: the ClassicV2 / V1xCompat table sets are pure
     // functions of compiled-in bytes, so they come out of the decoder's
@@ -317,296 +285,63 @@ fn encode_with_precomputed(
         has_extradata,
     );
 
-    let frame_bytes = emit_frame_bytes(family, method, frame, slot1, slot2, slot3, workers)?;
+    let frame_bytes = emit_frame_bytes(family, method, frame, slot1, slot2, slot3)?;
 
     let _ = (width, height);
     Ok((strf, frame_bytes))
 }
 
 /// Emit the wire bytes for one pre-computed residual frame using the
-/// caller-supplied per-slot Huffman tables.
-///
-/// Round-429 extraction of the emit tail of
-/// [`encode_with_precomputed`] so the registry stream encoder's
-/// pinned-tables path ([`encode_body_with_pinned_tables`]) can reuse
-/// the exact serial / two-worker interlaced emit arms without
-/// re-deriving tables from an [`ExtradataMode`]. Byte-identical to the
-/// pre-extraction inline block for every input (r419 golden pins +
-/// r420 invariance matrix).
+/// caller-supplied per-slot Huffman tables: the uncompressed first
+/// pixel followed by one continuous codeword stream (spec/02 §2 — a
+/// field-coded frame has the same shape, spec/06 §3.4).
 fn emit_frame_bytes(
     family: PixelFamily,
     method: Method,
-    frame: &PrecomputedFrame,
+    frame: &Residuals,
     slot1: &SlotEntries,
     slot2: &SlotEntries,
     slot3: &SlotEntries,
-    workers: usize,
 ) -> Result<Vec<u8>> {
-    if frame.interlaced {
-        if let (2.., Some(bot_seed)) = (workers, frame.bot_seed_opt) {
-            // Round-420 two-worker emit: the two per-field bit-streams
-            // are packed into independent buffers from disjoint body
-            // slices and identical tables, then concatenated in wire
-            // order — byte-identical to the serial arm below. The top
-            // field's result is inspected first so a top-field emit
-            // error surfaces exactly as in the serial arm.
-            let (top_joined, bot_result) = std::thread::scope(|s| {
-                let top_handle = s.spawn(|| {
-                    emit_bitstream_parts(
-                        family,
-                        method,
-                        &frame.top_seed,
-                        &frame.combined_body[..frame.top_body_len],
-                        slot1,
-                        slot2,
-                        slot3,
-                    )
-                });
-                let bot_result = emit_bitstream_parts(
-                    family,
-                    method,
-                    &bot_seed,
-                    &frame.combined_body[frame.top_body_len..],
-                    slot1,
-                    slot2,
-                    slot3,
-                );
-                (top_handle.join(), bot_result)
-            });
-            let mut out = match top_joined {
-                Ok(res) => res?,
-                Err(panic) => std::panic::resume_unwind(panic),
-            };
-            let mut bot_bytes = bot_result?;
-            out.append(&mut bot_bytes);
-            Ok(out)
-        } else {
-            let mut out = Vec::new();
-            // Top field: pass the seed + the [..top_body_len] slice of
-            // the combined body directly to `emit_bitstream_parts`. No
-            // per-field body Vec allocation needed.
-            let mut top_bytes = emit_bitstream_parts(
-                family,
-                method,
-                &frame.top_seed,
-                &frame.combined_body[..frame.top_body_len],
-                slot1,
-                slot2,
-                slot3,
-            )?;
-            out.append(&mut top_bytes);
-            if let Some(bot_seed) = frame.bot_seed_opt {
-                let mut bot_bytes = emit_bitstream_parts(
-                    family,
-                    method,
-                    &bot_seed,
-                    &frame.combined_body[frame.top_body_len..],
-                    slot1,
-                    slot2,
-                    slot3,
-                )?;
-                out.append(&mut bot_bytes);
-            }
-            Ok(out)
-        }
-    } else {
-        emit_bitstream_parts(
-            family,
-            method,
-            &frame.top_seed,
-            &frame.combined_body,
-            slot1,
-            slot2,
-            slot3,
-        )
-    }
-}
-
-/// Round-7 residual carrier: holds the per-field seed(s) + a single
-/// combined body Vec covering one progressive frame or both interlaced
-/// fields concatenated. Replaces the previous round's mix of
-/// `Option<Residuals>` (progressive) + `(top_seed, bot_seed_opt,
-/// top_body_len, combined_body)` (interlaced) so the same struct can
-/// be reused across the auto-selector's candidate-scoring + final
-/// emit passes.
-#[derive(Debug, Clone)]
-struct PrecomputedFrame {
-    interlaced: bool,
-    top_seed: [u8; 4],
-    /// `None` for progressive frames OR for interlaced frames where the
-    /// bottom field is empty (height == 1, etc.).
-    bot_seed_opt: Option<[u8; 4]>,
-    /// Length of the top field's body within `combined_body`. Equals
-    /// `combined_body.len()` for progressive frames.
-    top_body_len: usize,
-    /// Combined body bytes. Progressive: a single field's body.
-    /// Interlaced: top.body || bot.body (the bot half resumes the
-    /// per-family slot phase because top.body_len is always a multiple
-    /// of the slot cycle — see round-5 notes in this module).
-    combined_body: Vec<u8>,
+    emit_bitstream_parts(
+        family,
+        method,
+        &frame.seed,
+        &frame.body,
+        slot1,
+        slot2,
+        slot3,
+    )
 }
 
 /// Compute the per-frame residual stream once. Shared by
-/// [`encode_frame_with_mode`], [`encode_frame_auto`] (round-7), and
+/// [`encode_frame_with_mode`], [`encode_frame_auto`] and
 /// [`bit_cost_for_method`].
 ///
-/// Spec/02 §2 + spec/05 (planned): when biHeight > 288 the codec
-/// splits the source into two fields (even rows = top; odd rows =
-/// bottom) and predicts each independently. The walking-stride path
-/// from round 5 is preserved: a single field-sized scratch buffer is
-/// reused across top + bot field, and both fields' residual bodies
-/// land in ONE combined `Vec<u8>` (the bot half starts at
-/// `top_body_len`).
+/// The encoder field-codes exactly when `height > 288` (spec/06 §1.1)
+/// and [`build_bitmapinfoheader`] writes the matching interlace byte
+/// (spec/06 §1.2), so the two builds of the original codec and any
+/// decoder following spec/06 §1.3 agree on the raster. Field coding
+/// only doubles the prediction row length (spec/06 §2.1).
 fn compute_frame_residuals(
     family: PixelFamily,
     method: Method,
     width: u32,
     height: u32,
     pixels: &[u8],
-) -> Result<PrecomputedFrame> {
-    let interlaced = is_interlaced_height(height);
-    if !interlaced {
-        let r = compute_residuals(family, method, width, height, pixels)?;
-        let top_body_len = r.body.len();
-        return Ok(PrecomputedFrame {
-            interlaced: false,
-            top_seed: r.seed,
-            bot_seed_opt: None,
-            top_body_len,
-            combined_body: r.body,
-        });
-    }
-    // Round-261: single source of truth (`PixelFamily::row_bytes`)
-    // for the family → wire-stride dispatch; spec/02 §3 wire-byte
-    // layout table.
+) -> Result<Residuals> {
     let row_bytes = family.row_bytes(width);
-    let h = height as usize;
-    let top_h = h.div_ceil(2) as u32;
-    let bot_h = (h / 2) as u32;
-    // One field-sized scratch reused across top + bot (round-5
-    // walking-stride invariant — preserves the ~1.5× memory
-    // reduction over round 4's split_fields approach).
-    let mut scratch = vec![0u8; (top_h as usize) * row_bytes];
-    let body_capacity = match family {
-        PixelFamily::Yuy2 => row_bytes * h - if h > 0 { 4 } else { 0 },
-        PixelFamily::Rgb24 => {
-            let n_top = (width as usize) * (top_h as usize);
-            let n_bot = (width as usize) * (bot_h as usize);
-            let mut c = 0usize;
-            if n_top > 0 {
-                c += (n_top - 1) * 3;
-            }
-            if n_bot > 0 {
-                c += (n_bot - 1) * 3;
-            }
-            c
-        }
-        PixelFamily::Rgb32 => {
-            let n_top = (width as usize) * (top_h as usize);
-            let n_bot = (width as usize) * (bot_h as usize);
-            let mut c = 0usize;
-            if n_top > 0 {
-                c += (n_top - 1) * 4;
-            }
-            if n_bot > 0 {
-                c += (n_bot - 1) * 4;
-            }
-            c
-        }
-    };
-    let mut combined: Vec<u8> = Vec::with_capacity(body_capacity);
-    compact_field_rows(pixels, &mut scratch, row_bytes, h, 0);
-    let top_res = compute_residuals(
-        family,
-        method,
-        width,
-        top_h,
-        &scratch[..(top_h as usize) * row_bytes],
-    )?;
-    let top_seed = top_res.seed;
-    let top_len = top_res.body.len();
-    combined.extend_from_slice(&top_res.body);
-    drop(top_res);
-    let bot_seed_opt = if bot_h > 0 {
-        scratch.resize((bot_h as usize) * row_bytes, 0);
-        compact_field_rows(pixels, &mut scratch, row_bytes, h, 1);
-        let bot_res = compute_residuals(
-            family,
-            method,
-            width,
-            bot_h,
-            &scratch[..(bot_h as usize) * row_bytes],
-        )?;
-        let bs = bot_res.seed;
-        combined.extend_from_slice(&bot_res.body);
-        Some(bs)
+    let stride = if is_interlaced_height(height) {
+        row_bytes.saturating_mul(2)
     } else {
-        None
+        row_bytes
     };
-    Ok(PrecomputedFrame {
-        interlaced: true,
-        top_seed,
-        bot_seed_opt,
-        top_body_len: top_len,
-        combined_body: combined,
-    })
-}
-
-/// Round-420 two-worker variant of [`compute_frame_residuals`] for
-/// interlaced frames: the two fields' row-gather + forward-predictor
-/// passes read disjoint source rows and write independent outputs, so
-/// each runs on its own worker with its own field-sized scratch (the
-/// serial path's single shared scratch cannot be reused across
-/// concurrent fields). The per-field `Residuals` are computed by the
-/// same [`compute_residuals`] the serial path calls on the same field
-/// bytes, and concatenated into the same
-/// `top.body || bot.body` combined layout — `PrecomputedFrame`
-/// contents are identical to the serial path's for every input
-/// (guarded by the round-420 encode-invariance tests). Progressive
-/// and single-field-degenerate frames fall through to the serial
-/// function.
-fn compute_frame_residuals_parallel(
-    family: PixelFamily,
-    method: Method,
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-) -> Result<PrecomputedFrame> {
-    let h = height as usize;
-    if !is_interlaced_height(height) || h / 2 == 0 {
-        return compute_frame_residuals(family, method, width, height, pixels);
+    match family {
+        PixelFamily::Yuy2 => yuy2_residuals(method, width, height, stride, pixels),
+        PixelFamily::Rgb24 | PixelFamily::Rgb32 => {
+            rgb_residuals(family, method, width, height, stride, pixels)
+        }
     }
-    let row_bytes = family.row_bytes(width);
-    let top_h = h.div_ceil(2) as u32;
-    let bot_h = (h / 2) as u32;
-    let (top_result, bot_joined) = std::thread::scope(|s| {
-        let bot_handle = s.spawn(|| {
-            let mut scratch = vec![0u8; (bot_h as usize) * row_bytes];
-            compact_field_rows(pixels, &mut scratch, row_bytes, h, 1);
-            compute_residuals(family, method, width, bot_h, &scratch)
-        });
-        let mut scratch = vec![0u8; (top_h as usize) * row_bytes];
-        compact_field_rows(pixels, &mut scratch, row_bytes, h, 0);
-        let top_result = compute_residuals(family, method, width, top_h, &scratch);
-        (top_result, bot_handle.join())
-    });
-    // Serial error order: the top field is computed (and its errors
-    // surfaced) before the bottom field is touched.
-    let top_res = top_result?;
-    let bot_res = match bot_joined {
-        Ok(res) => res?,
-        Err(panic) => std::panic::resume_unwind(panic),
-    };
-    let top_len = top_res.body.len();
-    let mut combined = top_res.body;
-    combined.extend_from_slice(&bot_res.body);
-    Ok(PrecomputedFrame {
-        interlaced: true,
-        top_seed: top_res.seed,
-        bot_seed_opt: Some(bot_res.seed),
-        top_body_len: top_len,
-        combined_body: combined,
-    })
 }
 
 /// Build a `BITMAPINFOHEADER` for the encoded stream. `with_extradata`
@@ -694,8 +429,8 @@ pub fn build_bitmapinfoheader(
 /// muxer-side encoders can inspect the trade-off without doing two
 /// emit passes.
 ///
-/// Returns the total number of code-bits (excluding the per-field
-/// 4-byte uncompressed seed) the body would occupy using the
+/// Returns the total number of code-bits (excluding the 4-byte
+/// uncompressed first pixel) the body would occupy using the
 /// per-channel package-merge length tables. This is the same metric
 /// the auto-selector minimises.
 ///
@@ -719,7 +454,7 @@ pub fn bit_cost_for_method(
     // so a subsequent `encode_frame_auto` can reuse this residual
     // computation rather than redoing it.
     let frame = compute_frame_residuals(family, method, width, height, pixels)?;
-    let (h1, h2, h3) = histogramise(family, method, &frame.combined_body);
+    let (h1, h2, h3) = histogramise(family, method, &frame.body);
     Ok(bit_cost_from_histograms(&h1, &h2, &h3))
 }
 
@@ -817,7 +552,7 @@ pub fn encode_frame_auto(
 
 /// Score one auto-selector candidate: residual stream + package-merge
 /// bit cost. Round-7 semantics unchanged — the returned
-/// [`PrecomputedFrame`] carries forward into the winner's final emit
+/// [`Residuals`] carries forward into the winner's final emit
 /// so the body bytes are never re-derived from `pixels`.
 fn score_candidate(
     family: PixelFamily,
@@ -825,9 +560,9 @@ fn score_candidate(
     width: u32,
     height: u32,
     pixels: &[u8],
-) -> Result<(u64, PrecomputedFrame)> {
+) -> Result<(u64, Residuals)> {
     let frame = compute_frame_residuals(family, method, width, height, pixels)?;
-    let (h1, h2, h3) = histogramise(family, method, &frame.combined_body);
+    let (h1, h2, h3) = histogramise(family, method, &frame.body);
     Ok((bit_cost_from_histograms(&h1, &h2, &h3), frame))
 }
 
@@ -837,8 +572,8 @@ fn score_candidate(
 /// for every input — the budget only changes how the work is
 /// scheduled, following the `oxideav-core` `ExecutionContext`
 /// threading contract (serial until told otherwise; fan-out bounded
-/// inline by `budget.min(units).max(1)`). Two independent fan-outs
-/// are gated on the budget:
+/// inline by `budget.min(units).max(1)`). One fan-out is gated on
+/// the budget:
 ///
 /// - **Candidate scoring** (`units = candidates.len()`): each legal
 ///   method's residual + package-merge bit-cost evaluation is
@@ -849,10 +584,8 @@ fn score_candidate(
 ///   first error in candidate order surfaces, smallest cost wins,
 ///   first-in-order wins ties — so the winner (and therefore the
 ///   wire) cannot depend on scheduling.
-/// - **Winner emit** (`units = 2` interlaced fields): the final
-///   [`encode_with_precomputed`] pass gets the same clamp
-///   [`encode_frame_with_mode_workers`] applies, engaging the r420
-///   two-worker interlaced emit when the budget allows.
+///
+/// The winner's emit is a single codeword stream and runs serially.
 ///
 /// Byte-identity across budgets is guarded by the r429 auto-selector
 /// budget sweep in the golden-pin suite.
@@ -882,7 +615,7 @@ pub fn encode_frame_auto_workers(
     //
     // Tie-break: first in `candidates` order (so output is
     // deterministic).
-    let mut best: Option<(Method, u64, PrecomputedFrame)> = None;
+    let mut best: Option<(Method, u64, Residuals)> = None;
     if scoring_workers >= 2 {
         // Parallel scoring: per-candidate result slots filled by
         // contiguous chunks (first chunk on the caller thread, so at
@@ -890,10 +623,9 @@ pub fn encode_frame_auto_workers(
         // caller counts against the budget), then reduced serially in
         // candidate order below — winner, tie-break, and error order
         // all match the serial arm exactly.
-        let mut results: Vec<Option<Result<(u64, PrecomputedFrame)>>> =
-            std::iter::repeat_with(|| None)
-                .take(candidates.len())
-                .collect();
+        let mut results: Vec<Option<Result<(u64, Residuals)>>> = std::iter::repeat_with(|| None)
+            .take(candidates.len())
+            .collect();
         let chunk_len = candidates.len().div_ceil(scoring_workers);
         std::thread::scope(|s| {
             let (own_slots, mut slots_rest) = results.split_at_mut(chunk_len);
@@ -933,11 +665,7 @@ pub fn encode_frame_auto_workers(
         }
     }
     let (chosen, _, frame) = best.expect("non-empty candidates → some winner");
-    // Same emit clamp as `encode_frame_with_mode_workers` (`units = 2`
-    // interlaced fields).
-    let emit_workers = worker_budget.clamp(1, 2);
-    let (strf, bytes) =
-        encode_with_precomputed(family, chosen, width, height, &frame, mode, emit_workers)?;
+    let (strf, bytes) = encode_with_precomputed(family, chosen, width, height, &frame, mode)?;
     Ok((strf, bytes, chosen))
 }
 
@@ -998,61 +726,16 @@ struct Residuals {
     body: Vec<u8>,
 }
 
-fn compute_residuals(
-    family: PixelFamily,
+fn yuy2_residuals(
     method: Method,
     width: u32,
     height: u32,
+    stride: usize,
     pixels: &[u8],
 ) -> Result<Residuals> {
-    match family {
-        PixelFamily::Yuy2 => yuy2_residuals(method, width, height, pixels),
-        PixelFamily::Rgb24 => rgb24_residuals(method, width, height, pixels),
-        PixelFamily::Rgb32 => rgb32_residuals(method, width, height, pixels),
-    }
-}
-
-/// Walking-stride field row gather. Round-5 walks the source raster
-/// with row-stride 2 (writing the picked rows into `dst`'s start)
-/// instead of allocating a new top-field / bottom-field buffer via
-/// `predict::split_fields`. `field_idx == 0` selects even rows
-/// (top field); `field_idx == 1` selects odd rows (bottom field).
-///
-/// `dst` must already be sized to at least `field_h * row_bytes`
-/// where `field_h = (full_h + 1 - field_idx) / 2`. The function does
-/// not resize.
-///
-/// Spec/02 §2 says nothing about HOW the encoder happens to extract
-/// fields — only that the on-wire chunk concatenates the two
-/// per-field bit-streams. The walking-stride read pattern matches
-/// the round-4 `split_fields(...)` output byte-for-byte; a
-/// regression test in `roundtrip_tests::walking_stride_matches_split_fields_path`
-/// guards against drift.
-fn compact_field_rows(
-    pixels: &[u8],
-    dst: &mut [u8],
-    row_bytes: usize,
-    full_h: usize,
-    field_idx: usize,
-) {
-    debug_assert!(field_idx < 2);
-    let mut logical = 0usize;
-    let mut row = field_idx;
-    while row < full_h {
-        let src = row * row_bytes;
-        let d = logical * row_bytes;
-        dst[d..d + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
-        row += 2;
-        logical += 1;
-    }
-}
-
-fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Result<Residuals> {
     let w = width as usize;
     let h = height as usize;
-    // Round-262: family → wire-stride via the round-261 accessor
-    // (spec/02 §3 wire-byte layout table: Y₁ U Y₂ V per 2 px = 4
-    // bytes per macropixel = width × 2).
+    // spec/02 §3 wire-byte layout table: Y₁ U Y₂ V per 2 px.
     let row_bytes = PixelFamily::Yuy2.row_bytes(width);
     if pixels.len() != row_bytes * h {
         return Err(Error::invalid(format!(
@@ -1064,39 +747,20 @@ fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Res
     if !w.is_multiple_of(2) {
         return Err(Error::invalid("encoder: YUY2 width must be even"));
     }
-    let mut residuals = vec![0u8; row_bytes * h];
-    if method.predictor() == Predictor::Median {
-        // Round 115: the YUY2 forward MEDIAN pre-pass is produced in a
-        // single pass by `forward_median_subtract` (spec/03 §2.3 /
-        // §2.3.2) — LEFT residuals for row 0 + the first 8 wire bytes
-        // of row 1, MEDIAN residuals for the rest. Previously this
-        // computed a full-frame LEFT residual stream and then
-        // overwrote the median region (recomputing the median region's
-        // LEFT residuals only to discard them).
-        forward_median_subtract(pixels, &mut residuals, row_bytes, h);
-    } else {
-        // Round 95: avoid the `pixels.to_vec()` clone when no gradient
-        // pre-pass is needed by reading directly from `pixels` for the
-        // per-channel-stride subtract. For Gradient we still need the
-        // intermediate Vec (the per-channel subtract chain reads earlier
-        // intermediate bytes; an in-place rewrite would corrupt later
-        // reads). The intermediate is now built by `forward_gradient_subtract`
-        // (spec/03 §2.2.2 `@0x10001eab..@0x10001f9e`).
-        let intermediate: Option<Vec<u8>> = if method.predictor() == Predictor::Gradient {
-            let mut iv = vec![0u8; row_bytes * h];
-            forward_gradient_subtract(pixels, &mut iv, row_bytes, h);
-            Some(iv)
-        } else {
-            None
-        };
-        let pred_input: &[u8] = intermediate.as_deref().unwrap_or(pixels);
-        // Round 181: route the YUY2 forward LEFT residual through
-        // the branch-free macropixel-step helper (spec/03 §2.1.1
-        // four-channel Y₁ / U / Y₂ / V body) instead of the per-byte
-        // `i & 1` stride-select. Bit-identical output; see
-        // `predict::forward_yuy2_left_subtract` for the spec
-        // citation + equivalence regression test.
-        forward_yuy2_left_subtract(pred_input, &mut residuals);
+    let mut residuals = vec![0u8; pixels.len()];
+    match method.predictor() {
+        // spec/03 §2.3 / §2.3.2, spec/06 §3.3: LEFT residuals up to
+        // one prediction row + 8 wire bytes, median after.
+        Predictor::Median => forward_median_yuy2(pixels, &mut residuals, stride),
+        // spec/03 §2.2.2, spec/06 §3.2: subtract the byte one
+        // prediction row back, then LEFT-code the result.
+        Predictor::Gradient => {
+            let mut above_removed = vec![0u8; pixels.len()];
+            forward_gradient_stride(pixels, &mut above_removed, stride);
+            forward_yuy2_left_subtract(&above_removed, &mut residuals);
+        }
+        // spec/03 §2.1.1.
+        Predictor::Left => forward_yuy2_left_subtract(pixels, &mut residuals),
     }
     let mut seed = [0u8; 4];
     let copy_n = 4.min(pixels.len());
@@ -1105,255 +769,77 @@ fn yuy2_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Res
     Ok(Residuals { seed, body })
 }
 
-fn rgb24_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Result<Residuals> {
-    let w = width as usize;
+/// RGB24 (`n_channels == 3`) / RGB32 (`n_channels == 4`) residuals.
+///
+/// The first pixel goes out as the plain input bytes — `00 B G R` or
+/// `B G R A` (spec/03 §1.1, §1.3; spec/02 §8 #6) — also when the
+/// method decorrelates: the residual chain then starts from the
+/// decorrelated first pixel (spec/03 §2.4.1 fused formula), which the
+/// decoder derives from those same bytes.
+fn rgb_residuals(
+    family: PixelFamily,
+    method: Method,
+    width: u32,
+    height: u32,
+    stride: usize,
+    pixels: &[u8],
+) -> Result<Residuals> {
+    let n_channels = family.bytes_per_pixel_step();
+    let row_bytes = family.row_bytes(width);
     let h = height as usize;
-    // Round-262: family → wire-stride via the round-261 accessor
-    // (spec/02 §3 wire-byte layout table: 3 bytes per pixel,
-    // `+0:B +1:G +2:R`).
-    let row_bytes = PixelFamily::Rgb24.row_bytes(width);
     if pixels.len() != row_bytes * h {
         return Err(Error::invalid(format!(
-            "encoder: RGB24 pixel-buffer size {} ≠ expected {}",
+            "encoder: {} pixel-buffer size {} ≠ expected {}",
+            if n_channels == 3 { "RGB24" } else { "RGB32" },
             pixels.len(),
             row_bytes * h
         )));
     }
-    let n_pixels = w * h;
-    // Round 100: for the LeftDecorr path (decorrelate, no gradient),
-    // fuse the decorrelation transform into the LEFT residual per
-    // spec/03 §2.4.1 ("the decorrelation transform is fused with the
-    // predictor at the residual computation, not applied as a separate
-    // pre-pass ... there is no intermediate decorrelated buffer"). This
-    // skips the round-95 `working_owned: Vec<u8>` full-frame allocation
-    // (= row_bytes × h bytes per frame) entirely.
-    let fused_left_decorr = method.decorrelate() && method.predictor() == Predictor::Left;
-    // Round 103: for the GradientDecorr path (decorrelate + gradient),
-    // fuse the decorrelation into the forward-gradient subtract per
-    // spec/03 §2.4.2 (gradient applied to each decorrelated channel;
-    // the §2.2.2 gradient pre-pass reads only decorrelated values).
-    // `forward_decorr_gradient_subtract` produces the gradient
-    // pre-pass output straight from un-transformed `pixels`, so the
-    // round-95 `working_owned` decorrelated buffer is no longer needed
-    // on this path either. The per-channel LEFT-subtract pass that
-    // follows is identical; only the seed sourcing differs (the
-    // decorrelated first pixel must be read from `pixels`, not the
-    // now-absent `working`).
-    let fused_decorr_gradient = method.decorrelate() && method.predictor() == Predictor::Gradient;
-    // Round 95: skip the `pixels.to_vec()` clone when no decorrelation
-    // is in play — `working` borrows pixels directly. With both
-    // decorrelation paths fused (round 100 LeftDecorr + round 103
-    // GradientDecorr) `working_owned` is never allocated anymore.
-    let working_owned: Option<Vec<u8>> =
-        if method.decorrelate() && !fused_left_decorr && !fused_decorr_gradient {
-            let mut v = vec![0u8; row_bytes * h];
-            for px in 0..n_pixels {
-                let off = px * 3;
-                let b = pixels[off];
-                let g = pixels[off + 1];
-                let r = pixels[off + 2];
-                v[off] = b.wrapping_sub(g);
-                v[off + 1] = g;
-                v[off + 2] = r.wrapping_sub(g);
-            }
-            Some(v)
-        } else {
-            None
-        };
-    let working: &[u8] = working_owned.as_deref().unwrap_or(pixels);
-    let mut residuals = vec![0u8; row_bytes * h];
-    if fused_left_decorr {
-        // Fused decorrelated-LEFT residuals straight from `pixels`.
-        forward_left_decorr_residuals(pixels, &mut residuals, 3);
-    } else {
-        // The gradient pre-pass output. For GradientDecorr the fused
-        // helper folds decorrelation in (round 103); for plain
-        // Gradient it's the same-column row subtract over `working`;
-        // for non-gradient methods `pred_input` borrows `working`
-        // directly (round 95 — no `working.clone()`).
-        let intermediate: Option<Vec<u8>> = if fused_decorr_gradient {
-            let mut iv = vec![0u8; row_bytes * h];
-            forward_decorr_gradient_subtract(pixels, &mut iv, 3, row_bytes, h);
-            Some(iv)
-        } else if method.predictor() == Predictor::Gradient {
-            let mut iv = vec![0u8; row_bytes * h];
-            forward_gradient_subtract(working, &mut iv, row_bytes, h);
-            Some(iv)
-        } else {
-            None
-        };
-        let pred_input: &[u8] = intermediate.as_deref().unwrap_or(working);
-        // Round 186: single linear stride-1 walk replaces the prior
-        // three-pass stride-3 channel loop (3× fewer cache traversals
-        // + a contiguous SIMD-friendly inner subtract). spec/03 §2.1
-        // encoder evidence `@0x10001850`. Bit-identical to the prior
-        // per-channel loop — regression guarded by
-        // `predict::tests::round186_rgb_left_linear_matches_per_channel_rgb24`.
-        forward_rgb_left_subtract_linear(pred_input, &mut residuals, 3);
+    if pixels.len() < n_channels {
+        return Err(Error::invalid(
+            "encoder: RGB frame needs at least one pixel",
+        ));
     }
-    // Wire seed: `00 B G R` (the decoder writes pad as 0; first
-    // pixel goes into bytes 1..4). For the fused LeftDecorr path the
-    // decorrelated seed is already in `residuals[0..3]`; for the fused
-    // GradientDecorr path it's the decorrelated first pixel computed
-    // from `pixels` (B−G, G, R−G); otherwise it's `working`'s first
-    // (decorrelated-or-plain) pixel.
-    let mut seed = [0u8; 4];
-    if fused_left_decorr {
-        seed[1] = residuals[0];
-        seed[2] = residuals[1];
-        seed[3] = residuals[2];
-    } else if fused_decorr_gradient {
-        let g0 = pixels[1];
-        seed[1] = pixels[0].wrapping_sub(g0); // B − G
-        seed[2] = g0; // G
-        seed[3] = pixels[2].wrapping_sub(g0); // R − G
-    } else {
-        seed[1] = working[0];
-        seed[2] = working[1];
-        seed[3] = working[2];
-    }
-    // Body covers per-pixel residuals from pixel 1 onward, with order
-    // determined by `decorrelate`. We build the body in wire-order
-    // here so the emit pass can be a flat slot-iteration.
-    let mut body = Vec::with_capacity((n_pixels - 1) * 3);
-    for px in 1..n_pixels {
-        let off = px * 3;
-        if method.decorrelate() {
-            // wire order: G (slot2), B-G (slot1), R-G (slot3).
-            body.push(residuals[off + 1]);
-            body.push(residuals[off]);
-            body.push(residuals[off + 2]);
-        } else {
-            // wire order: B (slot1), G (slot2), R (slot3).
-            body.push(residuals[off]);
-            body.push(residuals[off + 1]);
-            body.push(residuals[off + 2]);
+    let decorrelate = method.decorrelate();
+    let mut residuals = vec![0u8; pixels.len()];
+    match (method.predictor(), decorrelate) {
+        (Predictor::Median, _) => {
+            return Err(Error::invalid("encoder: method not legal for RGB"));
+        }
+        (Predictor::Left, false) => {
+            forward_rgb_left_subtract_linear(pixels, &mut residuals, n_channels);
+        }
+        (Predictor::Left, true) => {
+            forward_left_decorr_residuals(pixels, &mut residuals, n_channels);
+        }
+        (Predictor::Gradient, false) => {
+            let mut above_removed = vec![0u8; pixels.len()];
+            forward_gradient_stride(pixels, &mut above_removed, stride);
+            forward_rgb_left_subtract_linear(&above_removed, &mut residuals, n_channels);
+        }
+        (Predictor::Gradient, true) => {
+            let mut above_removed = vec![0u8; pixels.len()];
+            forward_decorr_gradient_stride(pixels, &mut above_removed, n_channels, stride);
+            forward_rgb_left_subtract_linear(&above_removed, &mut residuals, n_channels);
         }
     }
-    Ok(Residuals { seed, body })
-}
-
-fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Result<Residuals> {
-    let w = width as usize;
-    let h = height as usize;
-    // Round-262: family → wire-stride via the round-261 accessor
-    // (spec/02 §3 wire-byte layout table: 4 bytes per pixel,
-    // `+0:B +1:G +2:R +3:A`).
-    let row_bytes = PixelFamily::Rgb32.row_bytes(width);
-    if pixels.len() != row_bytes * h {
-        return Err(Error::invalid(format!(
-            "encoder: RGB32 pixel-buffer size {} ≠ expected {}",
-            pixels.len(),
-            row_bytes * h
-        )));
-    }
-    let n_pixels = w * h;
-    // Round 100: fuse decorrelation into the LEFT residual for the
-    // LeftDecorr path (spec/03 §2.4.1 — no intermediate decorrelated
-    // buffer), skipping the round-95 `working_owned` full-frame
-    // allocation. Alpha is NOT decorrelated (spec/03 §2.4 Validator
-    // note); the fused helper LEFT-predicts it like the colour
-    // channels.
-    let fused_left_decorr = method.decorrelate() && method.predictor() == Predictor::Left;
-    // Round 103: fuse decorrelation into the forward-gradient subtract
-    // for the GradientDecorr path (spec/03 §2.4.2 — gradient applied to
-    // each decorrelated channel). `forward_decorr_gradient_subtract`
-    // folds the per-pixel decorrelation (B−G / G / R−G; alpha identity)
-    // into the §2.2.2 same-column gradient subtract, reading
-    // un-transformed `pixels` directly, so `working_owned` is no longer
-    // allocated on this path. Alpha is identity in both the decorr and
-    // gradient steps (NOT decorrelated, spec/03 §2.4 Validator note).
-    let fused_decorr_gradient = method.decorrelate() && method.predictor() == Predictor::Gradient;
-    // Round 95: skip the `pixels.to_vec()` clone when no decorrelation
-    // is in play. With both decorr paths fused (round 100 + round 103)
-    // `working_owned` is never allocated anymore.
-    let working_owned: Option<Vec<u8>> =
-        if method.decorrelate() && !fused_left_decorr && !fused_decorr_gradient {
-            let mut v = vec![0u8; row_bytes * h];
-            for px in 0..n_pixels {
-                let off = px * 4;
-                let b = pixels[off];
-                let g = pixels[off + 1];
-                let r = pixels[off + 2];
-                let a = pixels[off + 3];
-                v[off] = b.wrapping_sub(g);
-                v[off + 1] = g;
-                v[off + 2] = r.wrapping_sub(g);
-                v[off + 3] = a; // alpha NOT decorrelated.
-            }
-            Some(v)
-        } else {
-            None
-        };
-    let working: &[u8] = working_owned.as_deref().unwrap_or(pixels);
-    let mut residuals = vec![0u8; row_bytes * h];
-    let seed = if fused_left_decorr {
-        forward_left_decorr_residuals(pixels, &mut residuals, 4);
-        // Fused path: the decorrelated seed pixel is in residuals[0..4]
-        // (B−G, G, R−G, A).
-        let mut s = [0u8; 4];
-        s.copy_from_slice(&residuals[..4]);
-        s
+    let seed = if n_channels == 3 {
+        [0, pixels[0], pixels[1], pixels[2]]
     } else {
-        // The gradient pre-pass output. For GradientDecorr the fused
-        // helper folds decorrelation in (round 103); for plain Gradient
-        // it's the same-column row subtract over `working`; for
-        // non-gradient methods `pred_input` borrows `working` directly
-        // (round 95 — no `working.clone()`).
-        let intermediate: Option<Vec<u8>> = if fused_decorr_gradient {
-            let mut iv = vec![0u8; row_bytes * h];
-            forward_decorr_gradient_subtract(pixels, &mut iv, 4, row_bytes, h);
-            Some(iv)
-        } else if method.predictor() == Predictor::Gradient {
-            let mut iv = vec![0u8; row_bytes * h];
-            forward_gradient_subtract(working, &mut iv, row_bytes, h);
-            Some(iv)
-        } else {
-            None
-        };
-        let pred_input: &[u8] = intermediate.as_deref().unwrap_or(working);
-        // Round 186: single linear stride-1 walk replaces the prior
-        // four-pass stride-4 channel loop (4× fewer cache traversals
-        // + a contiguous SIMD-friendly inner subtract). spec/03 §2.1
-        // encoder evidence `@0x10001b21..@0x10001b3c` (the RGB32-LEFT
-        // byte-3 / A emit reusing the same offset-N-back identity as
-        // the byte-0 / B emit). Bit-identical to the prior
-        // per-channel loop — regression guarded by
-        // `predict::tests::round186_rgb_left_linear_matches_per_channel_rgb32`.
-        forward_rgb_left_subtract_linear(pred_input, &mut residuals, 4);
-        // Seed = decorrelated-or-plain first pixel. For the fused
-        // GradientDecorr path compute it from `pixels` (B−G, G, R−G, A
-        // — alpha identity); otherwise read `working`'s first pixel.
-        if fused_decorr_gradient {
-            let g0 = pixels[1];
-            [
-                pixels[0].wrapping_sub(g0), // B − G
-                g0,                         // G
-                pixels[2].wrapping_sub(g0), // R − G
-                pixels[3],                  // A (identity)
-            ]
-        } else {
-            let mut s = [0u8; 4];
-            s.copy_from_slice(&working[..4]);
-            s
-        }
+        [pixels[0], pixels[1], pixels[2], pixels[3]]
     };
-    let mut body = Vec::with_capacity((n_pixels - 1) * 4);
-    for px in 1..n_pixels {
-        let off = px * 4;
-        if method.decorrelate() {
-            // wire order: G (slot2), B-G (slot1), R-G (slot3), A (slot3).
-            body.push(residuals[off + 1]);
-            body.push(residuals[off]);
-            body.push(residuals[off + 2]);
-            body.push(residuals[off + 3]);
+    // Body in wire order (spec/03 §1.4): `B, G, R[, A]` plain,
+    // `G, B−G, R−G[, A]` decorrelated.
+    let mut body = Vec::with_capacity(pixels.len() - n_channels);
+    for px in residuals[n_channels..].chunks_exact(n_channels) {
+        if decorrelate {
+            body.push(px[1]);
+            body.push(px[0]);
         } else {
-            // wire order: B (slot1), G (slot2), R (slot3), A (slot3).
-            body.push(residuals[off]);
-            body.push(residuals[off + 1]);
-            body.push(residuals[off + 2]);
-            body.push(residuals[off + 3]);
+            body.push(px[0]);
+            body.push(px[1]);
         }
+        body.extend_from_slice(&px[2..]);
     }
     Ok(Residuals { seed, body })
 }
@@ -1361,10 +847,7 @@ fn rgb32_residuals(method: Method, width: u32, height: u32, pixels: &[u8]) -> Re
 // ───────────────────────── histogram + length building ─────────────────────────
 
 /// Walks `body` directly to build the per-channel histograms, then
-/// runs the package-merge length-limited Huffman builder. Round 5
-/// drops the round-4 `&Residuals` wrapper here so the combined-body
-/// Vec from the interlaced walking-stride path can drive histogram
-/// building without an intermediate per-frame `Residuals` clone.
+/// runs the package-merge length-limited Huffman builder.
 fn compute_lengths_from_body(family: PixelFamily, method: Method, body: &[u8]) -> [[u8; 256]; 3] {
     let (h1, h2, h3) = histogramise(family, method, body);
     [
@@ -1586,9 +1069,6 @@ fn histogramise(
 /// LUT-build once at process start rather than per encode call.
 /// V1xCompat verification: walk the body in slot order and ensure
 /// each emitted symbol has a non-zero length in its slot's table.
-/// Round 5 takes `body: &[u8]` directly so the interlaced
-/// walking-stride path's combined body can be verified without an
-/// intermediate `Residuals` clone.
 fn verify_body_in_table(
     family: PixelFamily,
     method: Method,
@@ -1709,15 +1189,12 @@ fn verify_body_in_table(
 
 // ───────────────────────── bit-emit pass ─────────────────────────
 
-/// Round-5 walking-stride entry: emit one field's seed + body
-/// without copying body bytes into a per-field `Residuals`. The
-/// interlaced encoder calls this twice on the combined-body Vec
-/// (once with body=[..top_body_len], once with body=[top_body_len..])
-/// to avoid the round-4 per-field body allocations at emit time.
+/// Emit one frame: the 4-byte uncompressed first pixel followed by
+/// the bit-packed residual body (spec/02 §2, §4).
 ///
 /// Round-7 removed the `emit_bitstream` / `EmitParams` wrapper that
 /// previously fronted this routine — all callers now compute the
-/// seed/body parts via [`PrecomputedFrame`] and hand them through
+/// seed/body parts via [`Residuals`] and hand them through
 /// directly.
 #[allow(clippy::too_many_arguments)]
 fn emit_bitstream_parts(
@@ -2116,8 +1593,7 @@ mod round221_yuy2_emit_macropixel_tests {
             // CustomV2's emitted extradata) gives us slot1/2/3.
             let frame = compute_frame_residuals(PixelFamily::Yuy2, method, w, h, &pixels)
                 .expect("residuals");
-            let lengths =
-                compute_lengths_from_body(PixelFamily::Yuy2, method, &frame.combined_body);
+            let lengths = compute_lengths_from_body(PixelFamily::Yuy2, method, &frame.body);
             // Build the slot HuffTables from the computed lengths.
             // Matches the v2.x Custom path in encode_with_precomputed.
             let slot1 = HuffTable::build_from_lengths(&lengths[0]).expect("slot1");
@@ -2126,8 +1602,8 @@ mod round221_yuy2_emit_macropixel_tests {
 
             // Reference emit using the pre-r221 per-byte body.
             let ref_frame = ref_emit_yuy2_per_byte(
-                &frame.top_seed,
-                &frame.combined_body,
+                &frame.seed,
+                &frame.body,
                 &slot1.entries,
                 &slot2.entries,
                 &slot3.entries,
@@ -2142,8 +1618,8 @@ mod round221_yuy2_emit_macropixel_tests {
             let prod_emit = emit_bitstream_parts(
                 PixelFamily::Yuy2,
                 method,
-                &frame.top_seed,
-                &frame.combined_body,
+                &frame.seed,
+                &frame.body,
                 &slot1.entries,
                 &slot2.entries,
                 &slot3.entries,
@@ -2273,8 +1749,8 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
                 let frame = compute_frame_residuals(PixelFamily::Yuy2, method, w, h, &pixels)
                     .expect("residuals");
                 let (h1_prod, h2_prod, h3_prod) =
-                    histogramise(PixelFamily::Yuy2, method, &frame.combined_body);
-                let (h1_ref, h2_ref, h3_ref) = ref_histogramise_yuy2_per_byte(&frame.combined_body);
+                    histogramise(PixelFamily::Yuy2, method, &frame.body);
+                let (h1_ref, h2_ref, h3_ref) = ref_histogramise_yuy2_per_byte(&frame.body);
                 assert_eq!(
                     h1_prod, h1_ref,
                     "round227 slot1 histogram drift @ {}x{} {:?}",
@@ -2300,7 +1776,7 @@ mod round227_yuy2_histogram_verify_macropixel_tests {
                     .sum();
                 assert_eq!(
                     total,
-                    frame.combined_body.len() as u64,
+                    frame.body.len() as u64,
                     "round227 histogram total != body.len() @ {}x{} {:?}",
                     w,
                     h,
@@ -2701,8 +2177,8 @@ mod round239_rgb24_emit_pixel_step_tests {
             // Re-derive the residuals body + the per-channel tables the
             // encoder built for this frame so we can run the reference
             // per-byte emit against the same inputs.
-            let residuals =
-                compute_residuals(PixelFamily::Rgb24, method, w, h, &pixels).expect("residuals");
+            let residuals = compute_frame_residuals(PixelFamily::Rgb24, method, w, h, &pixels)
+                .expect("residuals");
             let (h1, h2, h3) = histogramise(PixelFamily::Rgb24, method, &residuals.body);
             let len1 = compute_canonical_lengths(&h1).expect("lens1");
             let len2 = compute_canonical_lengths(&h2).expect("lens2");
@@ -2834,9 +2310,8 @@ mod round242_rgb24_histogram_pixel_step_tests {
                 let frame = compute_frame_residuals(PixelFamily::Rgb24, method, w, h, &pixels)
                     .expect("residuals");
                 let (h1_prod, h2_prod, h3_prod) =
-                    histogramise(PixelFamily::Rgb24, method, &frame.combined_body);
-                let (h1_ref, h2_ref, h3_ref) =
-                    ref_histogramise_rgb24_per_byte(method, &frame.combined_body);
+                    histogramise(PixelFamily::Rgb24, method, &frame.body);
+                let (h1_ref, h2_ref, h3_ref) = ref_histogramise_rgb24_per_byte(method, &frame.body);
                 assert_eq!(
                     h1_prod, h1_ref,
                     "round242 slot1 histogram drift @ {}x{} {:?}",
@@ -2862,7 +2337,7 @@ mod round242_rgb24_histogram_pixel_step_tests {
                     .sum();
                 assert_eq!(
                     total,
-                    frame.combined_body.len() as u64,
+                    frame.body.len() as u64,
                     "round242 histogram total != body.len() @ {}x{} {:?}",
                     w,
                     h,
@@ -3187,8 +2662,8 @@ mod round245_rgb32_emit_pixel_step_tests {
             // Re-derive the residuals body + the per-channel tables the
             // encoder built for this frame so we can run the reference
             // per-byte emit against the same inputs.
-            let residuals =
-                compute_residuals(PixelFamily::Rgb32, method, w, h, &pixels).expect("residuals");
+            let residuals = compute_frame_residuals(PixelFamily::Rgb32, method, w, h, &pixels)
+                .expect("residuals");
             let (h1, h2, h3) = histogramise(PixelFamily::Rgb32, method, &residuals.body);
             let len1 = compute_canonical_lengths(&h1).expect("lens1");
             let len2 = compute_canonical_lengths(&h2).expect("lens2");
@@ -3330,9 +2805,8 @@ mod round250_rgb32_histogram_pixel_step_tests {
                 let frame = compute_frame_residuals(PixelFamily::Rgb32, method, w, h, &pixels)
                     .expect("residuals");
                 let (h1_prod, h2_prod, h3_prod) =
-                    histogramise(PixelFamily::Rgb32, method, &frame.combined_body);
-                let (h1_ref, h2_ref, h3_ref) =
-                    ref_histogramise_rgb32_per_byte(method, &frame.combined_body);
+                    histogramise(PixelFamily::Rgb32, method, &frame.body);
+                let (h1_ref, h2_ref, h3_ref) = ref_histogramise_rgb32_per_byte(method, &frame.body);
                 assert_eq!(
                     h1_prod, h1_ref,
                     "round250 slot1 histogram drift @ {}x{} {:?}",
@@ -3361,7 +2835,7 @@ mod round250_rgb32_histogram_pixel_step_tests {
                     .sum();
                 assert_eq!(
                     total,
-                    frame.combined_body.len() as u64,
+                    frame.body.len() as u64,
                     "round250 histogram total != body.len() @ {}x{} {:?}",
                     w,
                     h,
@@ -3607,11 +3081,7 @@ mod round262_residuals_row_bytes_accessor_tests {
         for (family, method, w, h) in cases {
             let exact = family.row_bytes(w) * h as usize;
             let good = synth(exact, 0xBEEF_CAFE);
-            let call = |buf: &[u8]| match family {
-                PixelFamily::Yuy2 => yuy2_residuals(method, w, h, buf),
-                PixelFamily::Rgb24 => rgb24_residuals(method, w, h, buf),
-                PixelFamily::Rgb32 => rgb32_residuals(method, w, h, buf),
-            };
+            let call = |buf: &[u8]| compute_frame_residuals(family, method, w, h, buf);
             assert!(
                 call(&good).is_ok(),
                 "{family:?}: row_bytes-sized buffer must be accepted"
@@ -3634,7 +3104,8 @@ mod round262_residuals_row_bytes_accessor_tests {
         let yw = 4u32;
         let yh = 3u32;
         let ypix = synth(PixelFamily::Yuy2.row_bytes(yw) * yh as usize, 0x1357_9BDF);
-        let yres = yuy2_residuals(Method::Left, yw, yh, &ypix).expect("yuy2");
+        let yres =
+            compute_frame_residuals(PixelFamily::Yuy2, Method::Left, yw, yh, &ypix).expect("yuy2");
         assert_eq!(
             yres.body.len(),
             PixelFamily::Yuy2.row_bytes(yw) * yh as usize - 4
@@ -3649,12 +3120,7 @@ mod round262_residuals_row_bytes_accessor_tests {
         ] {
             let (w, h) = (5u32, 3u32);
             let pix = synth(family.row_bytes(w) * h as usize, 0x2468_ACE0);
-            let res = match family {
-                PixelFamily::Rgb24 => rgb24_residuals(method, w, h, &pix),
-                PixelFamily::Rgb32 => rgb32_residuals(method, w, h, &pix),
-                PixelFamily::Yuy2 => unreachable!(),
-            }
-            .expect("residuals");
+            let res = compute_frame_residuals(family, method, w, h, &pix).expect("residuals");
             let n_pixels = (w * h) as usize;
             assert_eq!(
                 res.body.len(),
@@ -3767,43 +3233,16 @@ mod round382_arbitrary_extradata_conformance_tests {
         // the flat tables via `emit_bitstream_parts`.
         let frame =
             compute_frame_residuals(family, method, width, height, pixels).expect("residuals");
-        let frame_bytes = if frame.interlaced {
-            let mut out = emit_bitstream_parts(
-                family,
-                method,
-                &frame.top_seed,
-                &frame.combined_body[..frame.top_body_len],
-                &s1.entries,
-                &s2.entries,
-                &s3.entries,
-            )
-            .expect("emit top");
-            if let Some(bot_seed) = frame.bot_seed_opt {
-                let mut bot = emit_bitstream_parts(
-                    family,
-                    method,
-                    &bot_seed,
-                    &frame.combined_body[frame.top_body_len..],
-                    &s1.entries,
-                    &s2.entries,
-                    &s3.entries,
-                )
-                .expect("emit bot");
-                out.append(&mut bot);
-            }
-            out
-        } else {
-            emit_bitstream_parts(
-                family,
-                method,
-                &frame.top_seed,
-                &frame.combined_body,
-                &s1.entries,
-                &s2.entries,
-                &s3.entries,
-            )
-            .expect("emit")
-        };
+        let frame_bytes = emit_bitstream_parts(
+            family,
+            method,
+            &frame.seed,
+            &frame.body,
+            &s1.entries,
+            &s2.entries,
+            &s3.entries,
+        )
+        .expect("emit");
 
         // The decoder rebuilds its tables purely from the extradata
         // lengths — if it were classic-blob-locked, it would decode with
@@ -3888,204 +3327,5 @@ mod round382_arbitrary_extradata_conformance_tests {
         let pixels = synth(PixelFamily::Yuy2.row_bytes(w) * h as usize, 0x0F0F_1E1E);
         let lens = [flat_len8(), flat_len8(), flat_len8()];
         roundtrip_with_tables(PixelFamily::Yuy2, Method::Left, w, h, &pixels, &lens);
-    }
-}
-
-#[cfg(test)]
-mod round420_encode_parallel_tests {
-    //! Round-420 regression guard for the two-worker interlaced
-    //! encode path (`encode_frame_with_mode_workers`). Wire bytes
-    //! (strf AND frame body) must be byte-identical between budgets
-    //! for every input — the budget only reschedules work.
-
-    use super::*;
-
-    fn synth(n: usize, seed: u32) -> Vec<u8> {
-        let mut s = seed | 1;
-        let mut out = vec![0u8; n];
-        for slot in out.iter_mut() {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            *slot = s as u8;
-        }
-        out
-    }
-
-    fn bpp(family: PixelFamily) -> usize {
-        match family {
-            PixelFamily::Yuy2 => 2,
-            PixelFamily::Rgb24 => 3,
-            PixelFamily::Rgb32 => 4,
-        }
-    }
-
-    fn legal_methods(family: PixelFamily) -> &'static [Method] {
-        match family {
-            PixelFamily::Yuy2 => &[
-                Method::PredictOld,
-                Method::Left,
-                Method::Gradient,
-                Method::Median,
-            ],
-            PixelFamily::Rgb24 | PixelFamily::Rgb32 => &[
-                Method::PredictOld,
-                Method::Left,
-                Method::LeftDecorr,
-                Method::GradientDecorr,
-            ],
-        }
-    }
-
-    const FAMILIES: [PixelFamily; 3] = [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32];
-    const MODES: [ExtradataMode; 3] = [
-        ExtradataMode::ClassicV2,
-        ExtradataMode::CustomV2,
-        ExtradataMode::V1xCompat,
-    ];
-
-    /// Budget-2 encode is byte-identical to serial encode on
-    /// interlaced frames across the full family/method/mode matrix,
-    /// including an odd interlaced height (top field one row taller),
-    /// and round-trips losslessly through the budget-2 decoder.
-    #[test]
-    fn round420_encode_workers2_matches_serial_interlaced_matrix() {
-        for family in FAMILIES {
-            for &method in legal_methods(family) {
-                for mode in MODES {
-                    for (w, h) in [(32u32, 292u32), (16, 293), (48, 289)] {
-                        let pixels = synth((w as usize) * (h as usize) * bpp(family), 0x0420_0007);
-                        let serial = encode_frame_with_mode(family, method, w, h, &pixels, mode)
-                            .expect("serial encode");
-                        let parallel =
-                            encode_frame_with_mode_workers(family, method, w, h, &pixels, mode, 2)
-                                .expect("parallel encode");
-                        assert_eq!(
-                            serial.0, parallel.0,
-                            "strf drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
-                        );
-                        assert_eq!(
-                            serial.1, parallel.1,
-                            "wire drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
-                        );
-                        let cfg = crate::header::StreamConfig::parse_bitmapinfoheader(&parallel.0)
-                            .expect("parse");
-                        let decoded =
-                            crate::decoder::decode_frame_with_workers(&cfg, &parallel.1, 2)
-                                .expect("decode");
-                        assert_eq!(
-                            decoded.pixels, pixels,
-                            "lossless drift: {family:?}/{method:?}/{mode:?}/{w}x{h}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Budgets 0/1 take the serial path, > 2 clamps to the two field
-    /// units; all budgets produce identical wire bytes. Progressive
-    /// frames ignore the budget entirely.
-    #[test]
-    fn round420_encode_budget_clamp_and_progressive_noop() {
-        let (w, h) = (32u32, 292u32);
-        let pixels = synth((w as usize) * (h as usize) * 2, 0x0420_0008);
-        let serial = encode_frame_with_mode(
-            PixelFamily::Yuy2,
-            Method::Median,
-            w,
-            h,
-            &pixels,
-            ExtradataMode::CustomV2,
-        )
-        .expect("encode");
-        for budget in [0usize, 1, 2, 3, 8, 64] {
-            let out = encode_frame_with_mode_workers(
-                PixelFamily::Yuy2,
-                Method::Median,
-                w,
-                h,
-                &pixels,
-                ExtradataMode::CustomV2,
-                budget,
-            )
-            .expect("encode");
-            assert_eq!(out, serial, "budget {budget} diverged");
-        }
-        let (w, h) = (48u32, 32u32);
-        let pixels = synth((w as usize) * (h as usize) * 3, 0x0420_0009);
-        let serial = encode_frame_with_mode(
-            PixelFamily::Rgb24,
-            Method::GradientDecorr,
-            w,
-            h,
-            &pixels,
-            ExtradataMode::ClassicV2,
-        )
-        .expect("encode");
-        let budgeted = encode_frame_with_mode_workers(
-            PixelFamily::Rgb24,
-            Method::GradientDecorr,
-            w,
-            h,
-            &pixels,
-            ExtradataMode::ClassicV2,
-            8,
-        )
-        .expect("encode");
-        assert_eq!(serial, budgeted, "progressive budget must be a no-op");
-    }
-
-    /// Illegal (family, method) pairs are rejected identically by both
-    /// entry points, and wrong-size pixel buffers error (not panic)
-    /// through the parallel path exactly like the serial one.
-    #[test]
-    fn round420_encode_workers_error_parity() {
-        let pixels = synth(32 * 292 * 2, 0x0420_000A);
-        assert!(
-            encode_frame_with_mode_workers(
-                PixelFamily::Yuy2,
-                Method::LeftDecorr,
-                32,
-                292,
-                &pixels,
-                ExtradataMode::ClassicV2,
-                2,
-            )
-            .is_err()
-        );
-        assert!(
-            encode_frame_with_mode_workers(
-                PixelFamily::Rgb24,
-                Method::Median,
-                32,
-                292,
-                &pixels,
-                ExtradataMode::ClassicV2,
-                2,
-            )
-            .is_err()
-        );
-        // Odd YUY2 width errors from compute_residuals on both paths
-        // (width 2·k+1 with an interlaced height).
-        let odd = synth(31 * 292 * 2, 0x0420_000B);
-        let serial = encode_frame_with_mode(
-            PixelFamily::Yuy2,
-            Method::Left,
-            31,
-            292,
-            &odd,
-            ExtradataMode::ClassicV2,
-        );
-        let parallel = encode_frame_with_mode_workers(
-            PixelFamily::Yuy2,
-            Method::Left,
-            31,
-            292,
-            &odd,
-            ExtradataMode::ClassicV2,
-            2,
-        );
-        assert!(serial.is_err() && parallel.is_err());
     }
 }

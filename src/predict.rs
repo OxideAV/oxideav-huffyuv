@@ -8,13 +8,18 @@
 //! residuals; the encoder calls them to *produce* residuals from
 //! pixels. Both directions are byte-modular.
 //!
-//! # Interlaced mode (spec/02 §2 + spec/05 planned)
+//! # Field coding (spec/06)
 //!
-//! When `biHeight > 288` the codec splits the source into two fields
-//! (even rows = top field; odd rows = bottom field) and predicts each
-//! field independently. The two fields' bitstreams are concatenated
-//! per-frame. Helpers [`is_interlaced_height`], [`split_fields`] and
-//! [`interleave_fields`] implement the row demux / mux.
+//! A field-coded frame is predicted over the *wide raster*: the only
+//! change from the plain raster is that every "above" reference is
+//! `2 × row_bytes` bytes back instead of `row_bytes` (spec/06 §2.1).
+//! Nothing is reordered, there is one first pixel per frame and no
+//! predictor reset between fields (spec/06 §2.2, §3.4). The
+//! `*_stride` helpers below therefore take the prediction row length
+//! in bytes and work on byte positions, which also covers the
+//! half-filled last wide row of an odd height (spec/06 §2.4).
+//! [`split_fields`] / [`interleave_fields`] are plain row
+//! demux / mux utilities and are **not** part of the wire model.
 
 /// Branchless three-value median over unsigned bytes (mod-256
 /// gradient context). spec/03 §2.3:
@@ -1073,6 +1078,167 @@ pub fn forward_rgb_left_subtract_linear(src: &[u8], dst: &mut [u8], n_channels: 
     while i < n {
         dst[i] = src[i].wrapping_sub(src[i - n_channels]);
         i += 1;
+    }
+}
+
+/// Gradient post-pass over byte positions (spec/03 §2.2.2 pass 2,
+/// spec/06 §3.2): every byte from position `stride` to the end has
+/// the byte `stride` positions back added to it, in increasing
+/// position order. `stride` is the prediction row length in bytes —
+/// `row_bytes` for the plain raster, `2 × row_bytes` for a field-coded
+/// frame. The first `stride` bytes are left untouched (they were
+/// LEFT-coded only).
+pub fn inverse_gradient_stride(out: &mut [u8], stride: usize) {
+    let n = out.len();
+    if stride == 0 || n <= stride {
+        return;
+    }
+    const MASK_LO: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const MASK_HI: u64 = 0x8080_8080_8080_8080;
+    let mut pos = stride;
+    if stride >= 8 {
+        // An 8-byte step only reads bytes at least `stride ≥ 8`
+        // positions back, all final before the step starts.
+        while pos + 8 <= n {
+            let mut a_buf = [0u8; 8];
+            a_buf.copy_from_slice(&out[pos..pos + 8]);
+            let a = u64::from_le_bytes(a_buf);
+            let mut b_buf = [0u8; 8];
+            b_buf.copy_from_slice(&out[pos - stride..pos - stride + 8]);
+            let b = u64::from_le_bytes(b_buf);
+            let lo = (a & MASK_LO).wrapping_add(b & MASK_LO);
+            let sum = ((a ^ b) & MASK_HI) ^ lo;
+            out[pos..pos + 8].copy_from_slice(&sum.to_le_bytes());
+            pos += 8;
+        }
+    }
+    while pos < n {
+        out[pos] = out[pos].wrapping_add(out[pos - stride]);
+        pos += 1;
+    }
+}
+
+/// Gradient pre-pass over byte positions (spec/03 §2.2.2, spec/06
+/// §3.2): the first `stride` bytes are copied, every later byte is
+/// replaced by `src[i] − src[i − stride]`. The result is then
+/// LEFT-coded by the caller.
+pub fn forward_gradient_stride(src: &[u8], dst: &mut [u8], stride: usize) {
+    assert_eq!(dst.len(), src.len(), "dst length != src length");
+    let n = src.len();
+    let head = stride.min(n);
+    dst[..head].copy_from_slice(&src[..head]);
+    if stride == 0 {
+        return;
+    }
+    let (cur, above) = (&src[head..], &src[..n - head]);
+    for ((d, &c), &a) in dst[head..].iter_mut().zip(cur).zip(above) {
+        *d = c.wrapping_sub(a);
+    }
+}
+
+/// Gradient pre-pass with the RGB decorrelation folded in (spec/03
+/// §2.4.2, spec/06 §3.2): `dst` receives, per pixel, the decorrelated
+/// channels (`B − G`, `G`, `R − G`, and `A` unchanged for
+/// `n_channels == 4`) for the first `stride` bytes and the
+/// decorrelated value minus the decorrelated value `stride` bytes back
+/// for the rest. `stride` must be a whole number of pixels.
+pub fn forward_decorr_gradient_stride(
+    pixels: &[u8],
+    dst: &mut [u8],
+    n_channels: usize,
+    stride: usize,
+) {
+    assert_eq!(pixels.len(), dst.len(), "dst length != pixels length");
+    debug_assert!(n_channels == 3 || n_channels == 4);
+    debug_assert!(stride.is_multiple_of(n_channels));
+    let n = pixels.len() - pixels.len() % n_channels;
+    let decorr = |px: &[u8]| -> [u8; 4] {
+        let g = px[1];
+        [
+            px[0].wrapping_sub(g),
+            g,
+            px[2].wrapping_sub(g),
+            if n_channels == 4 { px[3] } else { 0 },
+        ]
+    };
+    let mut off = 0usize;
+    while off < n {
+        let cur = decorr(&pixels[off..off + n_channels]);
+        if stride == 0 || off < stride {
+            dst[off..off + n_channels].copy_from_slice(&cur[..n_channels]);
+        } else {
+            let above = decorr(&pixels[off - stride..off - stride + n_channels]);
+            for c in 0..n_channels {
+                dst[off + c] = cur[c].wrapping_sub(above[c]);
+            }
+        }
+        off += n_channels;
+    }
+}
+
+/// Byte distance to the previous sample of the same YUY2 channel
+/// (spec/03 §2.1.1, restated in spec/06 §3): luma sits at even wire
+/// positions and its previous sample is 2 bytes back; a chroma sample
+/// (odd positions) has its previous sample 4 bytes back.
+#[inline]
+fn yuy2_left_distance(pos: usize) -> usize {
+    if pos & 1 == 0 { 2 } else { 4 }
+}
+
+/// End of the LEFT-only start region of a YUY2 median frame (spec/03
+/// §2.3.2, spec/06 §3.3): one prediction row plus 8 wire bytes,
+/// capped at the frame length.
+#[inline]
+fn yuy2_median_start(len: usize, stride: usize) -> usize {
+    if stride == 0 {
+        len
+    } else {
+        stride.saturating_add(8).min(len)
+    }
+}
+
+/// YUY2 median residuals (spec/03 §2.3, spec/06 §3.3). The first four
+/// bytes are the uncompressed macropixel, bytes up to
+/// `stride + 8` carry LEFT residuals, and every later byte carries
+/// `value − median(left, above, left + above − above_left)` where
+/// `left` is the previous sample of the same channel, `above` is
+/// `stride` bytes back and `above_left` is the previous sample of the
+/// same channel on the prediction row above. `stride` must be a
+/// multiple of 4.
+pub fn forward_median_yuy2(pixels: &[u8], dst: &mut [u8], stride: usize) {
+    assert_eq!(pixels.len(), dst.len(), "dst length != pixels length");
+    let n = pixels.len();
+    let copy_n = 4.min(n);
+    dst[..copy_n].copy_from_slice(&pixels[..copy_n]);
+    let median_start = yuy2_median_start(n, stride);
+    for i in copy_n..median_start {
+        dst[i] = pixels[i].wrapping_sub(pixels[i - yuy2_left_distance(i)]);
+    }
+    for pos in median_start..n {
+        let back = yuy2_left_distance(pos);
+        let l = pixels[pos - back];
+        let a = pixels[pos - stride];
+        let al = pixels[pos - stride - back];
+        dst[pos] = pixels[pos].wrapping_sub(median3(l, a, gradient_predictor(l, a, al)));
+    }
+}
+
+/// Inverse of [`forward_median_yuy2`], in place: `out` holds the
+/// uncompressed first macropixel followed by decoded residuals and is
+/// rewritten to pixel values.
+pub fn inverse_median_yuy2(out: &mut [u8], stride: usize) {
+    let n = out.len();
+    if n <= 4 {
+        return;
+    }
+    let median_start = yuy2_median_start(n, stride);
+    inverse_yuy2_left_macropixel(out, 4, median_start);
+    for pos in median_start..n {
+        let back = yuy2_left_distance(pos);
+        let l = out[pos - back];
+        let a = out[pos - stride];
+        let al = out[pos - stride - back];
+        out[pos] = out[pos].wrapping_add(median3(l, a, gradient_predictor(l, a, al)));
     }
 }
 

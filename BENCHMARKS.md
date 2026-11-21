@@ -177,6 +177,12 @@ longer pay `build_from_lengths` per frame at all outside CustomV2
 
 ### Worker scaling (round 420)
 
+> **Withdrawn (round 493).** The figures in this section measured
+> two-worker decode / encode of a two-independent-fields layout that
+> only this crate read and wrote. Field-coded frames are now a single
+> codeword stream (spec/06) and have no parallel split; the section is
+> kept as history until the tables are re-measured.
+
 Round 420 added the `ExecutionContext`-gated two-worker interlaced
 paths (`decode_frame_with_workers` / `encode_frame_with_mode_workers`)
 plus the scan-side pair-length LUTs. Measured on the same aarch64 dev

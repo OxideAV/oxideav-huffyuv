@@ -24,39 +24,30 @@ No external library source consulted.
   `biSize ∈ {0x28, > 0x28}` / low-3-bits-of-`biBitCount` shortcuts
   and the `bpp_override` byte.
 - **Per-frame decode** for the 8-bit pixel families: YUY2 (16-bit,
-  top-down), RGB24 (24-bit, bottom-up), RGB32 (32-bit, bottom-up).
+  top-down), RGB24 (24-bit, bottom-up), RGB32 (32-bit with alpha,
+  bottom-up).
 - **All six predictor methods**: `predict_old` (`-2`), `Left` (`0`),
   `Gradient` (`1`, YUV-only), `Median` (`2`, YUV-only), `LeftDecorr`
   (`0x40`, RGB-only), `GradientDecorr` (`0x41`, RGB-only).
 - **Both Huffman-table paths**: v2.x extradata (RLE-compressed length
   tables, canonical Huffman code build) and v1.x precomputed-codes.
-- **Interlaced field-stride prediction**: the frame splits into two
-  independently-predicted fields and is reassembled on decode. The
-  trigger honours the extradata `interlace_flag` byte (BIH `+0x2A`,
-  high nibble `1`=interlaced / `2`=non-interlaced) as the **primary**
-  indicator when set, falling back to the `biHeight > 288` heuristic
-  when the byte is `0x00` (the x86-64 build / clean-room default).
+- **Field-coded ("interlaced") frames** per spec/06: the extradata
+  interlace byte (BIH `+0x2A`) decides when its high nibble is `1`
+  (fields) or `2` (plain raster), otherwise `biHeight > 288` does. A
+  field-coded frame has the same single first pixel and single
+  codeword stream as a plain one; only the predictors' "above"
+  reference moves two frame rows back. Odd heights are handled.
 - A 65 536-entry primary lookup table per Huffman table services codes
   ≤ 16 bits in a single indexed load; longer codes fall through to a
-  flat overflow table. Full pair LUTs (round 429) resolve two
-  codewords per 32-bit load on the serial decode critical path; round
-  440's phase-flip pairing extends this to RGB24's third codeword by
-  walking two pixels per step (the middle pair crosses the pixel
-  boundary), so every codeword of every family rides a pair read.
+  flat overflow table. Full pair LUTs resolve two codewords per 32-bit
+  load on the decode critical path, for every family (RGB24 walks two
+  pixels per step so its third codeword pairs across the pixel
+  boundary).
 - **Arbitrary v2.x extradata** (spec/04 §3.4): the decoder accepts
   *any* set of three RLE-compressed 256-entry length tables in the
   extradata — not only the six classic blobs — deriving per-symbol
   codes by canonical-Huffman construction, and ignores the RGB24 "X"
-  pad byte's value (spec/02 §8 #2). A dedicated conformance suite pins
-  both contracts.
-- **Two-worker interlaced decode** (round 420): the two
-  independently-coded fields decode on parallel workers when the
-  caller grants a thread budget ≥ 2 (`decode_frame_with_workers`, or
-  `ExecutionContext` through the registry `Decoder`). The wire
-  carries no bottom-field offset, so the second worker is fed by a
-  bit-exact length-only scan of the top field's codeword stream.
-  Serial by default; output byte-identical across budgets (golden-pin
-  invariance suite + fuzz differential oracle).
+  pad byte's value (spec/02 §8 #2).
 
 ### Encode
 
@@ -70,10 +61,7 @@ No external library source consulted.
     stream, runs a length-limited (max-31) package-merge Huffman
     builder, and RLE-encodes the resulting length tables inline. The
     RLE stream is guaranteed free of in-band `0x00` bytes (spec/04
-    §3.3 C-string-terminator convention: length-0 runs are emitted as
-    short-form chunks, never long-form), so `lstrcpyA`/`lstrlenA`-based
-    third-party tooling can copy/measure the extradata without
-    truncating it.
+    §3.3 C-string-terminator convention).
   - **`V1xCompat`** — emits `biSize == 0x28` with no extradata; the
     decoder reads its codebook from the v1.x precomputed-codes set.
 - **Predictor auto-selection** (`encode_frame_auto` with
@@ -81,29 +69,22 @@ No external library source consulted.
   scores each with `bit_cost_for_method` against the package-merge
   optimal length tables, and emits the winner (returning the chosen
   `Method`). Pin a method via `MethodSelection::Fixed(...)`.
+  `encode_frame_auto_workers` fans the candidate scoring out across a
+  caller-granted thread budget with identical output.
 - Public **`build_bitmapinfoheader`** BIH writer for muxers
-  synthesising an AVI `strf` payload; emits the i386-style
-  `interlace_flag` byte (`0x10`/`0x20`) at BIH `+0x2A`.
-- **Interlaced encode** for `biHeight > 288`, walking the source
-  raster with row-stride 2 into a single reused scratch field buffer.
-- **Two-worker interlaced encode** (round 420,
-  `encode_frame_with_mode_workers`): with a thread budget ≥ 2 the two
-  fields' residual and bit-pack phases run on parallel workers; wire
-  bytes stay byte-identical to the serial encoder.
-- **Budgeted auto-selection** (round 429,
-  `encode_frame_auto_workers`): the per-candidate scoring fans out
-  across the granted workers (serial in-order reduction, so winner /
-  tie-break / error order match the serial selector exactly) and the
-  winner's emit gets the interlaced two-worker clamp — identical
-  `(strf, bytes, method)` across budgets.
+  synthesising an AVI `strf` payload; writes the interlace byte
+  `0x10` / `0x20` at BIH `+0x2A` (spec/06 §1.2).
+- **Field coding** for `biHeight > 288` (spec/06 §1.1), with the
+  matching interlace byte, so the stream decodes the same way under
+  the height rule and under the byte rule.
 
-### Registry (round 429: full dual-API on both sides)
+### Registry
 
 - Registry `Decoder` **and** `Encoder` implementations wired by
   `register()`, with `make_decoder` / `make_encoder` also exposed
-  directly. Both honour `set_execution_context` (serial default;
-  budget ≥ 2 engages the field-parallel interlaced paths and the
-  parallel auto scoring) with byte-identical output across budgets.
+  directly. Both honour `set_execution_context` (serial default; a
+  budget ≥ 2 engages the parallel auto-selector scoring) with
+  byte-identical output across budgets.
 - Encoder options bag (`HuffYuvEncoderOptions`, schema-registered):
   `format` = `auto`|`yuy2`|`rgb24`|`rgb32` (`auto` derives from
   `CodecParameters::pixel_format` — `Yuyv422`/`Bgr24`/`Bgra`),
@@ -123,22 +104,51 @@ No external library source consulted.
 ### FourCCs
 
 Native FourCCs `HFYU` + `FFVH` are registered via `oxideav-core`'s
-codec registry (codec id `"huffyuv"`), so `oxideav-avi` resolves a
-HuffYUV stream's `biCompression` straight through `CodecResolver`.
-The encoder advertises `HFYU` on `output_params().tag` (matching the
-`biCompression` it writes).
+codec registry (codec id `"huffyuv"`). The encoder writes `HFYU`.
+
+`FFVH` is an extended variant of the format with no specification in
+the clean-room reference workspace. A stream tagged `FFVH` is decoded
+only when its header stays byte-for-byte inside the `HFYU` layout
+(packed 4:2:2 / RGB24 / RGB32, 8-bit, stream-level tables); every
+other `FFVH` stream — planar 4:2:0 / 4:1:0 / 4:1:1 / 4:4:4 / 4:4:0,
+gray, alpha planes, 9–16-bit, planar RGB, per-frame tables — is
+refused with `Error::Unsupported` rather than mis-decoded.
+
+## Interoperability (live black-box matrix)
+
+`tests/blackbox_matrix.rs` generates and checks two sweeps against
+the `ffmpeg` command-line tool used as an opaque binary (the test
+skips when the tool is absent; nothing large is committed):
+
+| Sweep | Cells | Result |
+|-------|------:|--------|
+| Foreign → ours: both black-box encoders × 3 packed formats × 3 predictors × field flag on/off × 13–18 rasters (2×1 … 720×576, odd widths and heights, both sides of 288 lines) × 1–3 frames | 380 writable `HFYU`-layout streams | **380 / 380 bit-exact** against the source raster (and against the black-box decoder wherever it accepts its own stream) |
+| Foreign → ours: `FFVH`-only variants (23 extra pixel formats × 3 predictors × per-frame tables on/off, plus per-frame tables on the packed formats) | 180 writable streams | **180 / 180 refused** cleanly (unspecified extensions) |
+| Ours → foreign: 3 families × 4 methods × 3 extradata modes × 12–13 rasters | 380 comparable streams | **380 / 380 accepted without a diagnostic and bit-exact** |
+
+Not comparable (76 further cells): method byte `-2` (`predict_old`)
+next to extradata. spec/01 §3.1 makes it legal and equivalent to
+`left`; the black-box decoder reads that byte as predictor flags and
+rejects or mis-reads it. Use `left` when the stream must play in other
+decoders; `predict_old` without extradata (`v1x`) is accepted.
+
+`tests/foreign_pins.rs` pins six tiny third-party streams as bytes so
+the fixed bugs stay fixed without the tool installed.
+
+Encoded size against the black-box encoder on the same rasters is in
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Public API
 
 - `decode_frame(&StreamConfig, frame_bytes) -> Result<DecodedFrame>`
 - `decode_frame_with_workers(&StreamConfig, frame_bytes, worker_budget)`
-  — same output, field-parallel interlaced decode under an
-  `ExecutionContext`-style thread budget (`decode_frame` ≡ budget 1)
+  — same output at every budget (a frame is one codeword stream, so
+  decode has a single unit of work)
 - `encode_frame` / `encode_frame_with_mode` / `encode_frame_auto`
-- `encode_frame_with_mode_workers(..., worker_budget)` — budgeted
-  field-parallel interlaced encode, wire-identical to the serial path
+- `encode_frame_with_mode_workers(..., worker_budget)` — same wire
+  bytes at every budget
 - `encode_frame_auto_workers(..., worker_budget)` — budgeted
-  candidate scoring + winner emit, identical output across budgets
+  candidate scoring, identical output across budgets
   (`encode_frame_auto` ≡ budget 1)
 - `build_bitmapinfoheader`, `bit_cost_for_method`
 - `Method`, `PixelFamily`, `Predictor`, `StreamConfig`,
@@ -164,41 +174,35 @@ diagonal-gradient pattern (no committed fixtures). On Apple Silicon
 symbol reads, 64-bit-accumulator `BitWriter`, count-based
 package-merge) YUY2-LEFT 320×240 decodes at ~0.64 ms/frame
 (~230 MiB/s) and encodes at ~0.14 ms/frame (~1.0 GiB/s); decode runs
-~173–247 MiB/s and encode ~233 MiB/s–1.0 GiB/s across the matrix. All
-round-419 performance work is output-invariant, pinned by the 78-entry
-golden-hash suite in `tests/golden_pins.rs`.
+~173–247 MiB/s and encode ~233 MiB/s–1.0 GiB/s across the matrix.
+Performance work is output-invariant against the 78-entry golden-hash
+suite in `tests/golden_pins.rs` (re-pinned in round 493 after the
+wire-format corrections; the new pins are the bytes the black-box
+decoder accepts).
 
-Round 420 adds `ExecutionContext`-budgeted field-parallel interlaced
-decode/encode: with 2 granted workers, interlaced 720p decode runs
-1.33–1.47× (e.g. YUY2 Left 7.91 → 5.47 ms via a pair-length-LUT
-split scan) and encode 1.72–1.99× (RGB32 GradientDecorr
-10.78 → 5.43 ms) over the unchanged serial walls — byte-identical
-output across budgets. See the worker-scaling table in
-[`BENCHMARKS.md`](BENCHMARKS.md).
+The two-worker field-parallel decode / encode figures published for
+rounds 420–440 are withdrawn: they measured a two-independent-fields
+layout that this crate alone read and wrote (see *Interoperability*).
+A real field-coded frame is one codeword stream with no split point.
 
 Round 429 extends the budget to the auto-selector
 (`encode_frame_auto_workers`): 720p YUY2 auto encodes drop 6.42 →
 3.95 ms (custom, 1.62×) and 6.75 → 3.91 ms (classic, 1.73×) at 2
-workers; an interlaced RGB32 960×400 auto encode reaches 2.15×
-(6.29 → 2.93 ms) at 3 workers with scoring and emit both fanned out.
+workers (candidate scoring only; the emit is serial).
 
 Round 429 also lands the r419 serial-decode lever: full pair LUTs
 (16-bit window → both symbols + combined length in one 32-bit load,
 lazily built per stream behind the table cache) cut serial decode
 23–33% across the gates — YUY2 Left 320×240 0.64 → 0.43 ms
 (345 MiB/s), YUY2 Left 720p interlaced 7.73 → 5.31 ms, RGB24
-LeftDecorr 1.26 → 0.95 ms — with byte-identical output.
+LeftDecorr 1.26 → 0.95 ms.
 
-Round 440 closes the two levers the r429 notes left named:
-**RGB24 phase-flip pairing** (two pixels per decode step so the
-third codeword pairs across the pixel boundary — 320×240 LeftDecorr
-−8.4% serial, and mirrored into the split scanner so interlaced
-RGB24 gains a proper 2-worker win: 11.39 → 8.44 ms on 720p,
-**1.35×**, with a new `decode_workers_rgb24_*` gate) and **lean
-CustomV2 encoder tables** (the emit path reads only `(code, length)`
-entries, so the per-frame 64-Ki decode-LUT bake is skipped —
-320×240 auto-custom encodes −10.0% YUY2 / −7.1% RGB24). All
-byte-identical, golden-pinned.
+Round 440 adds **RGB24 phase-flip pairing** (two pixels per decode
+step so the third codeword pairs across the pixel boundary — 320×240
+LeftDecorr −8.4% serial) and **lean CustomV2 encoder tables** (the
+emit path reads only `(code, length)` entries, so the per-frame 64-Ki
+decode-LUT bake is skipped — 320×240 auto-custom encodes −10.0% YUY2
+/ −7.1% RGB24).
 
 ## Fuzzing
 
@@ -218,15 +222,13 @@ The contract is panic-/OOM-freedom on any input; declared rasters
 above a size cap are skipped as an expected resource request, not a
 logic bug.
 
-## Out of scope (deferred)
+## Not supported
 
-- 10/12-bit FFVHuff family — excluded from the clean-room reference
-  workspace; only the original `HFYU` FourCC HuffYUV is targeted.
-- Third-party-fixture lockstep — no `HFYU` / `FFVH` sample fixtures
-  are available, so the lockstep test runs against synthetic encoder
-  output. The interlaced wire format is self-roundtrip-correct;
-  bit-exact lockstep against a third-party interlaced encoder awaits
-  the canonical interlace spec chapter + a fixture.
+- The `FFVH` extensions listed under *FourCCs* (planar and
+  high-bit-depth formats, alpha planes, per-frame tables): the
+  clean-room reference workspace specifies only `HFYU`.
+- Top-down (negative `biHeight`) streams are read with the absolute
+  height; spec/06 §1.5 leaves their handling unestablished.
 
 ## License
 

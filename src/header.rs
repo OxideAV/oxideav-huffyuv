@@ -276,6 +276,29 @@ impl StreamConfig {
             )));
         }
 
+        // `FFVH`-tagged streams: the reference workspace specifies only
+        // the `HFYU` stream (spec/00 "Out of scope"; spec/01 §1.5). An
+        // `FFVH` header is decoded only when its extradata prefix is
+        // byte-for-byte within what spec/01 §3 defines for `HFYU` —
+        // effective bit count 16 / 24 / 32, interlace byte `0x00` /
+        // `0x10` / `0x20`, pad byte `0x00`. Anything else signals an
+        // extension this crate has no specification for; refuse it
+        // instead of mis-reading the frame.
+        if bi_compression == FOURCC_FFVH && (bi_size as usize) > 0x28 {
+            let prefix = strf
+                .get(0x28..0x2C)
+                .ok_or_else(|| Error::invalid("FFVH: extradata shorter than the 4-byte prefix"))?;
+            let bits_ok = matches!(prefix[1], 0 | 16 | 24 | 32);
+            let interlace_ok = matches!(prefix[2], 0x00 | 0x10 | 0x20);
+            if !bits_ok || !interlace_ok || prefix[3] != 0 {
+                return Err(Error::unsupported(format!(
+                    "FFVH stream with extradata prefix {:02x} {:02x} {:02x} {:02x}: \
+                     only the HFYU-compatible subset is specified",
+                    prefix[0], prefix[1], prefix[2], prefix[3]
+                )));
+            }
+        }
+
         // Method resolution (spec/01 §1.4 + §3.1):
         //
         // - Low 3 bits of biBitCount carry a v1.x predictor selector
@@ -403,15 +426,13 @@ impl StreamConfig {
         self.family.row_bytes(self.width)
     }
 
-    /// `true` when this stream uses the field-stride=2 interlaced path.
+    /// `true` when this stream is field-coded, i.e. predicted over
+    /// the wide raster of spec/06 §2 ("above" = two frame rows back).
     ///
-    /// The extradata `interlace_flag` byte (BIH `+0x2A`, spec/01 §3) is
-    /// the **primary** indicator when set: its high nibble `1` forces
-    /// interlaced, `2` forces non-interlaced. When the flag is `0x00`
-    /// (the x86-64 build / clean-room default) or its high nibble is
-    /// outside `{1, 2}`, the decision falls back to the `biHeight > 288`
-    /// heuristic (spec/02 §2 disassembly note + spec/01 §3 Validation
-    /// note). Thin wrapper around
+    /// spec/06 §1.3: the extradata `interlace_flag` byte (BIH `+0x2A`)
+    /// wins when its high nibble is `1` (fields) or `2` (plain
+    /// raster); any other value, including the `0x00` some encoders
+    /// write, falls back to `biHeight > 288`. Thin wrapper around
     /// [`crate::predict::interlaced_from_flag_and_height`].
     #[inline]
     pub fn is_interlaced(&self) -> bool {

@@ -145,7 +145,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "yuy2/predict_old/classic/32x292",
         0x7e599ef643dbb4c4,
-        0x0262fa1232a31ec5,
+        0x409b5dff73d3ed83,
     ),
     (
         "yuy2/predict_old/custom/48x32",
@@ -154,8 +154,8 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     ),
     (
         "yuy2/predict_old/custom/32x292",
-        0xd7b621f7e80a1f8c,
-        0xa417e79e55f1e281,
+        0x138b878e598e61ab,
+        0x0b16f49ba13e192f,
     ),
     (
         "yuy2/predict_old/v1x/48x32",
@@ -165,7 +165,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "yuy2/predict_old/v1x/32x292",
         0x783f1ba46e8635bf,
-        0x6d57d60de175d513,
+        0x8dd7b260f3fe9406,
     ),
     (
         "yuy2/left/classic/48x32",
@@ -175,7 +175,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "yuy2/left/classic/32x292",
         0x1a56cf7852dd4a86,
-        0x0262fa1232a31ec5,
+        0x409b5dff73d3ed83,
     ),
     (
         "yuy2/left/custom/48x32",
@@ -184,8 +184,8 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     ),
     (
         "yuy2/left/custom/32x292",
-        0x8d666415a813ebce,
-        0xa417e79e55f1e281,
+        0xaba72375cf0383f9,
+        0x0b16f49ba13e192f,
     ),
     (
         "yuy2/left/v1x/48x32",
@@ -195,7 +195,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "yuy2/left/v1x/32x292",
         0x60c70b5ee8628676,
-        0x6d57d60de175d513,
+        0x8dd7b260f3fe9406,
     ),
     (
         "yuy2/gradient/classic/48x32",
@@ -205,7 +205,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "yuy2/gradient/classic/32x292",
         0x2adac40da45cd86a,
-        0x646f0edae87ab62e,
+        0x70d87416799b1c18,
     ),
     (
         "yuy2/gradient/custom/48x32",
@@ -214,8 +214,8 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     ),
     (
         "yuy2/gradient/custom/32x292",
-        0x5f2ae94e889268bf,
-        0xddfe402551def818,
+        0x46418357617958ee,
+        0x004f85fabd1571a2,
     ),
     (
         "yuy2/gradient/v1x/48x32",
@@ -225,37 +225,37 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "yuy2/gradient/v1x/32x292",
         0x36046a61ef4dd078,
-        0x0bfb3bf6a50a9625,
+        0xbce72ac0452324fa,
     ),
     (
         "yuy2/median/classic/48x32",
         0x0e633134041d025a,
-        0x4e2c16b09a62f83a,
+        0x98d319e2ceff9abd,
     ),
     (
         "yuy2/median/classic/32x292",
         0x46682019f9d157b7,
-        0x218e2a64fd217154,
+        0xdf20d976e4b8743e,
     ),
     (
         "yuy2/median/custom/48x32",
-        0x27c9b3a6ba46656a,
-        0xf3074c0758460ac9,
+        0xa85009cccd28dc27,
+        0x405991329d7400bc,
     ),
     (
         "yuy2/median/custom/32x292",
-        0x7998eafd87d839f9,
-        0x91ae37da102044d6,
+        0x91963ae7f33c43c0,
+        0xcb37f29e9492147f,
     ),
     (
         "yuy2/median/v1x/48x32",
         0x1772fd972713841c,
-        0xcc89fe59cee83c34,
+        0xb2dfdeafa8b7d919,
     ),
     (
         "yuy2/median/v1x/32x292",
         0x1b3a2270e5cc601b,
-        0xcd2cac7f0dc92e62,
+        0xa4a7724730c0596d,
     ),
     (
         "rgb24/predict_old/classic/48x32",
@@ -265,7 +265,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "rgb24/predict_old/classic/32x292",
         0xc6c4b590cfda518e,
-        0xb529cce731cb6a55,
+        0x16d4dd3e1074513f,
     ),
     (
         "rgb24/predict_old/custom/48x32",
@@ -274,8 +274,8 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     ),
     (
         "rgb24/predict_old/custom/32x292",
-        0xfa1930eec8a53624,
-        0xc1f0c375be1fe701,
+        0x76ecee20d6eb8122,
+        0x8248870b6714b408,
     ),
     (
         "rgb24/predict_old/v1x/48x32",
@@ -285,7 +285,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "rgb24/predict_old/v1x/32x292",
         0x1f44c4175b661047,
-        0x5c89a2b326ea17ea,
+        0x364df1ee2e909843,
     ),
     (
         "rgb24/left/classic/48x32",
@@ -295,7 +295,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "rgb24/left/classic/32x292",
         0x57e0d3efc2844780,
-        0xb529cce731cb6a55,
+        0x16d4dd3e1074513f,
     ),
     (
         "rgb24/left/custom/48x32",
@@ -304,8 +304,8 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     ),
     (
         "rgb24/left/custom/32x292",
-        0x5f0960bd5637d742,
-        0xc1f0c375be1fe701,
+        0x1b978bae31fcabc4,
+        0x8248870b6714b408,
     ),
     (
         "rgb24/left/v1x/48x32",
@@ -315,67 +315,67 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "rgb24/left/v1x/32x292",
         0xc3e5163af7ddf49e,
-        0x5c89a2b326ea17ea,
+        0x364df1ee2e909843,
     ),
     (
         "rgb24/left_decorr/classic/48x32",
         0x36f1c0a3a943fe1c,
-        0x4ac3f8a578305731,
+        0xcf34f698aa41a96f,
     ),
     (
         "rgb24/left_decorr/classic/32x292",
         0xdf4dbf65524efc47,
-        0x82e9b408dd730b52,
+        0xa62e63bdfa36c34f,
     ),
     (
         "rgb24/left_decorr/custom/48x32",
         0x810c70635c043d5d,
-        0x64a64d3e78fa75f4,
+        0x0cc59da657fd9062,
     ),
     (
         "rgb24/left_decorr/custom/32x292",
-        0xb4cb6b2693c48776,
-        0x0e0050896df91d3f,
+        0x798bffbd57c9e106,
+        0x1a1c18972f170ed4,
     ),
     (
         "rgb24/left_decorr/v1x/48x32",
         0x7a6141f3cea6d296,
-        0xc84b3e353164bd96,
+        0x1a329ce10a3e7e68,
     ),
     (
         "rgb24/left_decorr/v1x/32x292",
         0x0f33f781ea3ce831,
-        0x229b697b27d6109d,
+        0x46f6890a961a62a1,
     ),
     (
         "rgb24/gradient_decorr/classic/48x32",
         0xfcd546f4a619af21,
-        0x346e254eaf0772ae,
+        0x85599c0d1461044c,
     ),
     (
         "rgb24/gradient_decorr/classic/32x292",
         0x6ced2bf9e3adf608,
-        0xd70c3202bc7e8e07,
+        0xfe7f48c725707b9d,
     ),
     (
         "rgb24/gradient_decorr/custom/48x32",
         0x0dce5b44b76d215c,
-        0xc0a6aaf2c17253da,
+        0x21271348042d9bdc,
     ),
     (
         "rgb24/gradient_decorr/custom/32x292",
-        0xb412297cb3f680fa,
-        0x1e5984dcadde21ed,
+        0x73c2c47be1e99c2a,
+        0x4fa9bd75f2556d03,
     ),
     (
         "rgb24/gradient_decorr/v1x/48x32",
         0x36c073363b705d5f,
-        0xead6036c6213062c,
+        0x68660bac6adc145a,
     ),
     (
         "rgb24/gradient_decorr/v1x/32x292",
         0xe684b189c5891840,
-        0x16081ab4351fb3d3,
+        0xc18e5a3501dcb6b6,
     ),
     (
         "rgb32/predict_old/classic/48x32",
@@ -385,7 +385,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "rgb32/predict_old/classic/32x292",
         0xccba0ec5f6d5ebee,
-        0x685d73984be975a8,
+        0x2ad755703c5fa72f,
     ),
     (
         "rgb32/predict_old/custom/48x32",
@@ -394,8 +394,8 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     ),
     (
         "rgb32/predict_old/custom/32x292",
-        0x41dc954e6a2901b3,
-        0x9749a952c0156064,
+        0xc9bc4e5592d390ca,
+        0xe35e7fb3195fbec6,
     ),
     (
         "rgb32/predict_old/v1x/48x32",
@@ -405,7 +405,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "rgb32/predict_old/v1x/32x292",
         0x3307ae91c6b2c8cf,
-        0xe01ef6486d2d225c,
+        0x545a95c9fdfbee67,
     ),
     (
         "rgb32/left/classic/48x32",
@@ -415,7 +415,7 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "rgb32/left/classic/32x292",
         0xc055fa47b8ac9360,
-        0x685d73984be975a8,
+        0x2ad755703c5fa72f,
     ),
     (
         "rgb32/left/custom/48x32",
@@ -424,8 +424,8 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     ),
     (
         "rgb32/left/custom/32x292",
-        0x6fbbf3dfe34a2b41,
-        0x9749a952c0156064,
+        0x3029fc3d4bdebcb8,
+        0xe35e7fb3195fbec6,
     ),
     (
         "rgb32/left/v1x/48x32",
@@ -435,67 +435,67 @@ const EXPECTED: &[(&str, u64, u64)] = &[
     (
         "rgb32/left/v1x/32x292",
         0xbd6b11885eea4546,
-        0xe01ef6486d2d225c,
+        0x545a95c9fdfbee67,
     ),
     (
         "rgb32/left_decorr/classic/48x32",
         0x714fe4370f5416dc,
-        0x44be5197d4b917ef,
+        0x5887d4e0fce5ee39,
     ),
     (
         "rgb32/left_decorr/classic/32x292",
         0x17c2f84a34592657,
-        0x65ee3717bd8a60c2,
+        0x0a7b1409f88f7eb6,
     ),
     (
         "rgb32/left_decorr/custom/48x32",
         0x79038e6a476a9bb9,
-        0x94f682306b7d2438,
+        0x9e45ba37e16609ee,
     ),
     (
         "rgb32/left_decorr/custom/32x292",
-        0x5f324e79a5f98f81,
-        0x33d2b8aef9406af9,
+        0xbbe3a95a78dea788,
+        0xe0a5872c15404846,
     ),
     (
         "rgb32/left_decorr/v1x/48x32",
         0xf9c0341749d88fce,
-        0xfb45c197a9bb8f1a,
+        0x8a5f4679e30261ec,
     ),
     (
         "rgb32/left_decorr/v1x/32x292",
         0xdb247414c8f02379,
-        0x73985537761b4318,
+        0xc20474a3c6b7ebe8,
     ),
     (
         "rgb32/gradient_decorr/classic/48x32",
         0x4c7602c1f0cf31c1,
-        0x9fea1fc733591fa0,
+        0x5d541b476385bbc6,
     ),
     (
         "rgb32/gradient_decorr/classic/32x292",
         0xd7c7049230358008,
-        0x9f9899424969febd,
+        0x838e678242a8a2aa,
     ),
     (
         "rgb32/gradient_decorr/custom/48x32",
         0x9953c138da89aad6,
-        0x140b5e46debdf53f,
+        0x56d911c7d5cbdd4d,
     ),
     (
         "rgb32/gradient_decorr/custom/32x292",
-        0x01c36755a65234ca,
-        0x3538774bca904cc1,
+        0x0a48bb07423a4e72,
+        0x2fde746ba277b1a5,
     ),
     (
         "rgb32/gradient_decorr/v1x/48x32",
         0xad76a63643764a77,
-        0x729810c518c2218b,
+        0x3383a4fa16cf8171,
     ),
     (
         "rgb32/gradient_decorr/v1x/32x292",
         0xa0e4130309bdd748,
-        0x1cff301fdb8abc8c,
+        0x103415d77b14a29f,
     ),
 ];
 
@@ -505,13 +505,13 @@ const EXPECTED_AUTO: &[(&str, &str, u64, u64)] = &[
         "yuy2/auto/classic/48x32",
         "median",
         0x0e633134041d025a,
-        0x4e2c16b09a62f83a,
+        0x98d319e2ceff9abd,
     ),
     (
         "yuy2/auto/custom/48x32",
         "median",
-        0x27c9b3a6ba46656a,
-        0xf3074c0758460ac9,
+        0xa85009cccd28dc27,
+        0x405991329d7400bc,
     ),
     (
         "rgb24/auto/classic/48x32",
