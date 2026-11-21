@@ -2,11 +2,14 @@
 
 [![CI](https://github.com/OxideAV/oxideav-huffyuv/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-huffyuv/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-huffyuv.svg)](https://crates.io/crates/oxideav-huffyuv) [![docs.rs](https://docs.rs/oxideav-huffyuv/badge.svg)](https://docs.rs/oxideav-huffyuv) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust HuffYUV / FFVHuff lossless video codec for the
-[oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
+Pure-Rust HuffYUV lossless video codec for the
+[oxideav](https://github.com/OxideAV/oxideav-workspace) framework:
+the `HFYU` format (packed 4:2:2, RGB24, RGB32 with alpha; 8-bit) in
+full, plus `FFVH`-tagged streams that stay inside that layout. The
+`FFVH` extensions (planar and high-bit-depth formats, per-frame
+tables) are refused — see *FourCCs*.
 
-This crate decodes and encodes HuffYUV / FFVHuff frames from raw
-codec bytes; AVI / OpenDML container handling lives one layer up in
+This crate decodes and encodes HuffYUV frames from raw codec bytes; AVI / OpenDML container handling lives one layer up in
 `oxideav-avi`. End-to-end (encode → AVI mux → AVI demux → decode) is
 exercised in `tests/round4_avi_lockstep.rs` via a test-only
 `[dev-dependencies] oxideav-avi`.
@@ -152,7 +155,10 @@ rejects or mis-reads it. Use `left` when the stream must play in other
 decoders; `predict_old` without extradata (`v1x`) is accepted.
 
 `tests/foreign_pins.rs` pins six tiny third-party streams as bytes so
-the fixed bugs stay fixed without the tool installed.
+the fixed bugs stay fixed without the tool installed. The nine staged
+third-party fixture files of the reference workspace
+(`docs/video/huffyuv-fixtures/`, two frames each) also decode
+bit-exactly: 18 / 18 frames, up from 2 / 18 before round 493.
 
 Encoded size against the black-box encoder on the same rasters is in
 [`BENCHMARKS.md`](BENCHMARKS.md).
@@ -212,7 +218,7 @@ A real field-coded frame is one codeword stream with no split point.
 Round 429 extends the budget to the auto-selector
 (`encode_frame_auto_workers`): 720p YUY2 auto encodes drop 6.42 →
 3.95 ms (custom, 1.62×) and 6.75 → 3.91 ms (classic, 1.73×) at 2
-workers (candidate scoring only; the emit is serial).
+workers (measured when only the candidate scoring fanned out).
 
 Round 429 also lands the r419 serial-decode lever: full pair LUTs
 (16-bit window → both symbols + combined length in one 32-bit load,
