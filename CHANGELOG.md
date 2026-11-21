@@ -6,6 +6,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-huffyuv/compare/v0.0.4...v0.0.5) - 2026-11-21
+
+### Other
+
+- truncated or undersized chunks are errors
+- scope statement, fixture result, wording after the encode split
+- multi-worker encode of any frame, fused residual kernels, stream-safe custom tables
+- re-resolve Cargo.lock to oxideav-core 0.1.43
+- explicit field-coding choice (FieldCoding / EncodeOptions)
+- top-down RGB frames, decoder output_params, padded strides
+- Wire-format corrections found by a live black-box matrix
+- API hygiene: #[non_exhaustive] on growable enums and records
+
 ### Fixed
 
 - **Field-coded ("interlaced") frames were a private dialect.** The
