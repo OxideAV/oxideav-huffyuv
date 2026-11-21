@@ -1125,11 +1125,9 @@ pub fn inverse_gradient_stride(out: &mut [u8], stride: usize) {
 pub fn forward_gradient_stride(src: &[u8], dst: &mut [u8], stride: usize) {
     assert_eq!(dst.len(), src.len(), "dst length != src length");
     let n = src.len();
-    let head = stride.min(n);
+    // A zero row length has no "above" anywhere: plain copy.
+    let head = if stride == 0 { n } else { stride.min(n) };
     dst[..head].copy_from_slice(&src[..head]);
-    if stride == 0 {
-        return;
-    }
     let (cur, above) = (&src[head..], &src[..n - head]);
     for ((d, &c), &a) in dst[head..].iter_mut().zip(cur).zip(above) {
         *d = c.wrapping_sub(a);
@@ -1233,7 +1231,32 @@ pub fn inverse_median_yuy2(out: &mut [u8], stride: usize) {
     }
     let median_start = yuy2_median_start(n, stride);
     inverse_yuy2_left_macropixel(out, 4, median_start);
-    for pos in median_start..n {
+    // Whole macropixels with the left neighbours carried in locals:
+    // the two luma samples form one dependency chain, the two chroma
+    // samples an independent one each. `median_start` is a multiple
+    // of 4 for every stride the decoder passes (a whole number of
+    // macropixels); anything else takes the per-byte tail below.
+    let mut pos = median_start;
+    if pos.is_multiple_of(4) && stride.is_multiple_of(4) {
+        let mut left_y = out[pos - 2];
+        let mut left_u = out[pos - 3];
+        let mut left_v = out[pos - 1];
+        while pos + 4 <= n {
+            let (done, cur) = out.split_at_mut(pos);
+            let above = &done[pos - stride - 4..pos - stride + 4];
+            let step = |residual: u8, l: u8, a: u8, al: u8| {
+                residual.wrapping_add(median3(l, a, gradient_predictor(l, a, al)))
+            };
+            let y1 = step(cur[0], left_y, above[4], above[2]);
+            let u = step(cur[1], left_u, above[5], above[1]);
+            let y2 = step(cur[2], y1, above[6], above[4]);
+            let v = step(cur[3], left_v, above[7], above[3]);
+            cur[..4].copy_from_slice(&[y1, u, y2, v]);
+            (left_y, left_u, left_v) = (y2, u, v);
+            pos += 4;
+        }
+    }
+    for pos in pos..n {
         let back = yuy2_left_distance(pos);
         let l = out[pos - back];
         let a = out[pos - stride];
@@ -1245,6 +1268,78 @@ pub fn inverse_median_yuy2(out: &mut [u8], stride: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Per-byte statement of spec/06 §3.3, used as the reference for
+    /// the unrolled inverse and for the forward pass.
+    fn reference_inverse_median(out: &mut [u8], stride: usize) {
+        let n = out.len();
+        let start = if stride == 0 { n } else { (stride + 8).min(n) };
+        for pos in 4..n {
+            let back = if pos & 1 == 0 { 2 } else { 4 };
+            let l = out[pos - back];
+            let p = if pos < start {
+                l
+            } else {
+                let a = out[pos - stride];
+                let al = out[pos - stride - back];
+                median3(l, a, gradient_predictor(l, a, al))
+            };
+            out[pos] = out[pos].wrapping_add(p);
+        }
+    }
+
+    #[test]
+    fn median_yuy2_inverse_matches_per_byte_reference_and_inverts_forward() {
+        let mut state = 0x6d2b_79f5u32;
+        for (stride, len) in [
+            (4usize, 4usize),
+            (4, 8),
+            (4, 40),
+            (8, 16),
+            (8, 20),
+            (16, 160),
+            (32, 160),
+            (32, 150),
+            (64, 61),
+            (12, 133),
+            (6, 90),
+        ] {
+            let pixels: Vec<u8> = (0..len)
+                .map(|i| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    ((i / 3) as u32).wrapping_add(state & 0x3F) as u8
+                })
+                .collect();
+            let mut residuals = vec![0u8; len];
+            forward_median_yuy2(&pixels, &mut residuals, stride);
+            let mut a = residuals.clone();
+            let mut b = residuals.clone();
+            inverse_median_yuy2(&mut a, stride);
+            reference_inverse_median(&mut b, stride);
+            assert_eq!(a, b, "stride {stride} len {len}: unrolled vs per-byte");
+            assert_eq!(a, pixels, "stride {stride} len {len}: inverse of forward");
+        }
+    }
+
+    #[test]
+    fn gradient_stride_passes_invert_each_other() {
+        for (stride, len) in [
+            (0usize, 9usize),
+            (1, 9),
+            (3, 30),
+            (8, 64),
+            (12, 100),
+            (200, 50),
+        ] {
+            let src: Vec<u8> = (0..len).map(|i| (i * 37 + i / 7) as u8).collect();
+            let mut mid = vec![0u8; len];
+            forward_gradient_stride(&src, &mut mid, stride);
+            inverse_gradient_stride(&mut mid, stride);
+            assert_eq!(mid, src, "stride {stride} len {len}");
+        }
+    }
 
     #[test]
     fn median3_picks_middle_value() {

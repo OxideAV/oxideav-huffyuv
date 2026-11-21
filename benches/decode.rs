@@ -39,22 +39,12 @@
 //!     the per-predictor decode-LUT matrix so all six on-wire methods
 //!     have a measured baseline.
 //!
-//! ## Interlaced coverage (spec/02 §2, `biHeight > 288`)
+//! ## Field-coded coverage (spec/06, `biHeight > 288`)
 //!
-//! The 720p `yuy2_1280x720_left_classic` scenario above already
-//! crosses the `is_interlaced_height` threshold, but a 320×320 pair
-//! isolates the field-split overhead from the raster-size delta:
-//!
-//!   - **yuy2_320x288_left_progressive**: 320×288 is the largest
-//!     progressive raster (height == 288 is NOT interlaced), so this
-//!     is the single-field control.
-//!   - **yuy2_320x320_left_interlaced**: 320×320 (height 320 > 288)
-//!     engages `decode_frame_interlaced` — two `decode_field` passes
-//!     plus the `interleave_fields` row-gather. Diffing it against the
-//!     288-row progressive control isolates the interlaced-path cost.
-//!   - **rgb24_320x320_left_decorr_interlaced**: the RGB-decorr
-//!     interlaced variant so the field path is measured on the
-//!     wider-stride family too.
+//! Field coding only moves the predictors' "above" reference two rows
+//! back, so it costs nothing in the entropy loop; the 320×288 /
+//! 320×320 pair shows that (LEFT streams are byte-identical either
+//! way), and the 1280×720 scenarios run field-coded by height.
 //!
 //! Run with:
 //!     cargo bench -p oxideav-huffyuv --bench decode
@@ -62,8 +52,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_huffyuv::{
-    ExtradataMode, Method, PixelFamily, StreamConfig, decode_frame, decode_frame_with_workers,
-    encode_frame_with_mode,
+    ExtradataMode, Method, PixelFamily, StreamConfig, decode_frame, encode_frame_with_mode,
 };
 
 /// Cheap deterministic xorshift32 — synthesises "natural-ish" per-pixel
@@ -247,8 +236,8 @@ fn bench_yuy2_320x240_predict_old_classic(c: &mut Criterion) {
 }
 
 fn bench_yuy2_320x288_left_progressive(c: &mut Criterion) {
-    // height == 288 is the largest progressive raster (NOT > 288), so
-    // this is the single-field control for the interlaced pair below.
+    // height == 288 is the tallest plain raster (NOT > 288): the
+    // control for the field-coded pair below.
     bench_scenario(
         c,
         "decode_yuy2_320x288_left_progressive",
@@ -261,8 +250,7 @@ fn bench_yuy2_320x288_left_progressive(c: &mut Criterion) {
 }
 
 fn bench_yuy2_320x320_left_interlaced(c: &mut Criterion) {
-    // height 320 > 288 engages decode_frame_interlaced (two
-    // decode_field passes + interleave_fields row-gather).
+    // height 320 > 288 is field-coded (prediction row doubled).
     bench_scenario(
         c,
         "decode_yuy2_320x320_left_interlaced",
@@ -291,7 +279,7 @@ fn bench_rgb32_1280x720_gradient_decorr_classic(c: &mut Criterion) {
     // ≥ HD decode scenario was YUY2 Left, so a raster-scaling
     // regression on the wider-stride families (4-byte wire cycle,
     // decorrelation + gradient post-passes over a 3.5-MiB raster) had
-    // no baseline. 720 > 288 also engages the interlaced field split.
+    // no baseline. 720 > 288 is field-coded.
     bench_scenario(
         c,
         "decode_rgb32_1280x720_gradient_decorr_classic",
@@ -303,66 +291,43 @@ fn bench_rgb32_1280x720_gradient_decorr_classic(c: &mut Criterion) {
     );
 }
 
-/// Round-420 worker-scaling gates: 1 vs 2 workers on interlaced HD
-/// streams (`decode_frame_with_workers`). The budget-1 arm routes
-/// through the identical serial path `decode_frame` takes, so the
-/// pair reads directly as the field-parallel win. Three gates:
-///
-/// - **yuy2 720p LEFT** — entropy-dominated; the win is bounded by
-///   the split-scan prefix (the wire carries no bottom-field offset,
-///   so the second worker can only start after the top field's
-///   codeword stream has been length-scanned).
-/// - **yuy2 720p MEDIAN** — adds the serial per-byte median inverse,
-///   the heaviest predictor pass; best case for the parallel path.
-/// - **rgb32 720p GradientDecorr** — wide-stride family with decorr +
-///   gradient post-passes (the r419 HD RGB gate, now under budget 2).
-fn bench_hd_interlaced_worker_scaling(c: &mut Criterion) {
-    for (name, family, method) in [
-        (
-            "decode_workers_yuy2_1280x720_left_classic",
-            PixelFamily::Yuy2,
-            Method::Left,
-        ),
-        (
-            "decode_workers_yuy2_1280x720_median_classic",
-            PixelFamily::Yuy2,
-            Method::Median,
-        ),
-        (
-            "decode_workers_rgb32_1280x720_gradient_decorr_classic",
-            PixelFamily::Rgb32,
-            Method::GradientDecorr,
-        ),
-        // Round-440: RGB24 gate — the 3-code family whose scan left
-        // the +2 → slot3 position on a lone decode_one before the
-        // phase-flip pairing; the 2w arm reads directly as the
-        // split-scan improvement.
-        (
-            "decode_workers_rgb24_1280x720_left_decorr_classic",
-            PixelFamily::Rgb24,
-            Method::LeftDecorr,
-        ),
-    ] {
-        let (w, h) = (1280u32, 720u32);
-        let (cfg, frame) = make_decode_input(family, method, w, h, ExtradataMode::ClassicV2);
-        let mut g = c.benchmark_group(name);
-        g.throughput(Throughput::Bytes(
-            (w as u64) * (h as u64) * bytes_per_pixel(family) as u64,
-        ));
-        for workers in [1usize, 2] {
-            g.bench_function(BenchmarkId::from_parameter(format!("{workers}w")), |b| {
-                b.iter(|| {
-                    decode_frame_with_workers(
-                        criterion::black_box(&cfg),
-                        criterion::black_box(&frame),
-                        workers,
-                    )
-                    .expect("decode")
-                });
-            });
-        }
-        g.finish();
-    }
+/// HD gates for the predictor passes that only ran at 320×240 before:
+/// the per-byte median inverse and the three-codeword RGB24 cycle,
+/// both field-coded by height (spec/06 §1.1).
+fn bench_yuy2_1280x720_median_classic(c: &mut Criterion) {
+    bench_scenario(
+        c,
+        "decode_yuy2_1280x720_median_classic",
+        PixelFamily::Yuy2,
+        Method::Median,
+        1280,
+        720,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_yuy2_1280x720_gradient_classic(c: &mut Criterion) {
+    bench_scenario(
+        c,
+        "decode_yuy2_1280x720_gradient_classic",
+        PixelFamily::Yuy2,
+        Method::Gradient,
+        1280,
+        720,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_rgb24_1280x720_left_decorr_classic(c: &mut Criterion) {
+    bench_scenario(
+        c,
+        "decode_rgb24_1280x720_left_decorr_classic",
+        PixelFamily::Rgb24,
+        Method::LeftDecorr,
+        1280,
+        720,
+        ExtradataMode::ClassicV2,
+    );
 }
 
 criterion_group!(
@@ -379,6 +344,8 @@ criterion_group!(
     bench_yuy2_320x320_left_interlaced,
     bench_rgb24_320x320_left_decorr_interlaced,
     bench_rgb32_1280x720_gradient_decorr_classic,
-    bench_hd_interlaced_worker_scaling,
+    bench_yuy2_1280x720_median_classic,
+    bench_yuy2_1280x720_gradient_classic,
+    bench_rgb24_1280x720_left_decorr_classic,
 );
 criterion_main!(benches);

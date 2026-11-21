@@ -46,14 +46,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- `decode_frame_with_workers` and `encode_frame_with_mode_workers`
-  keep their signatures but run serially at every budget: a frame is
-  a single codeword stream with no resynchronisation point, so the
-  two-worker field-parallel paths (which only existed for the retired
-  layout) are gone. `encode_frame_auto_workers` still fans out its
-  candidate scoring.
-- Golden wire pins regenerated for the corrected format (median, all
-  decorrelated RGB cells, all cells above 288 lines).
+- `decode_frame_with_workers` keeps its signature but runs serially
+  at every budget: a frame is a single codeword stream with no
+  resynchronisation point, so the two-worker field-parallel decode
+  (which only existed for the retired layout) is gone.
+- **Multi-worker encode for every frame, not only tall ones.**
+  `encode_frame_with_mode_workers`, `encode_frame_with_options` and
+  the registry encoder under an `ExecutionContext` budget cut the
+  residual body into one piece per worker: residuals are computed
+  piecewise (each is a function of the source picture alone), each
+  piece is bit-packed on its own thread, and the bit strings are
+  spliced back at their exact bit offsets (`BitWriter::append_bits`,
+  one shift per 32 output bits). Wire bytes and errors are those of
+  the serial encoder at every budget; frames too small to pay for a
+  thread stay serial. `encode_frame_auto_workers` still fans out its
+  candidate scoring and now splits the winner's emit too.
+- Residual passes rewritten as single fused, position-based kernels
+  (packed-word byte arithmetic; RGB decorrelation applied once to the
+  plain difference): no intermediate full-frame buffers, no per-byte
+  body reordering. Serial RGB encodes run 1.1–1.5× faster; see
+  `BENCHMARKS.md`.
+- YUY2 median inverse walks whole macropixels with the left
+  neighbours carried in locals.
+- **Registry `custom-v2` streams can no longer fail on later frames.**
+  The stream-level tables used to be the first frame's exact optimum,
+  so any later frame containing a residual value the first frame
+  lacked was rejected — on real footage, almost every stream. The
+  stream encoder now blends each first-frame histogram with the
+  distribution of the matching classic table (7 parts frame, 1 part
+  classic, plus one per symbol): all 256 symbols of each channel have
+  a code, a frame like the first one costs 0.3–0.5 % over its own
+  optimum (measured), and a frame unlike it stays near the classic
+  size (+5–9 % measured when the stream opens on a flat frame). The
+  direct single-frame API keeps the exact per-frame optimum.
 
 ### Added
 
@@ -79,6 +104,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write those streams (interlaced material of 288 lines or fewer,
   progressive material above). A v1.x header has no interlace byte, so
   a choice against the height rule is rejected there.
+- `BitWriter::{with_prefix, into_bits, append_bits}` — bit-string
+  splicing.
+- `tests/blackbox_matrix.rs::encoded_size_against_black_box_encoder`
+  — same picture, same predictor: `custom-v2` frames are never larger
+  than the black-box encoder's (asserted; 4–46 % smaller on the three
+  test sources, `classic-v2` 1 % smaller to 37 % larger).
+- Bench gates: 1280×720 median / gradient / RGB24 decode, 1280×720
+  median / RGB32 encode, and `encode_workers_*` (1 / 2 / 4 workers).
 - `predict::{inverse_gradient_stride, forward_gradient_stride,
   forward_decorr_gradient_stride, forward_median_yuy2,
   inverse_median_yuy2}` — byte-position predictor passes taking the

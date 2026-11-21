@@ -21,11 +21,7 @@
 use crate::bitio::BitWriter;
 use crate::error::{Error, Result};
 use crate::header::{FOURCC_HFYU, Method, PixelFamily, Predictor, StreamConfig};
-use crate::predict::{
-    forward_decorr_gradient_stride, forward_gradient_stride, forward_left_decorr_residuals,
-    forward_median_yuy2, forward_rgb_left_subtract_linear, forward_yuy2_left_subtract,
-    is_interlaced_height,
-};
+use crate::predict::is_interlaced_height;
 #[cfg(test)]
 use crate::tables::HuffTable;
 use crate::tables::{
@@ -181,13 +177,44 @@ pub fn encode_frame_with_options(
     pixels: &[u8],
     options: &EncodeOptions,
 ) -> Result<EncodedFrame> {
-    let field_coded = options.field_coding.resolve(height, options.mode)?;
-    let (strf, frame, method) = encode_auto_inner(
+    encode_with_options(family, width, height, pixels, options, false)
+}
+
+/// First frame of a multi-frame stream: [`encode_frame_with_options`],
+/// except that `CustomV2` tables are built to cover all 256 symbols of
+/// each channel. The tables travel in the stream header and cannot
+/// change per frame (spec/02 §1.2), so they must be able to code
+/// residuals the first frame never produced.
+#[cfg(feature = "registry")]
+pub(crate) fn encode_stream_opening_frame(
+    family: PixelFamily,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    options: &EncodeOptions,
+) -> Result<EncodedFrame> {
+    encode_with_options(family, width, height, pixels, options, true)
+}
+
+fn encode_with_options(
+    family: PixelFamily,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    options: &EncodeOptions,
+    cover_all: bool,
+) -> Result<EncodedFrame> {
+    let template = FrameShape {
         family,
-        options.method,
+        method: Method::Left,
         width,
         height,
-        field_coded,
+        field_coded: options.field_coding.resolve(height, options.mode)?,
+        cover_all,
+    };
+    let (strf, frame, method) = encode_auto_inner(
+        &template,
+        options.method,
         pixels,
         options.mode,
         options.worker_budget,
@@ -242,20 +269,28 @@ pub fn encode_frame_with_mode(
     // shared across the auto-selector's candidate scoring + the final
     // emit pass (one residual computation per candidate instead of
     // candidate + winner-restart = N+1).
-    let field_coded = is_interlaced_height(height);
-    let frame = residuals_for(family, method, width, height, field_coded, pixels)?;
-    encode_with_precomputed(family, method, width, height, field_coded, &frame, mode)
+    let shape = FrameShape {
+        family,
+        method,
+        width,
+        height,
+        field_coded: is_interlaced_height(height),
+        cover_all: false,
+    };
+    encode_with_precomputed(&shape, &shape.residuals(pixels, 1)?, mode, 1)
 }
 
 /// Encode a frame under an explicit worker budget.
 ///
 /// Same wire output as [`encode_frame_with_mode`] for every input and
-/// every budget. A fixed-method frame is one residual pass feeding one
-/// continuous codeword stream (spec/02 §2; a field-coded frame has no
-/// separately coded halves either, spec/06 §3.4), so there is a single
-/// unit of work and this currently runs serially whatever the budget;
-/// the budget matters for [`encode_frame_auto_workers`], whose
-/// candidate scoring does fan out.
+/// every budget. `worker_budget` follows the `oxideav-core`
+/// `ExecutionContext` threading contract — serial until told
+/// otherwise, fan-out bounded by `budget.min(units).max(1)`. A frame
+/// is one continuous codeword stream (spec/02 §2), but the stream is a
+/// pure concatenation of codewords: the residual body is cut into
+/// pieces, each piece is bit-packed on its own worker, and the bit
+/// strings are spliced back at their exact bit offsets. Frames whose
+/// body is too small to pay for a thread stay serial.
 pub fn encode_frame_with_mode_workers(
     family: PixelFamily,
     method: Method,
@@ -265,8 +300,56 @@ pub fn encode_frame_with_mode_workers(
     mode: ExtradataMode,
     worker_budget: usize,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let _ = worker_budget;
-    encode_frame_with_mode(family, method, width, height, pixels, mode)
+    if family.is_rgb() && !method.is_rgb_legal() {
+        return Err(Error::invalid("encoder: method not legal for RGB"));
+    }
+    if !family.is_rgb() && !method.is_yuv_legal() {
+        return Err(Error::invalid("encoder: method not legal for YUV"));
+    }
+    let shape = FrameShape {
+        family,
+        method,
+        width,
+        height,
+        field_coded: is_interlaced_height(height),
+        cover_all: false,
+    };
+    let frame = shape.residuals(pixels, worker_budget)?;
+    encode_with_precomputed(&shape, &frame, mode, worker_budget)
+}
+
+/// What a frame is coded as: family, method, size and the
+/// field-coding decision (spec/06 §1). Internal carrier so the encode
+/// helpers do not each take the five values separately.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameShape {
+    pub(crate) family: PixelFamily,
+    pub(crate) method: Method,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) field_coded: bool,
+    /// `CustomV2` only: build tables that give every one of the 256
+    /// symbols of each channel a code and stay close to the classic
+    /// tables for content unlike this frame, so the tables — which
+    /// are stream-level, spec/02 §1.2 — can code whatever later frames
+    /// contain (see `covering_lengths_from_body`).
+    pub(crate) cover_all: bool,
+}
+
+impl FrameShape {
+    /// Residual stream of `pixels`, computed on up to `workers`
+    /// threads (identical bytes at every count).
+    fn residuals(&self, pixels: &[u8], workers: usize) -> Result<Residuals> {
+        residuals_for(
+            self.family,
+            self.method,
+            self.width,
+            self.height,
+            self.field_coded,
+            pixels,
+            workers,
+        )
+    }
 }
 
 /// Encode one frame's wire bytes against caller-pinned per-slot
@@ -292,21 +375,19 @@ pub fn encode_frame_with_mode_workers(
 /// the function is compiled out of standalone builds.
 #[cfg(feature = "registry")]
 pub(crate) fn encode_body_with_pinned_tables(
-    family: PixelFamily,
-    method: Method,
-    width: u32,
-    height: u32,
+    shape: &FrameShape,
     pixels: &[u8],
     tabs: &crate::decoder::ThreeTables,
-    field_coded: bool,
+    worker_budget: usize,
 ) -> Result<Vec<u8>> {
+    let (family, method) = (shape.family, shape.method);
     if family.is_rgb() && !method.is_rgb_legal() {
         return Err(Error::invalid("encoder: method not legal for RGB"));
     }
     if !family.is_rgb() && !method.is_yuv_legal() {
         return Err(Error::invalid("encoder: method not legal for YUV"));
     }
-    let frame = residuals_for(family, method, width, height, field_coded, pixels)?;
+    let frame = shape.residuals(pixels, worker_budget)?;
     verify_body_in_table(
         family,
         method,
@@ -329,6 +410,7 @@ pub(crate) fn encode_body_with_pinned_tables(
         &tabs.slot1.entries,
         &tabs.slot2.entries,
         &tabs.slot3.entries,
+        worker_budget,
     )
 }
 
@@ -340,14 +422,19 @@ pub(crate) fn encode_body_with_pinned_tables(
 /// [`encode_frame_with_mode`]. Direct callers should keep using
 /// [`encode_frame_with_mode`] / [`encode_frame_auto`].
 fn encode_with_precomputed(
-    family: PixelFamily,
-    method: Method,
-    width: u32,
-    height: u32,
-    field_coded: bool,
+    shape: &FrameShape,
     frame: &Residuals,
     mode: ExtradataMode,
+    worker_budget: usize,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    let FrameShape {
+        family,
+        method,
+        width,
+        height,
+        field_coded,
+        cover_all,
+    } = *shape;
     let stats_body: &[u8] = &frame.body;
 
     // Round-419: the ClassicV2 / V1xCompat table sets are pure
@@ -386,7 +473,11 @@ fn encode_with_precomputed(
             (extra, EncTables::Shared(tabs), true)
         }
         ExtradataMode::CustomV2 => {
-            let lengths = compute_lengths_from_body(family, method, stats_body);
+            let lengths = if cover_all {
+                covering_lengths_from_body(family, method, stats_body)
+            } else {
+                compute_lengths_from_body(family, method, stats_body)
+            };
             let tabs = Box::new([
                 crate::tables::canonical_entries_from_lengths(&lengths[0])?.0,
                 crate::tables::canonical_entries_from_lengths(&lengths[1])?.0,
@@ -424,9 +515,8 @@ fn encode_with_precomputed(
         field_coded,
     );
 
-    let frame_bytes = emit_frame_bytes(family, method, frame, slot1, slot2, slot3)?;
+    let frame_bytes = emit_frame_bytes(family, method, frame, slot1, slot2, slot3, worker_budget)?;
 
-    let _ = (width, height);
     Ok((strf, frame_bytes))
 }
 
@@ -441,8 +531,14 @@ fn emit_frame_bytes(
     slot1: &SlotEntries,
     slot2: &SlotEntries,
     slot3: &SlotEntries,
+    worker_budget: usize,
 ) -> Result<Vec<u8>> {
-    emit_bitstream_parts(
+    // ExecutionContext clamp: `budget.min(units).max(1)`, a unit being
+    // a body piece big enough to pay for its thread.
+    let segments = worker_budget
+        .min(frame.body.len() / MIN_EMIT_SEGMENT)
+        .max(1);
+    emit_bitstream_segments(
         family,
         method,
         &frame.seed,
@@ -450,6 +546,7 @@ fn emit_frame_bytes(
         slot1,
         slot2,
         slot3,
+        segments,
     )
 }
 
@@ -476,6 +573,7 @@ fn compute_frame_residuals(
         height,
         is_interlaced_height(height),
         pixels,
+        1,
     )
 }
 
@@ -488,6 +586,7 @@ fn residuals_for(
     height: u32,
     field_coded: bool,
     pixels: &[u8],
+    workers: usize,
 ) -> Result<Residuals> {
     let row_bytes = family.row_bytes(width);
     let stride = if field_coded {
@@ -496,9 +595,9 @@ fn residuals_for(
         row_bytes
     };
     match family {
-        PixelFamily::Yuy2 => yuy2_residuals(method, width, height, stride, pixels),
+        PixelFamily::Yuy2 => yuy2_residuals(method, width, height, stride, pixels, workers),
         PixelFamily::Rgb24 | PixelFamily::Rgb32 => {
-            rgb_residuals(family, method, width, height, stride, pixels)
+            rgb_residuals(family, method, width, height, stride, pixels, workers)
         }
     }
 }
@@ -744,7 +843,7 @@ fn score_candidate(
     field_coded: bool,
     pixels: &[u8],
 ) -> Result<(u64, Residuals)> {
-    let frame = residuals_for(family, method, width, height, field_coded, pixels)?;
+    let frame = residuals_for(family, method, width, height, field_coded, pixels, 1)?;
     let (h1, h2, h3) = histogramise(family, method, &frame.body);
     Ok((bit_cost_from_histograms(&h1, &h2, &h3), frame))
 }
@@ -781,32 +880,35 @@ pub fn encode_frame_auto_workers(
     mode: ExtradataMode,
     worker_budget: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, Method)> {
-    encode_auto_inner(
+    let template = FrameShape {
         family,
-        selection,
+        method: Method::Left,
         width,
         height,
-        is_interlaced_height(height),
-        pixels,
-        mode,
-        worker_budget,
-    )
+        field_coded: is_interlaced_height(height),
+        cover_all: false,
+    };
+    encode_auto_inner(&template, selection, pixels, mode, worker_budget)
 }
 
 /// Auto-selector body shared by [`encode_frame_auto_workers`] (height
-/// rule) and [`encode_frame_with_options`] (caller's field-coding
-/// decision).
-#[allow(clippy::too_many_arguments)] // one frame description, passed flat like its public callers
-pub(crate) fn encode_auto_inner(
-    family: PixelFamily,
+/// rule), [`encode_frame_with_options`] (caller's field-coding
+/// decision) and the stream encoder. `template.method` is a
+/// placeholder: each candidate of `selection` replaces it.
+fn encode_auto_inner(
+    template: &FrameShape,
     selection: MethodSelection,
-    width: u32,
-    height: u32,
-    field_coded: bool,
     pixels: &[u8],
     mode: ExtradataMode,
     worker_budget: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, Method)> {
+    let FrameShape {
+        family,
+        width,
+        height,
+        field_coded,
+        ..
+    } = *template;
     let candidates = selection.candidates(family);
     for &m in &candidates {
         if family.is_rgb() && !m.is_rgb_legal() {
@@ -821,9 +923,16 @@ pub(crate) fn encode_auto_inner(
     }
     if let [only] = candidates[..] {
         // A pinned method needs no scoring pass.
-        let frame = residuals_for(family, only, width, height, field_coded, pixels)?;
-        let (strf, bytes) =
-            encode_with_precomputed(family, only, width, height, field_coded, &frame, mode)?;
+        let shape = FrameShape {
+            method: only,
+            ..*template
+        };
+        let (strf, bytes) = encode_with_precomputed(
+            &shape,
+            &shape.residuals(pixels, worker_budget)?,
+            mode,
+            worker_budget,
+        )?;
         return Ok((strf, bytes, only));
     }
     // Inline scoring fan-out clamp per the ExecutionContext threading
@@ -903,8 +1012,11 @@ pub(crate) fn encode_auto_inner(
         }
     }
     let (chosen, _, frame) = best.expect("non-empty candidates → some winner");
-    let (strf, bytes) =
-        encode_with_precomputed(family, chosen, width, height, field_coded, &frame, mode)?;
+    let shape = FrameShape {
+        method: chosen,
+        ..*template
+    };
+    let (strf, bytes) = encode_with_precomputed(&shape, &frame, mode, worker_budget)?;
     Ok((strf, bytes, chosen))
 }
 
@@ -965,12 +1077,160 @@ struct Residuals {
     body: Vec<u8>,
 }
 
+/// Residual bytes per worker below which splitting the residual pass
+/// is not worth a thread.
+const MIN_RESIDUAL_SEGMENT: usize = 96 * 1024;
+
+/// Fill `out` by calling `fill(first_unit, piece)` on up to `workers`
+/// consecutive pieces of whole `unit`-byte units, one piece per thread
+/// (the caller's included). `fill` must compute each unit from the
+/// source picture alone, so the pieces are independent.
+fn fill_in_pieces<F>(out: &mut [u8], unit: usize, workers: usize, fill: F)
+where
+    F: Fn(usize, &mut [u8]) + Sync,
+{
+    let pieces = workers.min(out.len() / MIN_RESIDUAL_SEGMENT).max(1);
+    if pieces < 2 {
+        fill(0, out);
+        return;
+    }
+    let per = (out.len() / unit).div_ceil(pieces) * unit;
+    std::thread::scope(|s| {
+        let fill = &fill;
+        let (own, mut rest) = out.split_at_mut(per);
+        let mut first_unit = per / unit;
+        while !rest.is_empty() {
+            let (piece, tail) = rest.split_at_mut(per.min(rest.len()));
+            rest = tail;
+            let start = first_unit;
+            first_unit += piece.len() / unit;
+            s.spawn(move || fill(start, piece));
+        }
+        fill(0, own);
+    });
+}
+
+/// Byte distance to the previous sample of the same YUY2 channel
+/// (spec/03 §2.1.1): 2 for luma (even wire positions), 4 for chroma.
+#[inline]
+fn yuy2_back(pos: usize) -> usize {
+    if pos & 1 == 0 { 2 } else { 4 }
+}
+
+/// Byte-wise wrapping subtraction of two packed 8-byte values.
+#[inline]
+fn sub_bytes64(a: u64, b: u64) -> u64 {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    ((a | HIGH).wrapping_sub(b & !HIGH)) ^ ((a ^ !b) & HIGH)
+}
+
+/// LEFT residuals of one macropixel from the eight bytes ending with
+/// it (previous macropixel in the low half, this one in the high
+/// half): `Y₁ − Y₂'`, `U − U'`, `Y₂ − Y₁`, `V − V'` (spec/03 §2.1.1).
+#[inline]
+fn yuy2_cell(pair: u64) -> [u8; 4] {
+    let cur = (pair >> 32) as u32;
+    // Left neighbours in cell order: previous Y₂ (byte 2), previous U
+    // (byte 1), this Y₁ (byte 4), previous V (byte 3).
+    let left = ((pair >> 16) & 0xFF)
+        | ((pair >> 8) & 0xFF) << 8
+        | ((pair >> 32) & 0xFF) << 16
+        | ((pair >> 24) & 0xFF) << 24;
+    sub_bytes(cur, left as u32).to_le_bytes()
+}
+
+#[inline]
+fn load8(bytes: &[u8], at: usize) -> u64 {
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(word)
+}
+
+/// LEFT residuals of the bytes `out` covers; `pos` is the wire
+/// position of its first byte, a multiple of 4 (spec/03 §2.1.1: luma
+/// from the previous luma sample, chroma from the previous chroma
+/// sample of the same kind).
+fn yuy2_left_run(pixels: &[u8], pos: usize, out: &mut [u8]) {
+    let (cells, tail) = out.as_chunks_mut::<4>();
+    let mut p = pos;
+    for cell in cells {
+        *cell = yuy2_cell(load8(pixels, p - 4));
+        p += 4;
+    }
+    for (k, o) in tail.iter_mut().enumerate() {
+        let x = p + k;
+        *o = pixels[x].wrapping_sub(pixels[x - yuy2_back(x)]);
+    }
+}
+
+/// Gradient residuals (spec/03 §2.2.2, spec/06 §3.2): LEFT residuals
+/// of the picture with the byte one prediction row back subtracted
+/// from every byte at position `stride` or later.
+fn yuy2_gradient_run(pixels: &[u8], stride: usize, pos: usize, out: &mut [u8]) {
+    let lifted = |x: usize| {
+        if x >= stride {
+            pixels[x].wrapping_sub(pixels[x - stride])
+        } else {
+            pixels[x]
+        }
+    };
+    // Up to the first macropixel whose every neighbour has an "above".
+    let edge_end = stride.saturating_add(4).max(pos).min(pos + out.len());
+    let (edge, body) = out.split_at_mut(edge_end - pos);
+    for (k, o) in edge.iter_mut().enumerate() {
+        let x = pos + k;
+        *o = lifted(x).wrapping_sub(lifted(x - yuy2_back(x)));
+    }
+    let (cells, tail) = body.as_chunks_mut::<4>();
+    let mut p = edge_end;
+    for cell in cells {
+        let cur = load8(pixels, p - 4);
+        let above = load8(pixels, p - 4 - stride);
+        *cell = yuy2_cell(sub_bytes64(cur, above));
+        p += 4;
+    }
+    for (k, o) in tail.iter_mut().enumerate() {
+        let x = p + k;
+        *o = lifted(x).wrapping_sub(lifted(x - yuy2_back(x)));
+    }
+}
+
+/// Median residuals (spec/03 §2.3, spec/06 §3.3): LEFT up to one
+/// prediction row + 8 wire bytes, then
+/// `value − median(left, above, left + above − above_left)` with the
+/// neighbours of the same channel.
+fn yuy2_median_run(pixels: &[u8], stride: usize, pos: usize, out: &mut [u8]) {
+    let left_end = stride.saturating_add(8).max(pos).min(pos + out.len());
+    let (left_part, median_part) = out.split_at_mut(left_end - pos);
+    yuy2_left_run(pixels, pos, left_part);
+    let predict = |x: usize, back: usize| {
+        let l = pixels[x - back];
+        let a = pixels[x - stride];
+        let al = pixels[x - stride - back];
+        crate::predict::median3(l, a, crate::predict::gradient_predictor(l, a, al))
+    };
+    let (cells, tail) = median_part.as_chunks_mut::<4>();
+    let mut p = left_end;
+    for cell in cells {
+        cell[0] = pixels[p].wrapping_sub(predict(p, 2));
+        cell[1] = pixels[p + 1].wrapping_sub(predict(p + 1, 4));
+        cell[2] = pixels[p + 2].wrapping_sub(predict(p + 2, 2));
+        cell[3] = pixels[p + 3].wrapping_sub(predict(p + 3, 4));
+        p += 4;
+    }
+    for (k, o) in tail.iter_mut().enumerate() {
+        let x = p + k;
+        *o = pixels[x].wrapping_sub(predict(x, yuy2_back(x)));
+    }
+}
+
 fn yuy2_residuals(
     method: Method,
     width: u32,
     height: u32,
     stride: usize,
     pixels: &[u8],
+    workers: usize,
 ) -> Result<Residuals> {
     let w = width as usize;
     let h = height as usize;
@@ -986,26 +1246,103 @@ fn yuy2_residuals(
     if !w.is_multiple_of(2) {
         return Err(Error::invalid("encoder: YUY2 width must be even"));
     }
-    let mut residuals = vec![0u8; pixels.len()];
-    match method.predictor() {
-        // spec/03 §2.3 / §2.3.2, spec/06 §3.3: LEFT residuals up to
-        // one prediction row + 8 wire bytes, median after.
-        Predictor::Median => forward_median_yuy2(pixels, &mut residuals, stride),
-        // spec/03 §2.2.2, spec/06 §3.2: subtract the byte one
-        // prediction row back, then LEFT-code the result.
-        Predictor::Gradient => {
-            let mut above_removed = vec![0u8; pixels.len()];
-            forward_gradient_stride(pixels, &mut above_removed, stride);
-            forward_yuy2_left_subtract(&above_removed, &mut residuals);
-        }
-        // spec/03 §2.1.1.
-        Predictor::Left => forward_yuy2_left_subtract(pixels, &mut residuals),
-    }
     let mut seed = [0u8; 4];
     let copy_n = 4.min(pixels.len());
     seed[..copy_n].copy_from_slice(&pixels[..copy_n]);
-    let body = residuals[copy_n..].to_vec();
+    // Every residual is a function of the source picture alone, so the
+    // body is filled in independent pieces of whole macropixels; body
+    // byte `i` is wire position `i + 4`.
+    let mut body = vec![0u8; pixels.len() - copy_n];
+    let predictor = method.predictor();
+    fill_in_pieces(&mut body, 4, workers, |first_cell, piece| {
+        let pos = 4 + first_cell * 4;
+        match predictor {
+            Predictor::Left => yuy2_left_run(pixels, pos, piece),
+            Predictor::Gradient => yuy2_gradient_run(pixels, stride, pos, piece),
+            Predictor::Median => yuy2_median_run(pixels, stride, pos, piece),
+        }
+    });
     Ok(Residuals { seed, body })
+}
+
+/// Byte-wise wrapping subtraction of two packed 4-byte values.
+#[inline]
+fn sub_bytes(a: u32, b: u32) -> u32 {
+    const HIGH: u32 = 0x8080_8080;
+    ((a | HIGH).wrapping_sub(b & !HIGH)) ^ ((a ^ !b) & HIGH)
+}
+
+/// Residuals of the `N`-byte pixels `out` covers, starting at pixel
+/// `first` (≥ 1), in wire order.
+///
+/// Decorrelation is linear modulo 256, so it is applied once to the
+/// plain difference: `r = decorr(a − b)` for the LEFT part and
+/// `r = decorr((a − above(a)) − (b − above(b)))` under the gradient,
+/// with `a` the pixel and `b` its left neighbour; the pixel exactly
+/// one prediction row in has an "above" while its left neighbour has
+/// none (spec/06 §3.2).
+fn rgb_run<const N: usize>(
+    pixels: &[u8],
+    decorrelate: bool,
+    above_px: Option<usize>,
+    first: usize,
+    out: &mut [u8],
+) {
+    let px = pixels.as_chunks::<N>().0;
+    let cells = out.as_chunks_mut::<N>().0;
+    let pack = |c: &[u8; N]| -> u32 {
+        let mut word = [0u8; 4];
+        word[..N].copy_from_slice(c);
+        u32::from_le_bytes(word)
+    };
+    // Plain difference → wire-order residual bytes.
+    let store = |diff: u32, cell: &mut [u8; N]| {
+        let bytes = if decorrelate {
+            let g = (diff >> 8) & 0xFF;
+            let d = sub_bytes(diff, g | (g << 16)).to_le_bytes();
+            // `G, B−G, R−G[, A]` (spec/03 §1.4).
+            [d[1], d[0], d[2], d[3]]
+        } else {
+            diff.to_le_bytes()
+        };
+        cell.copy_from_slice(&bytes[..N]);
+    };
+    let end = first + cells.len();
+    // Pixels with no "above" for themselves: plain LEFT.
+    let flat_end = above_px.map_or(end, |up| up.clamp(first, end));
+    let (flat, lifted) = cells.split_at_mut(flat_end - first);
+    for ((cell, a), b) in flat
+        .iter_mut()
+        .zip(&px[first..flat_end])
+        .zip(&px[first - 1..])
+    {
+        store(sub_bytes(pack(a), pack(b)), cell);
+    }
+    let Some(up) = above_px else { return };
+    let mut q = flat_end;
+    let mut lifted = lifted.iter_mut();
+    if q == up {
+        // First pixel of the second prediction row: its left
+        // neighbour has no "above".
+        if let Some(cell) = lifted.next() {
+            let a = sub_bytes(pack(&px[q]), pack(&px[q - up]));
+            store(sub_bytes(a, pack(&px[q - 1])), cell);
+            q += 1;
+        }
+    }
+    if q >= end {
+        return;
+    }
+    for ((((cell, a), b), a_up), b_up) in lifted
+        .zip(&px[q..end])
+        .zip(&px[q - 1..])
+        .zip(&px[q - up..])
+        .zip(&px[q - 1 - up..])
+    {
+        let cur = sub_bytes(pack(a), pack(a_up));
+        let left = sub_bytes(pack(b), pack(b_up));
+        store(sub_bytes(cur, left), cell);
+    }
 }
 
 /// RGB24 (`n_channels == 3`) / RGB32 (`n_channels == 4`) residuals.
@@ -1015,6 +1352,13 @@ fn yuy2_residuals(
 /// method decorrelates: the residual chain then starts from the
 /// decorrelated first pixel (spec/03 §2.4.1 fused formula), which the
 /// decoder derives from those same bytes.
+///
+/// One fused pass per pixel, written straight in wire order: with
+/// `d(p)` the pixel's working value (`B−G, G, R−G[, A]` when
+/// decorrelating, the plain bytes otherwise) and `v(p) = d(p) − d(p
+/// one prediction row back)` under the gradient predictor from the
+/// second prediction row on (`v = d` elsewhere), the residual is
+/// `v(p) − v(p − 1)` (spec/03 §2.2.2, §2.4.1; spec/06 §3.2).
 fn rgb_residuals(
     family: PixelFamily,
     method: Method,
@@ -1022,6 +1366,7 @@ fn rgb_residuals(
     height: u32,
     stride: usize,
     pixels: &[u8],
+    workers: usize,
 ) -> Result<Residuals> {
     let n_channels = family.bytes_per_pixel_step();
     let row_bytes = family.row_bytes(width);
@@ -1040,46 +1385,28 @@ fn rgb_residuals(
         ));
     }
     let decorrelate = method.decorrelate();
-    let mut residuals = vec![0u8; pixels.len()];
-    match (method.predictor(), decorrelate) {
-        (Predictor::Median, _) => {
+    // Prediction row length in pixels; `None` without the gradient.
+    let above_px = match method.predictor() {
+        Predictor::Median => {
             return Err(Error::invalid("encoder: method not legal for RGB"));
         }
-        (Predictor::Left, false) => {
-            forward_rgb_left_subtract_linear(pixels, &mut residuals, n_channels);
-        }
-        (Predictor::Left, true) => {
-            forward_left_decorr_residuals(pixels, &mut residuals, n_channels);
-        }
-        (Predictor::Gradient, false) => {
-            let mut above_removed = vec![0u8; pixels.len()];
-            forward_gradient_stride(pixels, &mut above_removed, stride);
-            forward_rgb_left_subtract_linear(&above_removed, &mut residuals, n_channels);
-        }
-        (Predictor::Gradient, true) => {
-            let mut above_removed = vec![0u8; pixels.len()];
-            forward_decorr_gradient_stride(pixels, &mut above_removed, n_channels, stride);
-            forward_rgb_left_subtract_linear(&above_removed, &mut residuals, n_channels);
-        }
-    }
+        Predictor::Left => None,
+        Predictor::Gradient => Some((stride / n_channels).max(1)),
+    };
     let seed = if n_channels == 3 {
         [0, pixels[0], pixels[1], pixels[2]]
     } else {
         [pixels[0], pixels[1], pixels[2], pixels[3]]
     };
-    // Body in wire order (spec/03 §1.4): `B, G, R[, A]` plain,
-    // `G, B−G, R−G[, A]` decorrelated.
-    let mut body = Vec::with_capacity(pixels.len() - n_channels);
-    for px in residuals[n_channels..].chunks_exact(n_channels) {
-        if decorrelate {
-            body.push(px[1]);
-            body.push(px[0]);
+    // Body unit `i` is pixel `i + 1`.
+    let mut body = vec![0u8; pixels.len() - n_channels];
+    fill_in_pieces(&mut body, n_channels, workers, |first_unit, piece| {
+        if n_channels == 3 {
+            rgb_run::<3>(pixels, decorrelate, above_px, first_unit + 1, piece);
         } else {
-            body.push(px[0]);
-            body.push(px[1]);
+            rgb_run::<4>(pixels, decorrelate, above_px, first_unit + 1, piece);
         }
-        body.extend_from_slice(&px[2..]);
-    }
+    });
     Ok(Residuals { seed, body })
 }
 
@@ -1094,6 +1421,43 @@ fn compute_lengths_from_body(family: PixelFamily, method: Method, body: &[u8]) -
         compute_canonical_lengths(&h2).unwrap_or([1u8; 256]),
         compute_canonical_lengths(&h3).unwrap_or([1u8; 256]),
     ]
+}
+
+/// Stream-level `CustomV2` tables: fitted to this frame, usable for
+/// any later one.
+///
+/// Each histogram is blended with the distribution the classic table
+/// of the same `(family, method, slot)` implies (`2^−length` per
+/// symbol): `7 × count + total × 2^−length + 1`. Every symbol gets a
+/// code, and because one eighth of the weight follows the classic
+/// table, the blended model assigns each symbol at least one eighth of
+/// its classic probability: a later frame costs about three bits per
+/// symbol more than under the classic tables at worst, however unlike
+/// the first frame it is (a stream that opens on black, say), while a
+/// frame like the first one pays about `log2(8/7) ≈ 0.19` bits per
+/// symbol over its own optimum at worst.
+fn covering_lengths_from_body(family: PixelFamily, method: Method, body: &[u8]) -> [[u8; 256]; 3] {
+    let (h1, h2, h3) = histogramise(family, method, body);
+    let prior = crate::tables::rle_decode_three_channels(classic_blob_bytes(family, method))
+        .unwrap_or([[8u8; 256]; 3]);
+    let mut slot = 0usize;
+    [h1, h2, h3].map(|h| {
+        let total: u64 = h.iter().map(|&c| c as u64).sum();
+        let classic = &prior[slot];
+        slot += 1;
+        let mut blended = [0u32; 256];
+        for ((out, &count), &len) in blended.iter_mut().zip(&h).zip(classic) {
+            let share = if (1..=31).contains(&len) {
+                total >> len
+            } else {
+                0
+            };
+            let value = 7 * count as u64 + share + 1;
+            *out = value.min(u32::MAX as u64) as u32;
+        }
+        // A flat 8-bit code is the always-valid fallback.
+        compute_canonical_lengths(&blended).unwrap_or([8u8; 256])
+    })
 }
 
 fn histogramise(
@@ -1445,9 +1809,96 @@ fn emit_bitstream_parts(
     slot2: &SlotEntries,
     slot3: &SlotEntries,
 ) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.extend_from_slice(seed);
-    let mut writer = BitWriter::new();
+    // The classic tables average well under 8 bits per symbol on
+    // picture content; a body-sized reservation avoids regrowth.
+    let mut writer = BitWriter::with_prefix(seed, body.len());
+    emit_body(family, method, body, slot1, slot2, slot3, &mut writer)?;
+    Ok(writer.finish())
+}
+
+/// Number of codewords in one pixel (YUY2: macropixel) of the wire
+/// cycle (spec/03 §1.4). A body cut at a multiple of it starts every
+/// piece on the first slot of the cycle.
+fn wire_cycle(family: PixelFamily) -> usize {
+    match family {
+        PixelFamily::Rgb24 => 3,
+        PixelFamily::Yuy2 | PixelFamily::Rgb32 => 4,
+    }
+}
+
+/// Residual bytes per worker below which splitting the emit is not
+/// worth a thread.
+const MIN_EMIT_SEGMENT: usize = 48 * 1024;
+
+/// [`emit_bitstream_parts`] with the codeword packing split across
+/// `segments` workers (the caller's thread included).
+///
+/// The body is cut at wire-cycle boundaries; each piece is packed into
+/// its own bit string, and the strings are spliced back in order at
+/// their exact bit offsets ([`BitWriter::append_bits`]), which is one
+/// shift per 32 output bits rather than one table lookup per residual.
+/// The bytes are those of the serial path for every input, and the
+/// error is the serial path's too: the first failing symbol in body
+/// order.
+#[allow(clippy::too_many_arguments)] // mirrors emit_bitstream_parts plus the split count
+fn emit_bitstream_segments(
+    family: PixelFamily,
+    method: Method,
+    seed: &[u8; 4],
+    body: &[u8],
+    slot1: &SlotEntries,
+    slot2: &SlotEntries,
+    slot3: &SlotEntries,
+    segments: usize,
+) -> Result<Vec<u8>> {
+    let cycle = wire_cycle(family);
+    let piece = (body.len() / segments.max(1) / cycle) * cycle;
+    if segments < 2 || piece == 0 {
+        return emit_bitstream_parts(family, method, seed, body, slot1, slot2, slot3);
+    }
+    let (first, mut rest) = body.split_at(piece);
+    let mut tails: Vec<&[u8]> = Vec::with_capacity(segments - 1);
+    for _ in 1..segments - 1 {
+        let (head, tail) = rest.split_at(piece);
+        tails.push(head);
+        rest = tail;
+    }
+    tails.push(rest);
+    let pack = |part: &[u8]| -> Result<BitWriter> {
+        let mut writer = BitWriter::with_prefix(&[], part.len());
+        emit_body(family, method, part, slot1, slot2, slot3, &mut writer)?;
+        Ok(writer)
+    };
+    let mut writer = BitWriter::with_prefix(seed, body.len());
+    let (head, packed) = std::thread::scope(|s| {
+        let handles: Vec<_> = tails.iter().map(|part| s.spawn(|| pack(part))).collect();
+        let head = emit_body(family, method, first, slot1, slot2, slot3, &mut writer);
+        let packed: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
+        (head, packed)
+    });
+    head?;
+    for joined in packed {
+        let part = match joined {
+            Ok(res) => res?,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let (words, tail, tail_bits) = part.into_bits();
+        writer.append_bits(&words, tail, tail_bits);
+    }
+    Ok(writer.finish())
+}
+
+/// Pack one run of residuals, which must start on the first slot of
+/// the family's wire cycle.
+fn emit_body(
+    family: PixelFamily,
+    method: Method,
+    body: &[u8],
+    slot1: &SlotEntries,
+    slot2: &SlotEntries,
+    slot3: &SlotEntries,
+    writer: &mut BitWriter,
+) -> Result<()> {
     match family {
         PixelFamily::Yuy2 => {
             // Round-221: macropixel-step YUY2 Huffman-encode body.
@@ -1639,8 +2090,7 @@ fn emit_bitstream_parts(
             }
         }
     }
-    out.extend_from_slice(&writer.finish());
-    Ok(out)
+    Ok(())
 }
 
 fn lookup_code(table: &SlotEntries, sym: u8) -> Result<(u32, u32)> {
@@ -3566,5 +4016,190 @@ mod round382_arbitrary_extradata_conformance_tests {
         let pixels = synth(PixelFamily::Yuy2.row_bytes(w) * h as usize, 0x0F0F_1E1E);
         let lens = [flat_len8(), flat_len8(), flat_len8()];
         roundtrip_with_tables(PixelFamily::Yuy2, Method::Left, w, h, &pixels, &lens);
+    }
+}
+
+#[cfg(test)]
+mod segmented_emit_tests {
+    //! The segmented emit (body cut at wire-cycle boundaries, pieces
+    //! packed on separate workers, bit strings spliced) must produce
+    //! the serial emit's bytes and the serial emit's error for every
+    //! split count.
+    use super::*;
+
+    fn synth(n: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                ((i / 5) as u32).wrapping_add(state & 0x1F) as u8
+            })
+            .collect()
+    }
+
+    fn methods(family: PixelFamily) -> &'static [Method] {
+        if family.is_rgb() {
+            &[Method::Left, Method::LeftDecorr, Method::GradientDecorr]
+        } else {
+            &[Method::Left, Method::Gradient, Method::Median]
+        }
+    }
+
+    #[test]
+    fn every_split_count_matches_serial_bytes() {
+        for family in [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32] {
+            for (w, h) in [(2u32, 1u32), (2, 2), (6, 5), (14, 9), (40, 31)] {
+                let pixels = synth(family.row_bytes(w) * h as usize, w * 131 + h);
+                for &method in methods(family) {
+                    let frame = compute_frame_residuals(family, method, w, h, &pixels).unwrap();
+                    let lengths = compute_lengths_from_body(family, method, &frame.body);
+                    let slots = [
+                        crate::tables::canonical_entries_from_lengths(&lengths[0])
+                            .unwrap()
+                            .0,
+                        crate::tables::canonical_entries_from_lengths(&lengths[1])
+                            .unwrap()
+                            .0,
+                        crate::tables::canonical_entries_from_lengths(&lengths[2])
+                            .unwrap()
+                            .0,
+                    ];
+                    let serial = emit_bitstream_parts(
+                        family,
+                        method,
+                        &frame.seed,
+                        &frame.body,
+                        &slots[0],
+                        &slots[1],
+                        &slots[2],
+                    )
+                    .unwrap();
+                    for segments in 0..=9 {
+                        let split = emit_bitstream_segments(
+                            family,
+                            method,
+                            &frame.seed,
+                            &frame.body,
+                            &slots[0],
+                            &slots[1],
+                            &slots[2],
+                            segments,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            split, serial,
+                            "{family:?}/{method:?}/{w}x{h}: {segments} segments"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_symbol_reports_the_serial_error() {
+        let family = PixelFamily::Yuy2;
+        let pixels = synth(family.row_bytes(16) * 12, 99);
+        let frame = compute_frame_residuals(family, Method::Left, 16, 12, &pixels).unwrap();
+        let lengths = compute_lengths_from_body(family, Method::Left, &frame.body);
+        let mut slots = [
+            crate::tables::canonical_entries_from_lengths(&lengths[0])
+                .unwrap()
+                .0,
+            crate::tables::canonical_entries_from_lengths(&lengths[1])
+                .unwrap()
+                .0,
+            crate::tables::canonical_entries_from_lengths(&lengths[2])
+                .unwrap()
+                .0,
+        ];
+        // Drop two luma symbols that occur at different places in the
+        // body, so different pieces fail on different symbols.
+        let early = frame.body[0];
+        let late = *frame
+            .body
+            .iter()
+            .step_by(2)
+            .rev()
+            .find(|&&b| b != early)
+            .unwrap();
+        slots[0][early as usize].length = 0;
+        slots[0][late as usize].length = 0;
+        let serial = emit_bitstream_parts(
+            family,
+            Method::Left,
+            &frame.seed,
+            &frame.body,
+            &slots[0],
+            &slots[1],
+            &slots[2],
+        )
+        .unwrap_err();
+        for segments in 2..=6 {
+            let split = emit_bitstream_segments(
+                family,
+                Method::Left,
+                &frame.seed,
+                &frame.body,
+                &slots[0],
+                &slots[1],
+                &slots[2],
+                segments,
+            )
+            .unwrap_err();
+            assert_eq!(split, serial, "{segments} segments");
+        }
+    }
+
+    /// Through the public entry points a frame large enough to split
+    /// encodes to the same bytes at every budget, for both the fixed
+    /// and the auto-selected path.
+    #[test]
+    fn public_budgets_are_output_invariant_on_a_splittable_frame() {
+        for family in [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32] {
+            let (w, h) = (400u32, 302u32);
+            let pixels = synth(family.row_bytes(w) * h as usize, 7);
+            assert!(pixels.len() / MIN_EMIT_SEGMENT >= 2, "emit must split");
+            assert!(
+                pixels.len() / MIN_RESIDUAL_SEGMENT >= 2,
+                "residuals must split"
+            );
+            for &method in methods(family) {
+                for mode in [ExtradataMode::ClassicV2, ExtradataMode::CustomV2] {
+                    let serial = encode_frame_with_mode(family, method, w, h, &pixels, mode);
+                    for budget in [0usize, 2, 3, 5, 16] {
+                        let split = encode_frame_with_mode_workers(
+                            family, method, w, h, &pixels, mode, budget,
+                        );
+                        assert_eq!(
+                            split, serial,
+                            "{family:?}/{method:?}/{mode:?} budget {budget}"
+                        );
+                    }
+                }
+            }
+            let serial = encode_frame_auto(
+                family,
+                MethodSelection::Auto,
+                w,
+                h,
+                &pixels,
+                ExtradataMode::CustomV2,
+            );
+            for budget in [2usize, 4] {
+                let split = encode_frame_auto_workers(
+                    family,
+                    MethodSelection::Auto,
+                    w,
+                    h,
+                    &pixels,
+                    ExtradataMode::CustomV2,
+                    budget,
+                );
+                assert_eq!(split, serial, "{family:?} auto budget {budget}");
+            }
+        }
     }
 }

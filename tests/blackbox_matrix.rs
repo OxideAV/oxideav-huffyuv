@@ -809,14 +809,9 @@ fn registry_frames_are_top_down_both_ways() {
             let mut enc = make_encoder(&params).expect("make_encoder");
             let stride = row_bytes + 5;
             let mut packets = Vec::new();
-            // custom-v2 pins the first frame's tables for the stream, so
-            // repeat one picture there; the other modes take all three.
-            for (i, top_down) in decoded_frames.iter().enumerate() {
-                let picture = if mode == "custom-v2" {
-                    &decoded_frames[0]
-                } else {
-                    top_down
-                };
+            // custom-v2 pins the first frame's tables for the stream;
+            // they cover every symbol, so later pictures still encode.
+            for (i, picture) in decoded_frames.iter().enumerate() {
                 let mut data = Vec::with_capacity(stride * height as usize);
                 for row in picture.chunks_exact(row_bytes) {
                     data.extend_from_slice(row);
@@ -850,16 +845,144 @@ fn registry_frames_are_top_down_both_ways() {
                 "{pix_fmt}/{mode}: black-box diagnostics: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let want: Vec<u8> = if mode == "custom-v2" {
-                decoded_frames[0].repeat(frames)
-            } else {
-                source.clone()
-            };
             assert_eq!(
                 std::fs::read(&back).unwrap(),
-                want,
+                source,
                 "{pix_fmt}/{mode}: black-box decode of the registry stream"
             );
+        }
+    }
+}
+
+// ───────────────────────── size against the black box ─────────────────────────
+
+/// Same picture, same predictor: the residual symbols are fixed by the
+/// format, so the only freedom is the Huffman tables. Per-frame
+/// optimal tables (`CustomV2`) can therefore never lose to another
+/// encoder's tables on a single frame; the classic tables may. Prints
+/// the comparison (quoted in BENCHMARKS.md) and asserts the bound.
+#[test]
+fn encoded_size_against_black_box_encoder() {
+    use oxideav_huffyuv::encoder::encode_frame_auto;
+
+    if !ffmpeg_available() {
+        eprintln!("skip: ffmpeg not on PATH");
+        return;
+    }
+    let dir = TempDir::new("size");
+    eprintln!(
+        "| source | format | predictor | black box | ours classic | ours custom | ours auto+custom |"
+    );
+    for (source, graph_head) in [
+        (
+            "pattern + noise",
+            "testsrc2=size=320x240:rate=5,noise=alls=12:allf=t:all_seed=7",
+        ),
+        ("pattern", "testsrc2=size=320x240:rate=5"),
+        ("mandelbrot", "mandelbrot=size=320x240:rate=5"),
+    ] {
+        for (pix_fmt, raw_fmt, family) in [
+            ("yuv422p", "yuyv422", PixelFamily::Yuy2),
+            ("rgb24", "bgr24", PixelFamily::Rgb24),
+            ("bgra", "bgra", PixelFamily::Rgb32),
+        ] {
+            let graph = format!("{graph_head},format={pix_fmt}");
+            let raw = dir.path("src.raw");
+            let ok = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &graph,
+                    "-frames:v",
+                    "1",
+                ])
+                .args(["-pix_fmt", raw_fmt, "-f", "rawvideo"])
+                .arg(&raw)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "source dump");
+            let top_down = std::fs::read(&raw).unwrap();
+            let row_bytes = family.row_bytes(320);
+            let pixels = if family.is_rgb() {
+                flip_rows(&top_down, row_bytes)
+            } else {
+                top_down
+            };
+            let preds: &[(&str, Method)] = if family.is_rgb() {
+                &[
+                    ("left", Method::LeftDecorr),
+                    ("plane", Method::GradientDecorr),
+                ]
+            } else {
+                &[
+                    ("left", Method::Left),
+                    ("plane", Method::Gradient),
+                    ("median", Method::Median),
+                ]
+            };
+            for &(pred, method) in preds {
+                let avi = dir.path("bb.avi");
+                let ok = Command::new("ffmpeg")
+                    .args([
+                        "-v",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &graph,
+                        "-frames:v",
+                        "1",
+                    ])
+                    .args(["-c:v", "huffyuv", "-pred", pred])
+                    .arg(&avi)
+                    .status()
+                    .unwrap()
+                    .success();
+                assert!(ok, "black-box encode");
+                let foreign = read_avi(&avi);
+                let config = StreamConfig::parse_bitmapinfoheader(&foreign.strf).unwrap();
+                assert_eq!(config.method, method, "{pix_fmt}/{pred}: method mapping");
+                let theirs = foreign.frames[0].len();
+                let size = |mode| {
+                    encode_frame_with_mode(family, method, 320, 240, &pixels, mode)
+                        .unwrap()
+                        .1
+                        .len()
+                };
+                let classic = size(ExtradataMode::ClassicV2);
+                let custom = size(ExtradataMode::CustomV2);
+                let (_, auto, picked) = encode_frame_auto(
+                    family,
+                    MethodSelection::Auto,
+                    320,
+                    240,
+                    &pixels,
+                    ExtradataMode::CustomV2,
+                )
+                .unwrap();
+                eprintln!(
+                    "| {source} | {pix_fmt} | {pred} | {theirs} | {classic} ({:+.1} %) | {custom} ({:+.1} %) | {} ({:+.1} %, {picked:?}) |",
+                    100.0 * (classic as f64 / theirs as f64 - 1.0),
+                    100.0 * (custom as f64 / theirs as f64 - 1.0),
+                    auto.len(),
+                    100.0 * (auto.len() as f64 / theirs as f64 - 1.0),
+                );
+                assert!(
+                    custom <= theirs,
+                    "{source}/{pix_fmt}/{pred}: per-frame optimal tables ({custom}) \
+                     must not exceed the black-box frame ({theirs})"
+                );
+                assert!(
+                    auto.len() <= custom,
+                    "auto-selection must not lose to a fixed method"
+                );
+            }
         }
     }
 }

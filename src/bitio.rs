@@ -223,6 +223,56 @@ impl BitWriter {
         }
     }
 
+    /// A writer whose output starts with `prefix` (copied verbatim,
+    /// ahead of the first 32-bit word) and has room reserved for
+    /// `capacity` further bytes.
+    pub fn with_prefix(prefix: &[u8], capacity: usize) -> Self {
+        let mut out = Vec::with_capacity(prefix.len() + capacity);
+        out.extend_from_slice(prefix);
+        Self {
+            out,
+            acc: 0,
+            bits_buffered: 0,
+        }
+    }
+
+    /// Split a writer that started empty into its whole 32-bit words
+    /// (as stored bytes), the unflushed tail (MSB-aligned) and the
+    /// number of tail bits (0..32) — a bit string another writer can
+    /// take over with [`BitWriter::append_bits`].
+    pub fn into_bits(self) -> (Vec<u8>, u32, u32) {
+        (self.out, (self.acc >> 32) as u32, self.bits_buffered)
+    }
+
+    /// Append a bit string produced by [`BitWriter::into_bits`] at the
+    /// current bit position, as if its codewords had been written
+    /// here one by one.
+    pub fn append_bits(&mut self, words: &[u8], tail: u32, tail_bits: u32) {
+        debug_assert!(words.len().is_multiple_of(4));
+        debug_assert!(tail_bits < 32);
+        if self.bits_buffered == 0 {
+            // Word-aligned: the stored words are already in place.
+            self.out.extend_from_slice(words);
+        } else {
+            // Every incoming word straddles two output words: its top
+            // `32 - k` bits complete the pending word, its low `k`
+            // bits open the next one.
+            let k = self.bits_buffered;
+            self.out.reserve(words.len());
+            let mut pending = (self.acc >> 32) as u32;
+            for chunk in words.as_chunks::<4>().0 {
+                let w = u32::from_le_bytes(*chunk);
+                self.out
+                    .extend_from_slice(&(pending | (w >> k)).to_le_bytes());
+                pending = w << (32 - k);
+            }
+            self.acc = (pending as u64) << 32;
+        }
+        if tail_bits > 0 {
+            self.write_msb(tail, tail_bits);
+        }
+    }
+
     /// Write the top `n_bits` of `code` (an MSB-aligned 32-bit value).
     /// `n_bits` is in 1..=32.
     #[inline]
@@ -272,6 +322,46 @@ impl Default for BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Splicing bit strings must equal writing every codeword through
+    /// one writer, for every cut position and every bit alignment.
+    #[test]
+    fn append_bits_equals_serial_writes() {
+        let mut state = 0x2545_F491u32;
+        let mut codes = Vec::new();
+        for _ in 0..400 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let n = 1 + (state >> 27) % 31;
+            codes.push(((state << 5) & !((1u32 << (32 - n)) - 1), n));
+        }
+        let mut serial = BitWriter::with_prefix(&[9, 8, 7, 6], 0);
+        for &(c, n) in &codes {
+            serial.write_msb(c, n);
+        }
+        let serial = serial.finish();
+        for cuts in [
+            vec![0usize],
+            vec![1, 2, 3],
+            vec![57, 131],
+            vec![400],
+            vec![13, 13, 399],
+        ] {
+            let mut spliced = BitWriter::with_prefix(&[9, 8, 7, 6], 0);
+            let mut start = 0;
+            for end in cuts.into_iter().chain([codes.len()]) {
+                let mut part = BitWriter::new();
+                for &(c, n) in &codes[start..end] {
+                    part.write_msb(c, n);
+                }
+                let (words, tail, bits) = part.into_bits();
+                spliced.append_bits(&words, tail, bits);
+                start = end;
+            }
+            assert_eq!(spliced.finish(), serial);
+        }
+    }
 
     #[test]
     fn writer_then_reader_round_trip_short_codes() {

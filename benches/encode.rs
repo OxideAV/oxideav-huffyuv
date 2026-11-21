@@ -326,11 +326,10 @@ fn bench_rgb24_320x240_auto_custom(c: &mut Criterion) {
 // regression that scaled with raster size (allocation churn, cache
 // behaviour of the 64-Ki LUTs, package-merge per candidate) could
 // hide behind the 320-class scenarios. 1280×720 crosses the
-// `is_interlaced_height` threshold, so these also exercise the
-// field-split encode path on the wider-stride families.
+// 288-line threshold, so these are field-coded (spec/06 §1.1).
 
 fn bench_rgb24_1280x720_left_decorr_classic(c: &mut Criterion) {
-    // Large-raster RGB24 decorrelated encode (interlaced by height).
+    // Large-raster RGB24 decorrelated encode (field-coded by height).
     bench_fixed(
         c,
         "encode_rgb24_1280x720_left_decorr_classic",
@@ -357,13 +356,37 @@ fn bench_yuy2_1280x720_auto_custom(c: &mut Criterion) {
     );
 }
 
-/// Round-420 worker-scaling gates: 1 vs 2 workers on interlaced HD
-/// encodes (`encode_frame_with_mode_workers`). Unlike decode, encode
-/// has no split-finding prefix (each field packs into its own buffer
-/// and the buffers concatenate), so both the residual phase and the
-/// emit phase parallelise fully — these gates read as the ceiling of
-/// the crate's ExecutionContext scaling.
-fn bench_hd_interlaced_encode_worker_scaling(c: &mut Criterion) {
+/// HD gates for the residual passes that only ran at 320×240 before.
+fn bench_yuy2_1280x720_median_classic(c: &mut Criterion) {
+    bench_fixed(
+        c,
+        "encode_yuy2_1280x720_median_classic",
+        PixelFamily::Yuy2,
+        Method::Median,
+        1280,
+        720,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+fn bench_rgb32_1280x720_gradient_decorr_classic(c: &mut Criterion) {
+    bench_fixed(
+        c,
+        "encode_rgb32_1280x720_gradient_decorr_classic",
+        PixelFamily::Rgb32,
+        Method::GradientDecorr,
+        1280,
+        720,
+        ExtradataMode::ClassicV2,
+    );
+}
+
+/// Fixed-method worker scaling: 1 / 2 / 4 workers on
+/// `encode_frame_with_mode_workers`. The residual body is cut into
+/// one piece per worker, each piece is bit-packed on its own thread
+/// and the bit strings are spliced back at their bit offsets, so the
+/// wire bytes are those of the serial encoder at every budget.
+fn bench_fixed_worker_scaling(c: &mut Criterion) {
     for (name, family, method) in [
         (
             "encode_workers_yuy2_1280x720_left_classic",
@@ -385,7 +408,7 @@ fn bench_hd_interlaced_encode_worker_scaling(c: &mut Criterion) {
         let pixels = build_pixels(w as usize, h as usize, bytes_per_pixel(family));
         let mut g = c.benchmark_group(name);
         g.throughput(Throughput::Bytes(pixels.len() as u64));
-        for workers in [1usize, 2] {
+        for workers in [1usize, 2, 4] {
             g.bench_function(BenchmarkId::from_parameter(format!("{workers}w")), |b| {
                 b.iter(|| {
                     encode_frame_with_mode_workers(
@@ -397,7 +420,7 @@ fn bench_hd_interlaced_encode_worker_scaling(c: &mut Criterion) {
                         ExtradataMode::ClassicV2,
                         workers,
                     )
-                    .expect("encode")
+                    .expect("encode workers")
                 });
             });
         }
@@ -405,13 +428,11 @@ fn bench_hd_interlaced_encode_worker_scaling(c: &mut Criterion) {
     }
 }
 
-/// Round-429 auto-selector worker-scaling gates: 1 vs 2 vs 3 workers
-/// on `encode_frame_auto_workers`. The budget fans the per-candidate
+/// Auto-selector worker-scaling gates: 1 vs 2 vs 3 workers on
+/// `encode_frame_auto_workers`. The budget fans the per-candidate
 /// scoring (3 legal methods per family = 3 work units) across the
-/// granted workers and hands the winner's emit the r420 interlaced
-/// clamp, so the progressive HD case reads as pure scoring
-/// parallelism and the interlaced case adds the two-worker emit on
-/// top. Output is wire-identical across budgets (golden-pin sweep);
+/// granted workers; the winner's emit is one codeword stream and stays
+/// serial. Output is wire-identical across budgets (golden-pin sweep);
 /// these gates measure the wall-time side of that invariance.
 fn bench_auto_worker_scaling(c: &mut Criterion) {
     for (name, family, w, h) in [
@@ -482,7 +503,9 @@ criterion_group!(
     bench_rgb24_320x240_auto_custom,
     bench_rgb24_1280x720_left_decorr_classic,
     bench_yuy2_1280x720_auto_custom,
-    bench_hd_interlaced_encode_worker_scaling,
+    bench_yuy2_1280x720_median_classic,
+    bench_rgb32_1280x720_gradient_decorr_classic,
+    bench_fixed_worker_scaling,
     bench_auto_worker_scaling,
 );
 criterion_main!(benches);

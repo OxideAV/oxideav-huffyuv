@@ -71,6 +71,11 @@ No external library source consulted.
   `Method`). Pin a method via `MethodSelection::Fixed(...)`.
   `encode_frame_auto_workers` fans the candidate scoring out across a
   caller-granted thread budget with identical output.
+- **Multi-worker encode** under a caller-granted budget
+  (`encode_frame_with_mode_workers`, `EncodeOptions::worker_budget`,
+  or `ExecutionContext` through the registry): the residual body is
+  cut into one piece per worker, packed in parallel and spliced back
+  bit-exactly. Serial by default; small frames stay serial.
 - Public **`build_bitmapinfoheader`** BIH writer for muxers
   synthesising an AVI `strf` payload; writes the interlace byte
   `0x10` / `0x20` at BIH `+0x2A` (spec/06 §1.2).
@@ -87,9 +92,10 @@ No external library source consulted.
 
 - Registry `Decoder` **and** `Encoder` implementations wired by
   `register()`, with `make_decoder` / `make_encoder` also exposed
-  directly. Both honour `set_execution_context` (serial default; a
-  budget ≥ 2 engages the parallel auto-selector scoring) with
-  byte-identical output across budgets.
+  directly. Both honour `set_execution_context` (serial default; on
+  the encoder a budget ≥ 2 engages the piecewise frame encode and the
+  parallel auto-selector scoring) with byte-identical output across
+  budgets.
 - Encoder options bag (`HuffYuvEncoderOptions`, schema-registered):
   `format` = `auto`|`yuy2`|`rgb24`|`rgb32` (`auto` derives from
   `CodecParameters::pixel_format` — `Yuyv422`/`Bgr24`/`Bgra`),
@@ -100,10 +106,11 @@ No external library source consulted.
   `field-coding` = `auto`|`fields`|`plain`.
 - `output_params()` carries the AVI `strf` as extradata (final at
   construction for a fixed method with `classic-v2`/`v1x`; finalized
-  by the first `send_frame` otherwise). `custom-v2` streams pin the
-  first frame's Huffman tables — repeat content re-encodes
-  byte-identically, and frames needing symbols the pinned tables
-  never coded are rejected instead of emitting an undecodable stream.
+  by the first `send_frame` otherwise). `custom-v2` streams pin
+  tables fitted to the first frame and blended with the classic
+  distribution so every symbol has a code: later frames always
+  encode, a frame like the first costs 0.3–0.5 % over its own
+  optimum, and a frame unlike it stays near the classic size.
 - Packets are intra-only keyframes, pts passed through verbatim
   (`dts == pts`), time base from `CodecParameters::frame_rate`.
 - Frames are top row first for all three families: the registry path
@@ -160,8 +167,8 @@ Encoded size against the black-box encoder on the same rasters is in
 - `encode_frame_with_options(family, width, height, pixels,
   &EncodeOptions) -> Result<EncodedFrame>` — method selection,
   extradata mode, field coding and thread budget in one record
-- `encode_frame_with_mode_workers(..., worker_budget)` — same wire
-  bytes at every budget
+- `encode_frame_with_mode_workers(..., worker_budget)` — splits the
+  frame across the granted workers, same wire bytes at every budget
 - `encode_frame_auto_workers(..., worker_budget)` — budgeted
   candidate scoring, identical output across budgets
   (`encode_frame_auto` ≡ budget 1)
@@ -220,6 +227,21 @@ LeftDecorr −8.4% serial) and **lean CustomV2 encoder tables** (the
 emit path reads only `(code, length)` entries, so the per-frame 64-Ki
 decode-LUT bake is skipped — 320×240 auto-custom encodes −10.0% YUY2
 / −7.1% RGB24).
+
+Round 493 (same-session A/B against the pre-phase commit, minimum of
+4 runs each on a shared host, byte-identical output): the residual
+passes became single fused kernels — serial encode **1.5–1.9×** for
+YUY2 Median, **1.2–1.3×** for decorrelated RGB at 1280×720 — and the
+encoder now splits **any** large frame across the granted workers
+(piecewise residuals, per-piece bit packing, bit strings spliced at
+their bit offsets): a 1280×720 frame at 4 workers encodes in 1.05 ms
+(YUY2 Left, 2.8×), 1.06 ms (YUY2 Median, 4.8×) and 2.14 ms (RGB32
+GradientDecorr, 4.7×) against 2.9 / 5.2 / 9.7 ms before. Decode:
+YUY2 Median 1.1×, the rest unchanged (decode cannot be split — one
+codeword stream). Against the black-box encoder on the same picture
+and predictor, `custom-v2` frames are 4–46 % smaller and `classic-v2`
+frames 1 % smaller to 37 % larger. Tables in
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Fuzzing
 

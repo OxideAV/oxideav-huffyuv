@@ -17,10 +17,10 @@ cargo bench -p oxideav-huffyuv --bench tables
 
 ## Coverage
 
-**Decode** (`benches/decode.rs`) — all six on-wire methods plus the
-progressive/interlaced split:
+**Decode** (`benches/decode.rs`) — all six on-wire methods on both
+rasters (plain, and field-coded by height, spec/06 §1.1):
 
-| method               | family | mode      | size      | interlaced |
+| method               | family | mode      | size      | field-coded |
 | -------------------- | ------ | --------- | --------- | ---------- |
 | `predict_old` (`-2`) | YUY2   | ClassicV2 | 320×240   | no         |
 | Left (`0x00`)        | YUY2   | ClassicV2 | 320×240   | no         |
@@ -30,36 +30,31 @@ progressive/interlaced split:
 | Left                 | YUY2   | ClassicV2 | 320×288   | no (ctrl)  |
 | Left                 | YUY2   | ClassicV2 | 320×320   | **yes**    |
 | Left                 | YUY2   | ClassicV2 | 1280×720  | **yes**    |
+| Gradient             | YUY2   | ClassicV2 | 1280×720  | **yes** (r493) |
+| Median               | YUY2   | ClassicV2 | 1280×720  | **yes** (r493) |
+| LeftDecorr           | RGB24  | ClassicV2 | 1280×720  | **yes** (r493) |
 | LeftDecorr (`0x40`)  | RGB24  | ClassicV2 | 320×240   | no         |
 | LeftDecorr           | RGB24  | ClassicV2 | 320×320   | **yes**    |
 | GradientDecorr (`0x41`) | RGB32 | ClassicV2 | 320×240 | no         |
 | GradientDecorr       | RGB32  | ClassicV2 | 1280×720  | **yes**    |
 
-The 320×288 (largest progressive raster, `height == 288` is NOT
-`> 288`) / 320×320 (first interlaced raster) Left pair isolates the
-`decode_frame_interlaced` field-split overhead from the raster-size
-delta.
-
-Round 420 adds **worker-scaling gates** (1 vs 2 workers through
-`decode_frame_with_workers` / `encode_frame_with_mode_workers`) on
-three interlaced 1280×720 scenarios each:
-`{decode,encode}_workers_yuy2_1280x720_left_classic`,
-`…_yuy2_1280x720_median_classic`, and
-`…_rgb32_1280x720_gradient_decorr_classic`. The `1w` arm routes
-through the identical serial code path, so each pair reads directly
-as the field-parallel delta. Round 440 adds
-`decode_workers_rgb24_1280x720_left_decorr_classic` — the 3-code
-family whose split scan previously left the `+2 → slot3` position on
-a lone `decode_one`.
+The 320×288 (tallest plain raster, `height == 288` is NOT `> 288`) /
+320×320 (first field-coded raster) Left pair shows that field coding
+costs nothing in the entropy loop: it only moves the predictors'
+"above" reference.
 
 **Encode** (`benches/encode.rs`) — symmetric v1.x / v2.x across all
 three families:
 
 | family | methods                                   | modes               |
 | ------ | ----------------------------------------- | ------------------- |
-| YUY2   | Left, Gradient, Median, Left(interlaced)  | ClassicV2, V1xCompat, CustomV2(auto; 320×240 + 1280×720) |
+| YUY2   | Left, Gradient, Median (320×240 + 1280×720), Left 320×320 | ClassicV2, V1xCompat, CustomV2(auto; 320×240 + 1280×720) |
 | RGB24  | Left, LeftDecorr (320×240 + 1280×720), GradientDecorr | ClassicV2, V1xCompat, CustomV2(auto) |
-| RGB32  | Left, LeftDecorr, GradientDecorr          | ClassicV2, V1xCompat |
+| RGB32  | Left, LeftDecorr, GradientDecorr (320×240 + 1280×720) | ClassicV2, V1xCompat |
+
+Worker-scaling gates: `encode_workers_*` (fixed method, 1 / 2 / 4
+workers, 1280×720) and `encode_auto_workers_*` (auto-selector, 1 / 2 /
+3 workers).
 
 **Table-build primitives** (`benches/tables.rs`) — the per-channel,
 per-frame work the CustomV2 / auto-select path pays, isolated from the
@@ -81,6 +76,14 @@ balanced-tree worst case), and `sparse` (5 live symbols — small-alphabet
 fast path).
 
 ## Ranked hotspot table
+
+> **Read with round 493 in mind.** The absolute tables in this
+> section were measured in rounds 419–440. The plain-raster LEFT /
+> gradient rows still describe today's code. The Median rows and
+> every decorrelated-RGB row were measured on streams with the
+> pre-r493 wire defects (see CHANGELOG), and the rows marked
+> "interlaced" measured the retired two-field layout; treat those as
+> history. Current relative numbers are in "Round 493" below.
 
 Measured on aarch64 (Apple, macOS), Criterion 0.5, dev machine,
 `--measurement-time 3 --sample-size 20`, post-round-419. Absolute wall
@@ -175,58 +178,119 @@ primary-LUT fill) is the new largest primitive. Decode/encode no
 longer pay `build_from_lengths` per frame at all outside CustomV2
 (built-tables cache).
 
-### Worker scaling (round 420)
+### Round 493
 
-> **Withdrawn (round 493).** The figures in this section measured
-> two-worker decode / encode of a two-independent-fields layout that
-> only this crate read and wrote. Field-coded frames are now a single
-> codeword stream (spec/06) and have no parallel split; the section is
-> kept as history until the tables are re-measured.
+All numbers below are same-session A/B runs of two builds of this
+crate — the commit before the performance phase (`cc4601f`) and the
+current tree — alternated on one machine, **minimum of 4 runs per
+build** (the host was shared with nine other build jobs; a minimum
+approximates the uncontended wall, and rows within about ±10 % of
+1.00 are noise — the unchanged YUY2 Left decode path reads 0.89–1.00
+across runs). Apple Silicon, Criterion 0.5, synthetic gradient +
+noise rasters, `ClassicV2` tables. Output is byte-identical between
+the two builds (golden pins) and across worker budgets.
 
-Round 420 added the `ExecutionContext`-gated two-worker interlaced
-paths (`decode_frame_with_workers` / `encode_frame_with_mode_workers`)
-plus the scan-side pair-length LUTs. Measured on the same aarch64 dev
-machine; the host was contended by sibling jobs during the r420
-session, so these are **min-of-80 wall times** (a min over many
-iterations approximates the uncontended wall far better than a mean
-under load — the 1-worker mins reproduce the r419 Criterion table
-within ~4%, e.g. 7.91 vs 7.62 ms YUY2-720p-Left decode, 17.90 vs
-17.2 ms RGB32-720p). The Criterion `*_workers_*` gates cover the same
-scenarios for future quiet-host runs.
+**Encode, 1 worker** — fused position-based residual kernels:
 
-All scenarios interlaced 1280×720 ClassicV2, 1 → 2 workers:
+| scenario | before | after | speed-up |
+| --- | --- | --- | --- |
+| yuy2 320×240 Median | 0.367 ms | 0.196 ms | **1.87×** |
+| yuy2 1280×720 Median | 5.22 ms | 3.51 ms | **1.49×** |
+| rgb32 1280×720 GradientDecorr | 9.85 ms | 7.47 ms | **1.32×** |
+| rgb24 1280×720 LeftDecorr | 6.48 ms | 5.17 ms | **1.25×** |
+| rgb32 320×240 GradientDecorr | 0.724 ms | 0.595 ms | 1.22× |
+| rgb24 320×240 LeftDecorr | 0.474 ms | 0.396 ms | 1.20× |
+| yuy2 1280×720 auto CustomV2 | 6.33 ms | 5.24 ms | 1.21× |
+| rgb24 320×240 Left | 0.394 ms | 0.348 ms | 1.13× |
+| rgb24 320×240 GradientDecorr | 0.532 ms | 0.494 ms | 1.08× |
+| yuy2 320×240 Left | 0.204 ms | 0.187 ms | noise |
+| yuy2 1280×720 Left | 2.84 ms | 3.04 ms | noise |
+| yuy2 320×240 Gradient | 0.225 / 0.517 ms | 0.271 / 0.441 ms | noise (0.83× and 1.17× in two runs) |
 
-| direction | scenario                  | 1 worker | 2 workers | speedup |
-| --------- | ------------------------- | -------- | --------- | ------- |
-| decode    | yuy2 Left                 | 7.91 ms (222 MiB/s)  | 5.47 ms (321 MiB/s)  | **1.45×** |
-| decode    | yuy2 Median               | 9.81 ms (179 MiB/s)  | 6.69 ms (263 MiB/s)  | **1.47×** |
-| decode    | rgb32 GradientDecorr      | 17.90 ms (196 MiB/s) | 13.45 ms (261 MiB/s) | **1.33×** |
-| decode    | rgb24 LeftDecorr (r440)   | 11.39 ms (231 MiB/s) | 8.44 ms (312 MiB/s)  | **1.35×** |
-| encode    | yuy2 Left                 | 2.95 ms (597 MiB/s)  | 1.59 ms (1.08 GiB/s) | **1.85×** |
-| encode    | yuy2 Median               | 4.82 ms (365 MiB/s)  | 2.79 ms (629 MiB/s)  | **1.72×** |
-| encode    | rgb32 GradientDecorr      | 10.78 ms (326 MiB/s) | 5.43 ms (648 MiB/s)  | **1.99×** |
+**Encode, fixed method, worker scaling** (1280×720;
+`encode_frame_with_mode_workers`; "before" is serial at every budget
+because the previous build had no split for a single-stream frame):
 
-Reading the asymmetry: **encode scales near-perfectly** (no
-cross-field dependency — each field's residual + bit-pack lands in
-its own buffer, concatenated afterwards; the residual gather and the
-final `Vec` join are the only serial parts). **Decode is bounded by
-the split-scan prefix**: the wire carries no bottom-field offset, so
-the bottom worker starts only after a bit-exact length-only scan of
-the top field's codeword stream. The r420 pair-length LUTs (one
-8-bit load per two codewords when the pair fits in the 16 known
-window bits) cut that scan to well under half a field decode —
-before them the 2-worker decode wins were only 1.02× / 1.18× /
-1.04×. Serial (budget-1) walls are unchanged on every scenario, and
-all worker paths are byte-identical to serial (golden-pin invariance
-suites + fuzz differential oracles).
+| scenario | before (any budget) | 1 worker | 2 workers | 4 workers |
+| --- | --- | --- | --- | --- |
+| yuy2 Left | 2.91 ms | 3.04 ms | 1.79 ms (**1.6×**) | 1.05 ms (**2.8×**) |
+| yuy2 Median | 5.15 ms | 3.20 ms | 1.83 ms (**2.7×**) | 1.06 ms (**4.8×**) |
+| rgb32 GradientDecorr | 9.70 ms | 7.01 ms | 4.03 ms (**2.4×**) | 2.14 ms (**4.7×**) |
+
+(Speed-ups are against the "before" column, so they include the
+serial kernel gain; against the new 1-worker wall, 4 workers give
+2.9× / 3.0× / 3.3×.) At 4 workers a 1280×720 YUY2 frame encodes in
+about 1 ms — roughly 1.7 GiB/s.
+
+**Decode, 1 worker** (decode has no parallel split: one codeword
+stream, no offsets on the wire):
+
+| scenario | before | after | speed-up |
+| --- | --- | --- | --- |
+| yuy2 320×240 Median | 0.555 ms | 0.494 ms | **1.12×** |
+| yuy2 1280×720 Median | 7.26 ms | 6.58 ms | **1.10×** |
+| yuy2 1280×720 Gradient | 6.59 ms | 5.89 ms | 1.12× (noise band) |
+| yuy2 Left, rgb24 LeftDecorr, rgb32 GradientDecorr | — | — | unchanged code, 0.88–1.00× = noise |
+
+Formats newly gated this round (after, 1 worker, same run): yuy2
+1280×720 Median decode 6.58 ms (267 MiB/s), yuy2 1280×720 Gradient
+decode 5.89 ms (298 MiB/s), rgb24 1280×720 LeftDecorr decode 10.5 ms
+(250 MiB/s), rgb32 1280×720 GradientDecorr decode 12.5 ms
+(281 MiB/s).
+
+**Encoded size against the black-box encoder** — one 320×240 frame,
+same picture and same predictor on both sides, frame bytes
+(`tests/blackbox_matrix.rs::encoded_size_against_black_box_encoder`
+prints this table and asserts the `custom` column never exceeds the
+black box):
+
+| source | format | predictor | black box | ours classic | ours custom | ours auto+custom |
+|---|---|---|---|---|---|---|
+| pattern + noise | yuv422p | left | 131736 | 156964 (+19.2 %) | 107776 (-18.2 %) | 105768 (-19.7 %, Median) |
+| pattern + noise | yuv422p | plane | 143908 | 196968 (+36.9 %) | 114168 (-20.7 %) | 105768 (-26.5 %, Median) |
+| pattern + noise | yuv422p | median | 129356 | 176336 (+36.3 %) | 105768 (-18.2 %) | 105768 (-18.2 %, Median) |
+| pattern + noise | rgb24 | left | 165296 | 184664 (+11.7 %) | 147024 (-11.1 %) | 138468 (-16.2 %, Left) |
+| pattern + noise | rgb24 | plane | 181488 | 211072 (+16.3 %) | 157992 (-12.9 %) | 138468 (-23.7 %, Left) |
+| pattern + noise | bgra | left | 184496 | 203864 (+10.5 %) | 159092 (-13.8 %) | 149084 (-19.2 %, Left) |
+| pattern + noise | bgra | plane | 200688 | 230272 (+14.7 %) | 171840 (-14.4 %) | 149084 (-25.7 %, Left) |
+| pattern | yuv422p | left | 51888 | 58652 (+13.0 %) | 30352 (-41.5 %) | 24704 (-52.4 %, Median) |
+| pattern | yuv422p | plane | 45412 | 49524 (+9.1 %) | 25248 (-44.4 %) | 24704 (-45.6 %, Median) |
+| pattern | yuv422p | median | 44576 | 44184 (-0.9 %) | 24704 (-44.6 %) | 24704 (-44.6 %, Median) |
+| pattern | rgb24 | left | 70548 | 74320 (+5.3 %) | 40676 (-42.3 %) | 36728 (-47.9 %, GradientDecorr) |
+| pattern | rgb24 | plane | 67984 | 72988 (+7.4 %) | 36728 (-46.0 %) | 36728 (-46.0 %, GradientDecorr) |
+| pattern | bgra | left | 89748 | 93520 (+4.2 %) | 50276 (-44.0 %) | 46328 (-48.4 %, GradientDecorr) |
+| pattern | bgra | plane | 87184 | 92188 (+5.7 %) | 46328 (-46.9 %) | 46328 (-46.9 %, GradientDecorr) |
+| mandelbrot | yuv422p | left | 69392 | 77732 (+12.0 %) | 66604 (-4.0 %) | 50688 (-27.0 %, Gradient) |
+| mandelbrot | yuv422p | plane | 58280 | 65132 (+11.8 %) | 50688 (-13.0 %) | 50688 (-13.0 %, Gradient) |
+| mandelbrot | yuv422p | median | 58876 | 64644 (+9.8 %) | 52544 (-10.8 %) | 50688 (-13.9 %, Gradient) |
+| mandelbrot | rgb24 | left | 108116 | 124596 (+15.2 %) | 99568 (-7.9 %) | 72500 (-32.9 %, GradientDecorr) |
+| mandelbrot | rgb24 | plane | 87504 | 101188 (+15.6 %) | 72500 (-17.1 %) | 72500 (-17.1 %, GradientDecorr) |
+| mandelbrot | bgra | left | 127316 | 143796 (+12.9 %) | 111740 (-12.2 %) | 82100 (-35.5 %, GradientDecorr) |
+| mandelbrot | bgra | plane | 106704 | 120388 (+12.8 %) | 82100 (-23.1 %) | 82100 (-23.1 %, GradientDecorr) |
+
+With the predictor fixed, both encoders code the same residual
+symbols, so the difference is the Huffman tables alone: per-frame
+optimal tables (`custom-v2`) are 4–46 % smaller, the classic tables
+are 1 % smaller to 37 % larger, and letting the selector pick the
+predictor (`auto`) is 13–52 % smaller.
+
+**Stream-level `custom-v2` tables** (registry encoder; 96×64
+synthetic ramp + noise, frame bytes):
+
+| family / method | per-frame optimum | stream tables | classic tables | picture after a flat opening frame |
+| --- | --- | --- | --- | --- |
+| YUY2 Median | 5 792 | 5 820 (+0.5 %) | 7 768 | 8 196 (+5.5 % over classic) |
+| RGB24 GradientDecorr | 10 616 | 10 648 (+0.3 %) | 13 864 | 15 104 (+8.9 %) |
+| RGB32 GradientDecorr | 13 964 | 14 012 (+0.3 %) | 18 096 | 19 656 (+8.6 %) |
 
 ### Auto-selector worker scaling (round 429)
 
 Round 429 threads the budget through `encode_frame_auto_workers`: the
 per-candidate scoring (3 legal methods per family, each a full
 residual + histogram + package-merge pass) fans out across the
-granted workers, and the winner's emit inherits the r420 interlaced
-clamp. Criterion gates `encode_auto_workers_*` (sample-size 20,
+granted workers. (The table below predates round 493; since then the
+winner's emit also splits across workers on any frame large enough —
+see "Round 493".) Criterion gates `encode_auto_workers_*` (sample-size 20,
 Apple Silicon round machine):
 
 | scenario | 1 worker | 2 workers | 3 workers |
@@ -269,9 +333,9 @@ sweep), and the budget-1 path is the exact pre-r429 serial selector.
    observation; those passes are already SWAR / macropixel-step
    rewritten (r91 / r181 / r255 / r304).
 
-4. **Interlaced overhead stays ~1–2%** beyond the extra rows (320×320
-   interlaced 228 MiB/s vs 320×288 progressive 232 MiB/s), so the
-   field split + `interleave_fields` row-gather remains near-free.
+4. **Field coding is free in the entropy loop** — it only doubles the
+   prediction row length (spec/06 §2.1); nothing is split, gathered
+   or reordered.
 
 ## Next PROFILE-OPT target
 
@@ -306,34 +370,20 @@ slot views. `encode_yuy2_320x240_auto_custom` 579 → 521 µs (−10.0%,
 auto-custom scenarios are neutral (the fixed ~78 µs/frame saving
 amortises over the larger raster).
 
-**Remaining candidates (both unproven):**
+*(Landed r493)* The residual fan-out listed here as unproven shipped,
+together with the part it assumed impossible: the bit-emit is no
+longer serial. Codewords are a pure concatenation, so each worker
+packs its piece of the body into its own bit string and the strings
+are spliced at their bit offsets — see "Round 493".
 
-1. **Progressive-encode residual fan-out.** The forward predictor
-   passes read only source pixels (the sequential dependency is
-   decode-side only), so the residual phase could split across
-   `ExecutionContext` workers at row-aligned boundaries even on
-   progressive frames. Amdahl-bounded: the bit-emit stays serial
-   (one field = one bitstream; concatenation is only legal at the
-   per-field word-aligned boundaries the interlaced path already
-   exploits), so the win is capped at the residual phase's share —
-   worst for LEFT (SWAR-fast pass), best for MEDIAN. Needs
-   range-aware variants of the forward passes; only worth it if a
-   profile shows the residual share justifying the surface.
+**Remaining candidate:** serial decode is entropy-bound; every family
+consumes its whole wire cycle as LUT-fronted pair reads. Decode cannot
+be split (one codeword stream, no offsets on the wire), so further
+decode work should start from a fresh profile of the symbol loop.
 
-2. **Serial decode is entropy-bound and near-saturated.** Every
-   family now consumes its whole wire cycle as LUT-fronted pair
-   reads; the predictor inverses are already SWAR / macropixel-step
-   rewritten (r91/r181/r255/r304). No named lever remains; further
-   serial-decode work should start from a fresh profile.
-
-*(Landed r420)* The r419 candidate lever (b) — decoding the two
-independent field bitstreams of an interlaced frame on two threads —
-shipped in round 420 behind the `ExecutionContext` budget
-(`decode_frame_with_workers`), with the caveat the r419 note didn't
-anticipate: the wire carries no bottom-field offset, so the second
-worker is fed by a bit-exact length-only scan of the top field
-(§ "Worker scaling (round 420)" below). Encode-side field parallelism
-(no such prefix needed) landed in the same round.
+*(Withdrawn r493)* The round-420 two-field parallel decode / encode
+and its split scanner applied to a field layout no other
+implementation shares; they were removed with it.
 
 **Secondary (encode, CustomV2 only): skip the dead 64-Ki primary-LUT
 fill.** CustomV2 still builds three decode-grade `HuffTable`s per

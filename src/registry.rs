@@ -17,8 +17,9 @@ use oxideav_core::{
 
 use crate::decoder::{DecodedFrame, ThreeTables, decode_frame_with_workers, table_cache};
 use crate::encoder::{
-    EncodeOptions, ExtradataMode, FieldCoding, MethodSelection, build_bitmapinfoheader_field_coded,
-    encode_body_with_pinned_tables, encode_frame_with_options,
+    EncodeOptions, ExtradataMode, FieldCoding, FrameShape, MethodSelection,
+    build_bitmapinfoheader_field_coded, encode_body_with_pinned_tables,
+    encode_stream_opening_frame,
 };
 use crate::header::{Method, PixelFamily, StreamConfig};
 use crate::tables::classic_blob_bytes;
@@ -511,9 +512,10 @@ struct HuffYuvEncoder {
     /// Advisory worker budget from [`Encoder::set_execution_context`].
     /// Defaults to 1 — per the `ExecutionContext` threading contract
     /// the codec runs serial until told otherwise. Budgets ≥ 2 engage
-    /// the parallel auto-selector scoring (one candidate predictor per
-    /// worker, clamped inline to `threads.min(units).max(1)`); a
-    /// fixed-method frame has a single unit of work.
+    /// the piecewise frame encode (residuals and bit packing split
+    /// across workers, spliced bit-exactly) and the parallel
+    /// auto-selector scoring; every fan-out clamps inline to
+    /// `threads.min(units).max(1)`.
     worker_budget: usize,
 }
 
@@ -531,23 +533,23 @@ impl HuffYuvEncoder {
         // CustomV2 after the first frame: emit against the pinned
         // stream tables.
         if let (Some(m), Some((strf, tabs))) = (self.chosen_method, &self.pinned_custom) {
-            let bytes = encode_body_with_pinned_tables(
-                self.family,
-                m,
-                self.width,
-                self.height,
-                pixels,
-                tabs,
-                self.field_coded,
-            )
-            .map_err(map)?;
+            let shape = FrameShape {
+                family: self.family,
+                method: m,
+                width: self.width,
+                height: self.height,
+                field_coded: self.field_coded,
+                cover_all: false,
+            };
+            let bytes = encode_body_with_pinned_tables(&shape, pixels, tabs, self.worker_budget)
+                .map_err(map)?;
             return Ok((strf.clone(), bytes));
         }
         let selection = match self.chosen_method {
             Some(m) => MethodSelection::Fixed(m),
             None => MethodSelection::Auto,
         };
-        let encoded = encode_frame_with_options(
+        let encoded = encode_stream_opening_frame(
             self.family,
             self.width,
             self.height,
@@ -900,12 +902,27 @@ mod tests {
                         let params = encoder_params(family, w, h, Some(method), mode);
                         let mut enc = make_encoder(&params).expect("make_encoder");
                         let pkt = encode_one(&mut enc, &video_frame(family, w, pixels.clone(), 0));
-                        assert_eq!(pkt.data, bytes, "{scenario}: wire bytes diverged");
-                        assert_eq!(
-                            enc.output_params().extradata,
-                            strf,
-                            "{scenario}: strf diverged"
-                        );
+                        if mode == ExtradataMode::CustomV2 {
+                            // The stream encoder's tables cover every
+                            // symbol (they must serve later frames), so
+                            // its bytes differ from the single-frame
+                            // optimum — by well under 1 % plus the
+                            // word rounding on these small rasters.
+                            let slack = bytes.len() / 20 + 64;
+                            assert!(
+                                pkt.data.len() <= bytes.len() + slack,
+                                "{scenario}: covering tables cost {} vs {}",
+                                pkt.data.len(),
+                                bytes.len()
+                            );
+                        } else {
+                            assert_eq!(pkt.data, bytes, "{scenario}: wire bytes diverged");
+                            assert_eq!(
+                                enc.output_params().extradata,
+                                strf,
+                                "{scenario}: strf diverged"
+                            );
+                        }
                         assert!(pkt.flags.keyframe, "{scenario}: intra frame not keyframed");
 
                         // Full registry loop: decoder built from the
@@ -1056,53 +1073,126 @@ mod tests {
         }
     }
 
-    /// Round-429: `custom-v2` streams pin the first frame's Huffman
-    /// tables (extradata is stream-level, spec/01 §5): repeat frames
-    /// re-encode byte-identically, drifted frames whose residuals need
-    /// symbols the pinned tables never assigned codes to are rejected
-    /// instead of emitting an undecodable stream.
+    /// `custom-v2` streams pin the first frame's Huffman tables
+    /// (extradata is stream-level, spec/02 §1.2): repeat frames
+    /// re-encode byte-identically, and because the pinned tables give
+    /// every symbol a code, a later frame with completely different
+    /// content — here noise after a flat first frame, the worst case —
+    /// still encodes and decodes against the same header.
     #[test]
-    fn round429_custom_v2_stream_pins_tables() {
-        let family = PixelFamily::Yuy2;
-        let (w, h) = (16u32, 8u32);
-        let flat = vec![0x80u8; family.row_bytes(w) * h as usize];
-        let noisy = synth_pixels(w, h, family, 3);
+    fn custom_v2_stream_tables_cover_later_frames() {
+        for family in [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32] {
+            let (w, h) = (16u32, 8u32);
+            let flat = vec![0x80u8; family.row_bytes(w) * h as usize];
+            let noisy = synth_pixels(w, h, family, 3);
 
-        let params = encoder_params(family, w, h, Some(Method::Left), ExtradataMode::CustomV2);
-        let mut enc = make_encoder(&params).expect("make_encoder");
-        assert!(
-            enc.output_params().extradata.is_empty(),
-            "custom-v2 extradata must finalize on the first frame"
-        );
-        let pkt1 = encode_one(&mut enc, &video_frame(family, w, flat.clone(), 0));
-        let strf = enc.output_params().extradata.clone();
-        assert!(!strf.is_empty());
+            let params = encoder_params(family, w, h, None, ExtradataMode::CustomV2);
+            let mut enc = make_encoder(&params).expect("make_encoder");
+            assert!(
+                enc.output_params().extradata.is_empty(),
+                "custom-v2 extradata must finalize on the first frame"
+            );
+            let pkt1 = encode_one(&mut enc, &video_frame(family, w, flat.clone(), 0));
+            let strf = enc.output_params().extradata.clone();
+            assert!(!strf.is_empty());
+            // Every symbol of every table has a code.
+            let lengths =
+                crate::tables::rle_decode_three_channels(&strf[0x2C..]).expect("stream tables");
+            assert!(lengths.iter().all(|t| t.iter().all(|&l| l != 0)));
 
-        // Identical content → identical wire bytes under the pinned
-        // tables (and the strf must not drift).
-        let pkt2 = encode_one(&mut enc, &video_frame(family, w, flat.clone(), 1));
-        assert_eq!(pkt1.data, pkt2.data, "pinned tables must be deterministic");
-        assert_eq!(enc.output_params().extradata, strf);
+            // Identical content → identical wire bytes, same header.
+            let pkt2 = encode_one(&mut enc, &video_frame(family, w, flat.clone(), 1));
+            assert_eq!(pkt1.data, pkt2.data, "pinned tables must be deterministic");
+            // Unrelated content → still the same header.
+            let pkt3 = encode_one(&mut enc, &video_frame(family, w, noisy.clone(), 2));
+            assert_eq!(enc.output_params().extradata, strf);
 
-        // The flat frame's tables only cover the all-zero residual
-        // alphabet — a noisy frame needs symbols with no code, and
-        // must be rejected rather than silently emitting zero-length
-        // codewords.
-        let err = enc
-            .send_frame(&video_frame(family, w, noisy, 2))
-            .expect_err("uncovered residual symbols must be rejected");
-        assert!(
-            format!("{err}").contains("pinned"),
-            "unexpected error: {err}"
-        );
+            let mut dec = make_decoder(enc.output_params()).expect("make_decoder");
+            for (pkt, want) in [(&pkt1, &flat), (&pkt2, &flat), (&pkt3, &noisy)] {
+                dec.send_packet(pkt).expect("send_packet");
+                let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
+                    panic!("expected a video frame");
+                };
+                assert_eq!(
+                    &vf.planes[0].data, want,
+                    "{family:?}: custom-v2 stream not lossless"
+                );
+            }
+        }
+    }
 
-        // The stream stays decodable.
-        let mut dec = make_decoder(enc.output_params()).expect("make_decoder");
-        dec.send_packet(&pkt1).expect("send_packet");
-        let Frame::Video(vf) = dec.receive_frame().expect("receive_frame") else {
-            panic!("expected a video frame");
+    /// What the stream-level `custom-v2` tables cost, on picture-like
+    /// content (smooth ramp + a few bits of noise): against the exact
+    /// per-frame optimum for the frame they were fitted to, and against
+    /// the classic tables for a later frame that looks nothing like it
+    /// (the stream opens on a flat frame).
+    #[test]
+    fn custom_v2_stream_tables_cost_is_bounded() {
+        use crate::encoder::encode_frame_with_mode;
+        let picture = |w: u32, h: u32, family: PixelFamily, seed: u32| -> Vec<u8> {
+            let bpp = family.bytes_per_pixel_step();
+            let row = family.row_bytes(w);
+            let mut state = seed | 1;
+            (0..row * h as usize)
+                .map(|i| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let base = (i / row + (i % row) / bpp) / 2 + (i % bpp) * 9;
+                    (base as u32).wrapping_add(state & 7) as u8
+                })
+                .collect()
         };
-        assert_eq!(vf.planes[0].data, flat, "custom-v2 stream not lossless");
+        for family in [PixelFamily::Yuy2, PixelFamily::Rgb24, PixelFamily::Rgb32] {
+            let (w, h) = (96u32, 64u32);
+            let method = if family.is_rgb() {
+                Method::GradientDecorr
+            } else {
+                Method::Median
+            };
+            let first = picture(w, h, family, 11);
+            let size = |pixels: &[u8], mode| {
+                encode_frame_with_mode(family, method, w, h, &wire_raster(family, w, pixels), mode)
+                    .expect("direct encode")
+                    .1
+                    .len()
+            };
+            let optimum = size(&first, ExtradataMode::CustomV2);
+            let classic = size(&first, ExtradataMode::ClassicV2);
+
+            // Fitted frame: within 4 % of the per-frame optimum, and
+            // smaller than the classic tables.
+            let params = encoder_params(family, w, h, Some(method), ExtradataMode::CustomV2);
+            let mut enc = make_encoder(&params).expect("make_encoder");
+            let fitted = encode_one(&mut enc, &video_frame(family, w, first.clone(), 0))
+                .data
+                .len();
+            assert!(
+                fitted * 100 <= optimum * 104,
+                "{family:?}: fitted frame {fitted} vs optimum {optimum}"
+            );
+            assert!(
+                fitted < classic,
+                "{family:?}: {fitted} vs classic {classic}"
+            );
+
+            // Mismatched stream: tables fitted to a flat frame, then
+            // the picture. Never worse than 1.5× the classic tables.
+            let mut enc = make_encoder(&params).expect("make_encoder");
+            let flat = vec![0x80u8; first.len()];
+            encode_one(&mut enc, &video_frame(family, w, flat, 0));
+            let mismatched = encode_one(&mut enc, &video_frame(family, w, first.clone(), 1))
+                .data
+                .len();
+            assert!(
+                mismatched * 2 <= classic * 3,
+                "{family:?}: mismatched frame {mismatched} vs classic {classic}"
+            );
+            eprintln!(
+                "{family:?}: optimum {optimum}, stream tables {fitted}, classic {classic}, \
+                 after a flat opening frame {mismatched}"
+            );
+        }
     }
 
     /// Round-429: factory-time validation surface.
